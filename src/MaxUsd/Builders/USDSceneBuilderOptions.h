@@ -77,7 +77,8 @@ PXR_NAMESPACE_OPEN_SCOPE
 	(animationsPrimName) \
 	(version) \
         (transformFormat) \
-        (animationType)
+        (animationType) \
+	(normalizeStageMetersPerUnit)
 // clang-format on
 
 TF_DECLARE_PUBLIC_TOKENS(
@@ -701,6 +702,24 @@ public:
      * \brief Sets whether to use the progress bar.
      */
     MaxUSDAPI void SetUseProgressBar(bool useProgressBar);
+
+    /**
+     * \brief Gets whether the exporter should normalize the stage's `metersPerUnit` to 1.0
+     * (meters) by authoring an inverse uniform scale on the root prim. When false (default),
+     * the stage's `metersPerUnit` is authored to reflect the source 3ds Max system unit
+     * (e.g. inches -> 0.0254). When true, the stage's `metersPerUnit` is authored as 1.0 and
+     * the root prim receives an `xformOp:scale` equal to the system-unit-to-meters ratio,
+     * preserving physical size while presenting the file in the meter-centric convention
+     * expected by Houdini Karma at default scale, ARKit/Quick Look, and many other consumers.
+     * \return True if the exporter should normalize the stage to meters.
+     */
+    MaxUSDAPI bool GetNormalizeStageMetersPerUnit() const;
+
+    /**
+     * \brief Sets whether the exporter should normalize the stage's `metersPerUnit` to 1.0.
+     * See GetNormalizeStageMetersPerUnit() for semantics.
+     */
+    MaxUSDAPI void SetNormalizeStageMetersPerUnit(bool normalize);
 
     /**
      * \brief Sets what kind of transform type to use during export.

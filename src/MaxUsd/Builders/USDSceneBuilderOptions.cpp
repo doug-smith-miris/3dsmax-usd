@@ -163,6 +163,7 @@ const pxr::VtDictionary& USDSceneBuilderOptions::GetDefaultDictionary()
         defaultDict[MaxUsdUsdSceneBuilderOptionsTokens->bonesPrimName] = pxr::TfToken("Bones");
         defaultDict[MaxUsdUsdSceneBuilderOptionsTokens->transformFormat]
             = static_cast<int>(TransformFormat::SingleMatrix);
+        defaultDict[MaxUsdUsdSceneBuilderOptionsTokens->normalizeStageMetersPerUnit] = false;
     });
     // Purposefully left out of the call_once, in order to always fetch the latest value for
     // "APP_TEMP_DIR".
@@ -677,6 +678,17 @@ bool USDSceneBuilderOptions::GetUseProgressBar() const
 void USDSceneBuilderOptions::SetUseProgressBar(bool useProgressBar)
 {
     options[MaxUsdUsdSceneBuilderOptionsTokens->useProgressBar] = useProgressBar;
+}
+
+bool USDSceneBuilderOptions::GetNormalizeStageMetersPerUnit() const
+{
+    return VtDictionaryGet<bool>(
+        options, MaxUsdUsdSceneBuilderOptionsTokens->normalizeStageMetersPerUnit);
+}
+
+void USDSceneBuilderOptions::SetNormalizeStageMetersPerUnit(bool normalize)
+{
+    options[MaxUsdUsdSceneBuilderOptionsTokens->normalizeStageMetersPerUnit] = normalize;
 }
 
 void USDSceneBuilderOptions::SetTransformFormat(int option)

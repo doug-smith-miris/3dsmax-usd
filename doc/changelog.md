@@ -1,6 +1,12 @@
 ## Changelog
 
 
+### Unreleased
+
+#### What's New:
+- **New export option `NormalizeStageMetersPerUnit` (default `false`).** When set to `true`, the exporter authors `metersPerUnit = 1.0` on the stage and applies a uniform compensating `xformOp:scale` on the export root prim equal to the source 3ds Max system-unit-to-meters ratio (e.g. `0.0254` when the scene's system unit is inches). The geometry's physical size is preserved, but the file is presented in the meter-centric convention that Houdini Karma at default scale, ARKit/Quick Look, and many other downstream consumers assume. The legacy behavior — `metersPerUnit` reflecting the scene's system unit directly — is unchanged when the option is left at its default. Addresses MAX-UNIT-001 in the Miris USD diagnostic catalog.
+
+
 ### v0.15.0
 
 #### What's New:

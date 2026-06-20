@@ -36,6 +36,7 @@
 #include <MaxUsd/Utilities/TypeUtils.h>
 #include <MaxUsd/resource.h>
 
+#include <pxr/base/gf/vec3d.h>
 #include <pxr/base/tf/diagnostic.h>
 #include <pxr/usd/kind/registry.h>
 #include <pxr/usd/usd/editContext.h>
@@ -46,6 +47,7 @@
 #include <pxr/usd/usdGeom/metrics.h>
 #include <pxr/usd/usdGeom/scope.h>
 #include <pxr/usd/usdGeom/tokens.h>
+#include <pxr/usd/usdGeom/xformable.h>
 #include <pxr/usd/usdGeom/xformOp.h>
 #include <pxr/usd/usdLux/cylinderLight.h>
 
@@ -246,7 +248,11 @@ void USDSceneBuilder::Build(
         // round float imprecision
         stageScale = MaxUsd::MathUtils::RoundToSignificantDigit(
             stageScale, std::numeric_limits<float>::digits10);
-        pxr::UsdGeomSetStageMetersPerUnit(stage, stageScale);
+        // When normalizing to meters, advertise the stage as meters-per-unit = 1.0; the
+        // actual unit conversion is applied as a uniform xformOp:scale on the root prim
+        // after the scene has been built (see "Normalize stage to meters" below).
+        const bool normalizeToMeters = exportOptions.GetNormalizeStageMetersPerUnit();
+        pxr::UsdGeomSetStageMetersPerUnit(stage, normalizeToMeters ? 1.0 : stageScale);
 
         if (timeConfig.IsAnimated()) {
             // In 3dsMax, one tick is defined as 1/4800th of a second.
@@ -359,6 +365,44 @@ void USDSceneBuilder::Build(
         // export was cancelled
         cancelled = true;
         return;
+    }
+
+    // Normalize stage to meters: when requested, apply the system-unit-to-meters scale
+    // (already computed above as `stageScale` during isNewStage metadata setup) as a uniform
+    // xformOp:scale on the export root prim. Combined with `metersPerUnit = 1.0` authored
+    // above, this preserves the physical size of the geometry while presenting the file in
+    // the meter-centric convention expected by Houdini Karma (default scale), ARKit/Quick
+    // Look, and many other downstream consumers. Only applied when we authored the metadata
+    // (isNewStage) — when exporting into an existing stage we must respect its existing
+    // unit metadata rather than re-author it.
+    if (isNewStage && exportOptions.GetNormalizeStageMetersPerUnit()) {
+        const double stageScale = MaxUsd::MathUtils::RoundToSignificantDigit(
+            GetSystemUnitScale(UNITS_METERS), std::numeric_limits<float>::digits10);
+
+        auto         rootPathForScale = exportOptions.GetRootPrimPath(false);
+        rootPathForScale = rootPathForScale.StripAllVariantSelections();
+
+        if (!rootPathForScale.IsAbsoluteRootPath()) {
+            const auto rootPrim = stage->GetPrimAtPath(rootPathForScale);
+            if (rootPrim) {
+                pxr::UsdGeomXformable xformable(rootPrim);
+                if (xformable) {
+                    // Append (rather than overwrite) so we don't disturb any xformOp the
+                    // root prim may have received from upstream config. Suffix the op so
+                    // it round-trips meaningfully on re-import.
+                    auto scaleOp = xformable.AddScaleOp(
+                        pxr::UsdGeomXformOp::PrecisionDouble,
+                        pxr::TfToken("metersNormalization"));
+                    scaleOp.Set(pxr::GfVec3d(stageScale, stageScale, stageScale));
+                } else {
+                    MaxUsd::Log::Warn(
+                        "NormalizeStageMetersPerUnit was requested, but the root prim is not "
+                        "Xformable; the stage was authored as metersPerUnit=1.0 but no "
+                        "compensating scale was applied. Downstream consumers may see "
+                        "geometry at the wrong physical size.");
+                }
+            }
+        }
     }
 
     // Set the first valid prim as default prim.

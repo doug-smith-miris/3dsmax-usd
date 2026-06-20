@@ -335,6 +335,7 @@ public:
         fnIdGetUseLastResortUSDPreviewSurfaceWriter, fnIdSetUseLastResortUSDPreviewSurfaceWriter,
         fidSerialize,
         fnIdGetUseWorldspaceRoot, fnIdSetUseWorldspaceRoot,
+        fnIdGetNormalizeStageMetersPerUnit, fnIdSetNormalizeStageMetersPerUnit,
 #ifdef USD_CURVES_SUPPORTED
         fnIdGetAnimationType, fnIdSetAnimationType,
 #endif
@@ -408,6 +409,7 @@ public:
         PROP_FNS(fnIdGetUseSeparateMaterialLayer, GetUseSeparateMaterialLayer, fnIdSetUseSeparateMaterialLayer, SetUseSeparateMaterialLayer, TYPE_BOOL);
         PROP_FNS(fnIdGetUseLastResortUSDPreviewSurfaceWriter, GetUseLastResortUSDPreviewSurfaceWriter, fnIdSetUseLastResortUSDPreviewSurfaceWriter, SetUseLastResortUSDPreviewSurfaceWriter, TYPE_BOOL);
         PROP_FNS(fnIdGetUseWorldspaceRoot, GetUseWorldspaceRoot, fnIdSetUseWorldspaceRoot, SetUseWorldspaceRoot, TYPE_BOOL);
+        PROP_FNS(fnIdGetNormalizeStageMetersPerUnit, GetNormalizeStageMetersPerUnit, fnIdSetNormalizeStageMetersPerUnit, SetNormalizeStageMetersPerUnit, TYPE_BOOL);
         VFN_0(fnIdReset, SetDefaults);
         VFN_0(fnIdSetChannelPrimvarMappingDefaults, SetChannelPrimvarMappingDefaults);
         VFN_4(fnIdSetChannelPrimvarMapping, SetChannelPrimvarMapping, TYPE_INT, TYPE_VALUE, TYPE_ENUM, TYPE_BOOL);
