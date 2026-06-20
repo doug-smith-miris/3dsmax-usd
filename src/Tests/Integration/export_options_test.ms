@@ -110,6 +110,7 @@ struct export_options_test
         assert_true uiExportOptions.UseProgressBar message:"UseProgressBar property was not properly initialized to defaults (true)."
         assert_true uiExportOptions.UseLastResortUSDPreviewSurfaceWriter message:"UseLastResortUSDPreviewSurfaceWriter property was not properly initialized to defaults (true)."
         assert_false uiExportOptions.UseWorldspaceRoot message:"UseWorldspaceRoot property was not properly initialized to defaults (false)"
+        assert_false uiExportOptions.NormalizeStageMetersPerUnit message:"NormalizeStageMetersPerUnit property was not properly initialized to defaults (false)."
 
         -- Create new options and set them all to non-default values
         local exportOptions = USDExporter.CreateOptions()
@@ -160,7 +161,8 @@ struct export_options_test
         exportOptions.UseProgressBar = false
         exportOptions.UseLastResortUSDPreviewSurfaceWriter = false
         exportOptions.UseWorldspaceRoot = true
-        
+        exportOptions.NormalizeStageMetersPerUnit = true
+
         -- Test the UI options setter
         USDExporter.UIOptions = exportOptions
 
@@ -220,6 +222,7 @@ struct export_options_test
         assert_false uiExportOptions.UseProgressBar message:"UseProgressBar property was not properly set to false."
         assert_false uiExportOptions.UseLastResortUSDPreviewSurfaceWriter message:"UseLastResortUSDPreviewSurfaceWriter property was not properly set to false."
         assert_true uiExportOptions.UseWorldspaceRoot message:"UseWorldspaceRoot property was not properly set to true."
+        assert_true uiExportOptions.NormalizeStageMetersPerUnit message:"NormalizeStageMetersPerUnit property was not properly set to true."
         -- Reset & test
 
         uiExportOptions.Reset()
@@ -276,6 +279,7 @@ struct export_options_test
         assert_true uiExportOptions.UseProgressBar message:"UseProgressBar property was not properly reset to defaults (true)."
         assert_true uiExportOptions.UseLastResortUSDPreviewSurfaceWriter message:"UseLastResortUSDPreviewSurfaceWriter property was not properly reset to default (true)."
         assert_false uiExportOptions.UseWorldspaceRoot message:"UseWorldspaceRoot property was not properly reset to defaults (false)"
+        assert_false uiExportOptions.NormalizeStageMetersPerUnit message:"NormalizeStageMetersPerUnit property was not properly reset to defaults (false)."
 
         -- Testing specific cases for transform format and animation type
         if supportCurves then (

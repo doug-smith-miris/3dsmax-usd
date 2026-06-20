@@ -101,6 +101,7 @@ FPInterfaceDesc IUSDExportOptionsDesc(
 	IUSDExportOptions::fnIdGetUseSeparateMaterialLayer, IUSDExportOptions::fnIdSetUseSeparateMaterialLayer, _T("UseSeparateMaterialLayer"), FP_NO_REDRAW, TYPE_BOOL,
 	IUSDExportOptions::fnIdGetUseLastResortUSDPreviewSurfaceWriter, IUSDExportOptions::fnIdSetUseLastResortUSDPreviewSurfaceWriter, _T("UseLastResortUSDPreviewSurfaceWriter"), FP_NO_REDRAW, TYPE_BOOL,
 	IUSDExportOptions::fnIdGetUseWorldspaceRoot, IUSDExportOptions::fnIdSetUseWorldspaceRoot, _T("UseWorldspaceRoot"), FP_NO_REDRAW, TYPE_BOOL,
+	IUSDExportOptions::fnIdGetNormalizeStageMetersPerUnit, IUSDExportOptions::fnIdSetNormalizeStageMetersPerUnit, _T("NormalizeStageMetersPerUnit"), FP_NO_REDRAW, TYPE_BOOL,
 	// Enums
 	enums,
 	IUSDExportOptions::eIdFileFormat, 2,

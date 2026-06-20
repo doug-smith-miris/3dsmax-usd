@@ -646,6 +646,22 @@ void wrapUsdSceneBuilderOptions()
             "Sets the \"up axis\" of the USD Stage produced from the translation of the 3ds Max "
             "content (maxUsd.UpAxis).")
         .def(
+            "GetNormalizeStageMetersPerUnit",
+            &MaxUsd::USDSceneBuilderOptions::GetNormalizeStageMetersPerUnit,
+            (pyboost::arg("self")),
+            "Returns whether the exporter normalizes the stage to metersPerUnit=1.0 by applying "
+            "a compensating xformOp:scale on the root prim.")
+        .def(
+            "SetNormalizeStageMetersPerUnit",
+            &MaxUsd::USDSceneBuilderOptions::SetNormalizeStageMetersPerUnit,
+            (pyboost::args("self", "normalize")),
+            "Sets whether the exporter should normalize the stage to metersPerUnit=1.0. When "
+            "true, metersPerUnit is authored as 1.0 and the root prim receives an "
+            "xformOp:scale equal to the source system-unit-to-meters ratio (e.g. 0.0254 for "
+            "inches), preserving physical size while presenting the file in the meter-centric "
+            "convention expected by Houdini Karma at default scale, ARKit/Quick Look, etc. "
+            "When false (default), metersPerUnit reflects the 3ds Max system unit directly.")
+        .def(
             "GetBakeObjectOffsetTransform",
             &USDSceneBuilderOptionsWrapper::GetBakeObjectOffsetTransform,
             (pyboost::arg("self")),
