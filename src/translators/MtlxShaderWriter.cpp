@@ -36,7 +36,170 @@
 
 #include <MaterialXFormat/XmlIo.h>
 
+#include <cmath>
+#include <sstream>
+
 PXR_NAMESPACE_OPEN_SCOPE
+
+namespace {
+
+// Returns the static float value of a MaterialX input if it is not connected.
+// On a connection (node/nodegraph/output), reports the input as "not statically known".
+bool _TryGetStaticFloat(const MaterialX::InputPtr& input, float& outValue)
+{
+    if (!input) {
+        return false;
+    }
+    if (input->hasNodeName() || input->hasNodeGraphString() || input->hasOutputString()) {
+        return false;
+    }
+    const std::string& valStr = input->getValueString();
+    if (valStr.empty()) {
+        return false;
+    }
+    try {
+        outValue = std::stof(valStr);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// Parses a MaterialX color3 value string ("r, g, b" or "r g b") when the
+// input is not connected. Tolerates commas, semicolons, and whitespace
+// between components so we read whatever the MaterialX serializer wrote.
+// Returns false on a connection, on a value string with fewer/more than 3
+// numeric components, or on any parse failure.
+bool _TryGetStaticColor3(
+    const MaterialX::InputPtr& input,
+    float (&outValue)[3])
+{
+    if (!input) {
+        return false;
+    }
+    if (input->hasNodeName() || input->hasNodeGraphString() || input->hasOutputString()) {
+        return false;
+    }
+    const std::string& valStr = input->getValueString();
+    if (valStr.empty()) {
+        return false;
+    }
+    // Replace any non-numeric separators with spaces so a single istringstream
+    // walk extracts the three components regardless of MaterialX serialization
+    // style.
+    std::string normalized;
+    normalized.reserve(valStr.size());
+    for (char c : valStr) {
+        if (c == ',' || c == ';' || c == '\t' || c == '\n') {
+            normalized.push_back(' ');
+        } else {
+            normalized.push_back(c);
+        }
+    }
+    std::istringstream iss(normalized);
+    int parsed = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (!(iss >> outValue[i])) {
+            return false;
+        }
+        ++parsed;
+    }
+    // Reject trailing tokens (e.g. a fourth component) so we don't silently
+    // accept color4 strings as color3.
+    std::string trailing;
+    if (iss >> trailing) {
+        return false;
+    }
+    return parsed == 3;
+}
+
+// MAX-MAT-002 workaround: 3ds Max's MtlxIOUtil bridge emits emission = 1.0
+// paired with emission_color = (0, 0, 0) on every standard_surface node,
+// regardless of whether the source PhysicalMaterial authored any emission.
+// The MaterialX standard_surface nodedef defaults are emission = 0.0 and
+// emission_color = (1, 1, 1). The buggy pair multiplies to (0, 0, 0) so it
+// has no visual effect, but it is semantically wrong: any downstream
+// override that bumps emission_color away from black would unexpectedly
+// turn emission on at full strength. Strip both inputs when they exactly
+// match the buggy pattern so the exported USD falls back to the nodedef
+// defaults (which also evaluate to zero emission, with the right meaning).
+// Connected inputs and any non-matching values are left untouched.
+void _NormalizeStandardSurfaceEmissionDefault(const MaterialX::DocumentPtr& doc)
+{
+    if (!doc) {
+        return;
+    }
+    for (const auto& node : doc->getNodes("standard_surface")) {
+        auto emissionInput = node->getInput("emission");
+        auto emissionColorInput = node->getInput("emission_color");
+        if (!emissionInput || !emissionColorInput) {
+            continue;
+        }
+        float emissionValue = 0.f;
+        if (!_TryGetStaticFloat(emissionInput, emissionValue)) {
+            continue;
+        }
+        if (std::fabs(emissionValue - 1.0f) > 1e-6f) {
+            continue;
+        }
+        float emissionColor[3] = { 0.f, 0.f, 0.f };
+        if (!_TryGetStaticColor3(emissionColorInput, emissionColor)) {
+            continue;
+        }
+        if (std::fabs(emissionColor[0]) > 1e-6f
+            || std::fabs(emissionColor[1]) > 1e-6f
+            || std::fabs(emissionColor[2]) > 1e-6f) {
+            continue;
+        }
+        node->removeInput("emission");
+        node->removeInput("emission_color");
+    }
+}
+
+// MAX-MAT-001 workaround: 3ds Max's MtlxIOUtil bridge emits
+// specular_rotation = 0.25 on every standard_surface node, regardless of the
+// source PhysicalMaterial's anisotropy settings. The MaterialX standard_surface
+// nodedef defaults specular_rotation to 0.0, and the value has no visual effect
+// when specular_anisotropy is zero. Strip the spurious value so the exported
+// USD matches the nodedef default for the common (anisotropy == 0) case.
+// Inputs that are connected, non-zero, or carry a non-0.25 authored value are
+// left untouched.
+void _NormalizeStandardSurfaceSpecularRotation(const MaterialX::DocumentPtr& doc)
+{
+    if (!doc) {
+        return;
+    }
+    for (const auto& node : doc->getNodes("standard_surface")) {
+        auto rotationInput = node->getInput("specular_rotation");
+        if (!rotationInput) {
+            continue;
+        }
+        float rotationValue = 0.f;
+        if (!_TryGetStaticFloat(rotationInput, rotationValue)) {
+            continue;
+        }
+        // Match the buggy 3ds Max hardcoded value (0.25), tolerant of float noise.
+        if (std::fabs(rotationValue - 0.25f) > 1e-6f) {
+            continue;
+        }
+        // Only strip when specular_anisotropy is provably zero (or absent).
+        // If anisotropy is connected, the user may genuinely want a rotation,
+        // so we conservatively keep the input.
+        auto anisotropyInput = node->getInput("specular_anisotropy");
+        if (anisotropyInput) {
+            float anisotropyValue = 0.f;
+            if (!_TryGetStaticFloat(anisotropyInput, anisotropyValue)) {
+                continue;
+            }
+            if (std::fabs(anisotropyValue) > 1e-6f) {
+                continue;
+            }
+        }
+        node->removeInput("specular_rotation");
+    }
+}
+
+} // namespace
 
 bool _IsWellFormedPath(const fs::path& p)
 {
@@ -519,6 +682,9 @@ void MtlxShaderWriter::Write()
         TF_WARN("Error reading MaterialX document: %s", e.what());
         return;
     }
+
+    _NormalizeStandardSurfaceSpecularRotation(mtlxDoc);
+    _NormalizeStandardSurfaceEmissionDefault(mtlxDoc);
 
     // Sanitize the material name using the same logic as with the MaterialX component
     // to match the node name produced by the MaterialX exporter. createValidName
