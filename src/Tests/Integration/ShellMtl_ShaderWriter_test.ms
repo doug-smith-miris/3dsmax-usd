@@ -335,7 +335,9 @@ struct shell_mtl_shader_writer_test
         assert_false (boundPrim.IsValid()) message:"Main geometry should have no direct material binding."
         
         -- Verify GeomSubsets have purpose-specific bindings
-        local subsetNames = #("_1_", "_2_", "_3_", "_4_", "_5_", "_6_")
+        -- MAX-GEO-003: subset naming for the null/non-Multi case is now
+        -- `mat_{N}` instead of the legacy underscore-wrapped `_{N}_`.
+        local subsetNames = #("mat_1", "mat_2", "mat_3", "mat_4", "mat_5", "mat_6")
         local expectedMatIDs = #(1, 2, 3, 4, 5, 6)  -- Based on face material ID assignments
         
         for i = 1 to subsetNames.count do (
