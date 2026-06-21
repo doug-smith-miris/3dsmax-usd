@@ -56,7 +56,8 @@ Status legend:
 | PhysicalMaterial.anisotropy_angle | `standard_surface.specular_rotation` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits `0.25` AND `specular_anisotropy` is static-zero or absent | MAX-MAT-001 | 2026-06-20 |
 | PhysicalMaterial.emission (none authored) | `standard_surface.emission` + `standard_surface.emission_color` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits `emission = 1.0` AND `emission_color = (0, 0, 0)`, both static | MAX-MAT-002 | 2026-06-20 |
 | Node.wireColor / Node.material.diffuse | `UsdGeomMesh.primvars:displayColor` | bug normalization | (mesh primvar; not a shader nodedef) | `MeshConverter` is about to author wireColor into `primvars:displayColor` AND `node->GetMtl() != nullptr` | MAX-MAT-003 | 2026-06-20 |
-| Mesh normals (every interpolation) | `primvars:normals` AND `UsdGeomMesh.normals` (the schema attribute) | bug normalization | (mesh attribute; not a shader nodedef) | `NormalsMode` default is now `Both` -- both locations are authored unless the user explicitly picks `AsPrimvar` or `AsAttribute` | (this PR) | 2026-06-20 |
+| Mesh normals (every interpolation) | `primvars:normals` AND `UsdGeomMesh.normals` (the schema attribute) | bug normalization | (mesh attribute; not a shader nodedef) | `NormalsMode` default is now `Both` -- both locations are authored unless the user explicitly picks `AsPrimvar` or `AsAttribute` | MAX-GEO-001 | 2026-06-20 |
+| Map channel 1 missing on the converted MNMesh | `primvars:st` (channel 1's configured primvar) | approximating workaround | (mesh primvar; not a shader nodedef) | `ApplyMaxMapChannels` did not author the channel-1 primvar AND channel 1 is not explicitly opted out (`GetChannelPrimvarConfig(1).GetPrimvarName().IsEmpty()`) AND VertexCount() > 0 AND FaceCount() > 0 | (this PR) | 2026-06-20 |
 
 ## Notes per expression
 
@@ -379,6 +380,109 @@ default better matches the catalog's "best practice" rule that USD
 consumers should be able to read either carrier and get the same
 answer.
 
+### Map channel 1 missing → primvars:st  (MAX-GEO-004)
+
+**Symptom.** `MaxUsd::MeshConverter::ApplyMaxMapChannels()` iterates the
+source MNMesh's map channels and only authors `primvars:st` for channel 1
+when the channel has face data. 3ds Max parametric primitives (Box /
+Sphere / Cylinder / Torus / Teapot) default the `Generate Mapping Coords.`
+checkbox to **off** when constructed via MAXScript without an explicit
+`mapCoords:true` argument, so the converted MNMesh exposes channel 1 with
+zero faces. The diagnostic corpus shows the result: only `/root/Ground`
+(a `Plane`, whose `mapCoords` defaults to true) carries `primvars:st`. The
+other five meshes (`/root/Teapot`, `/root/Sphere`, `/root/Box`,
+`/root/Cylinder`, `/root/Torus`) export with no UV stream at all.
+
+**Why it matters.** USD `UsdPreviewSurface` and MaterialX `image`
+textures sample by `inputs:st` (or whatever the bound `primvar reader`
+asks for). A mesh with no `primvars:st` cannot be textured: the renderer
+either falls back to the texture's default colour, the BSDF's
+`base_color` default, or whatever the host pipeline does when a primvar
+read returns no data. The diagnostic catalog flagged this as
+"non-blocking for this untextured PBR corpus but critical for any
+texture-bearing pipeline" — the bug is invisible on the captured corpus
+(no materials carry texture inputs) and lethal the moment an artist
+binds a texture-bearing material to a primitive whose `mapCoords` is
+off.
+
+**Fix.** After `ApplyMaxMapChannels` runs, call
+`EnsureFallbackStPrimvar(maxMesh, usdMesh, options, timeCode)`. The
+helper:
+
+1. Looks up the primvar name channel 1 is configured to write (default
+   `st`; the user can rebind it via
+   `MaxMeshConversionOptions::SetChannelPrimvarConfig(1, ...)` or
+   explicitly opt out by binding it to an empty name).
+2. Returns early if the user opted out (empty name) or if the primvar is
+   already authored — both of which mean we have nothing to do.
+3. Computes a top-down (Z-axis) planar projection: each vertex's
+   `(X, Y)` position is normalized to `[0, 1]` using the mesh's bounding
+   box X / Y extents.
+4. Writes the result as `primvars:st` (or the configured name) with
+   `vertex` interpolation, value type `TexCoord2fArray`.
+5. Emits a `MaxUsd::Log::Warn` so the artist knows the projection is a
+   fallback and how to fix it properly (enable `Generate Mapping Coords.`
+   on the source primitive, or apply a UVW Map modifier).
+
+The projection is "wrong" for non-planar surfaces — a sphere or
+cylinder will see the texture pinched at the poles / wrapped along the
+axis — but it is **finite, deterministic, and visible**. The artist
+will immediately see that the texture appears, see that it is warped on
+curved geometry, and know to fix it via the surfaced warning. This is
+the diagnostic catalog's "fix-or-warn" pattern: do the best we can,
+then tell the user what's going on.
+
+**Bounds (where the fix conservatively does nothing):**
+
+* Channel 1's configured primvar name is empty — the user explicitly
+  disabled channel-1 export via `SetChannelPrimvarConfig(1, Config(""))`.
+* The mesh already has a primvar with that name —
+  `ApplyMaxMapChannels` (or some prior call) authored real UV data;
+  leave it alone.
+* `VertexCount() == 0` or `FaceCount() == 0` — degenerate mesh; nothing
+  to project.
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/f787408d-043c-445e-a483-5c5a21577376/fallback_uvs.py`
+mirrors the new C++ helper at the USD layer. Running it on the
+post-MAX-GEO-001 corpus
+(`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/53bb1e15-4ff8-405c-9dd9-bfdaf02a21d3/complex_export_postfix.usda`)
+adds `primvars:st` to all 5 meshes that lacked it — Teapot, Sphere,
+Box, Cylinder, Torus — and leaves the Ground's existing `primvars:st`
+untouched. Vertex counts of the new primvar match the mesh's
+`points` count (vertex interpolation).
+
+| Mesh    | points | st (prefix) | st (postfix)        |
+| ------- | ------ | ----------- | ------------------- |
+| Ground  | 4      | n=4 (faceVarying, authored) | unchanged           |
+| Teapot  | 2082   | unset       | n=2082 (vertex)     |
+| Sphere  | 1106   | unset       | n=1106 (vertex)     |
+| Box     | 8      | unset       | n=8 (vertex)        |
+| Cylinder| 72     | unset       | n=72 (vertex)       |
+| Torus   | 648    | unset       | n=648 (vertex)      |
+
+Karma renders of the untextured pair (PBR materials, no `image`
+nodes wired) are byte-identical (same SHA-256) — the materials don't
+sample UVs, so the fallback primvar makes no visual difference. That
+zero-regression signal is exactly what we want for the common case.
+
+Karma renders of a textured pair (a checker texture wired into the
+bound material's `base_color`) diverge: the prefix renders Teapot /
+Sphere / Box / Cylinder / Torus untextured (flat solid colour because
+the renderer has no UVs to sample), and the postfix renders them with
+the warped planar projection — the texture is visible, often
+distorted on curved surfaces, exactly as documented above. That is
+the **observable** the auditor checks against.
+
+**Retirement condition.** This is not a workaround for an external 3ds
+Max bug — the code being fixed is the fork's own
+`MeshConverter::ConvertToUSDMesh`. The fix is permanent. A future bite
+may add a `MaxMeshConversionOptions::SetGenerateFallbackUvs(false)`
+opt-out for round-trip purists who want a 1:1 representation of the
+source mesh (no UV channel in → no UV primvar out); for now the
+fallback is unconditional whenever channel 1 is configured to write,
+which is the catalog's "best practice" default.
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -401,3 +505,11 @@ answer.
   populates both `primvars:normals` AND `UsdGeomMesh.normals` (the
   schema attribute). Existing `AsPrimvar` and `AsAttribute` selectors
   unchanged.
+* 2026-06-20 — MAX-GEO-004 fallback UV stream: backfill
+  `primvars:st` (or the channel-1-configured primvar name) with a
+  planar projection of the vertex positions whenever
+  `ApplyMaxMapChannels` did not author it. Conservatively no-ops when
+  the user explicitly opted out of channel-1 export, when real UVs
+  already exist, or when the mesh is degenerate. Surfaces a
+  `MaxUsd::Log::Warn` so the artist knows to enable `Generate Mapping
+  Coords.` or apply a UVW Map modifier for accurate UVs.

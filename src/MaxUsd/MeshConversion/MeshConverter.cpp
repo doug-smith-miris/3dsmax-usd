@@ -488,6 +488,11 @@ void MeshConverter::ConvertToUSDMesh(
     ApplyMaxNormals(maxMesh, usdMesh, options, intervals, usdTime, animated);
     ApplyMaxMapChannels(maxMesh, usdMesh, options, intervals, usdTime, animated);
 
+    // MAX-GEO-004: backfill the channel-1 UV primvar (default `st`) with a
+    // planar-projection fallback when the source mesh did not contribute
+    // any UVs through ApplyMaxMapChannels. See doc/translation-mapping.md.
+    EnsureFallbackStPrimvar(maxMesh, usdMesh, options, usdTime);
+
     if (maxMesh.HasCreaseSupport()) {
         ApplyMaxVertCreases(maxMesh, usdMesh, usdTime);
         ApplyMaxEdgeCreases(maxMesh, usdMesh, usdTime);
@@ -800,6 +805,102 @@ void MeshConverter::ApplyMaxMapChannels(
         const MappedAttributeBuilder::Config& primConfig = options.GetChannelPrimvarConfig(i);
         ChannelToPrimvar(maxMesh, i, mesh, primConfig, channelIntervals, timeCode, animated);
     }
+}
+
+void MeshConverter::EnsureFallbackStPrimvar(
+    MeshFacade&                     maxMesh,
+    pxr::UsdGeomMesh&               mesh,
+    const MaxMeshConversionOptions& options,
+    const pxr::UsdTimeCode&         timeCode)
+{
+    // MAX-GEO-004: when a mesh has no UV channel 1 (the conventional carrier
+    // for `primvars:st`), emit a fallback planar projection so any
+    // texture-bearing material bound to the mesh has a deterministic UV
+    // stream to sample.
+    //
+    // 3ds Max parametric primitives (Box / Sphere / Cylinder / Torus /
+    // Teapot) default `Generate Mapping Coords.` to false when created via
+    // MAXScript without an explicit `mapCoords:true` argument, leaving the
+    // converted MNMesh's map channel 1 empty. Without this fallback,
+    // textured materials bound to such primitives render untextured
+    // (no UV stream means no texture sampling, so the renderer falls back
+    // to either the texture's default value or the BSDF default colour).
+    //
+    // The fallback is a top-down (Z-axis) planar projection: each vertex's
+    // (X, Y) is normalized into [0, 1] using the mesh's bounding-box X / Y
+    // extents. This is "wrong" for non-planar surfaces (a sphere / cylinder
+    // will see the texture pinched at the poles or wrapped along the axis)
+    // but it is finite, deterministic, and visible -- the artist sees the
+    // texture appear, sees the warp on curved geometry, and knows to fix it
+    // properly via `Generate Mapping Coords.` on the source primitive or a
+    // UVW Map modifier in the scene. The warning emitted below tells them
+    // exactly that.
+    //
+    // Bounds (where the fallback conservatively does nothing):
+    //  - Channel 1's configured primvar name is empty -> user opted out of
+    //    channel-1 export, do not fight them.
+    //  - The mesh already has a primvar with that name -> `ApplyMaxMapChannels`
+    //    wrote real UV data, leave it alone.
+    //  - VertexCount() or FaceCount() is 0 -> nothing to project.
+    //  - Degenerate bounding box on both X and Y -> still emit `(0, 0)` for
+    //    every vertex so the renderer has a sampleable stream, but the UVs
+    //    are uninformative; the warning is still emitted.
+
+    const auto& channel1Config = options.GetChannelPrimvarConfig(1);
+    const pxr::TfToken& stTokenName = channel1Config.GetPrimvarName();
+    if (stTokenName.IsEmpty()) {
+        return;
+    }
+
+    pxr::UsdGeomPrimvarsAPI primvarsAPI(mesh);
+    if (primvarsAPI.HasPrimvar(stTokenName)) {
+        return;
+    }
+
+    const int vertexCount = maxMesh.VertexCount();
+    const int faceCount = maxMesh.FaceCount();
+    if (vertexCount == 0 || faceCount == 0) {
+        return;
+    }
+
+    const auto  bbox = maxMesh.BoundingBox();
+    const float sizeX = bbox.Max().x - bbox.Min().x;
+    const float sizeY = bbox.Max().y - bbox.Min().y;
+    const float divX = (sizeX > 0.0f) ? sizeX : 1.0f;
+    const float divY = (sizeY > 0.0f) ? sizeY : 1.0f;
+    const float minX = bbox.Min().x;
+    const float minY = bbox.Min().y;
+
+    pxr::VtVec2fArray stData;
+    stData.reserve(vertexCount);
+    for (int i = 0; i < vertexCount; ++i) {
+        const auto& v = maxMesh.Vertex(i);
+        stData.emplace_back((v.x - minX) / divX, (v.y - minY) / divY);
+    }
+
+    auto primvar = primvarsAPI.CreatePrimvar(
+        stTokenName,
+        pxr::SdfValueTypeNames->TexCoord2fArray,
+        pxr::UsdGeomTokens->vertex);
+    if (!primvar.IsDefined()) {
+        MaxUsd::Log::Warn(
+            "Unable to create the fallback {0} primvar on {1}. The configured name may "
+            "be a reserved keyword or invalid.",
+            stTokenName.GetString(),
+            mesh.GetPath().GetString());
+        return;
+    }
+    primvar.GetAttr().Set(stData, timeCode);
+
+    MaxUsd::Log::Warn(
+        "{0} has no UV mapping channel; generated fallback planar UVs as "
+        "primvars:{1} (vertex interpolation, top-down XY projection from the mesh's "
+        "bounding box). Textured materials bound to this mesh will render with a "
+        "warped projection on curved surfaces. For accurate UVs, enable 'Generate "
+        "Mapping Coords.' on the source object's parameters, or apply a UVW Map "
+        "modifier (MAX-GEO-004).",
+        mesh.GetPath().GetString(),
+        stTokenName.GetString());
 }
 
 void MeshConverter::ResolveChannelPrimvars(
