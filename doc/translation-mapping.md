@@ -59,7 +59,8 @@ Status legend:
 | Mesh normals (every interpolation) | `primvars:normals` AND `UsdGeomMesh.normals` (the schema attribute) | bug normalization | (mesh attribute; not a shader nodedef) | `NormalsMode` default is now `Both` -- both locations are authored unless the user explicitly picks `AsPrimvar` or `AsAttribute` | MAX-GEO-001 | 2026-06-20 |
 | Map channel 1 missing on the converted MNMesh | `primvars:st` (channel 1's configured primvar) | approximating workaround | (mesh primvar; not a shader nodedef) | `ApplyMaxMapChannels` did not author the channel-1 primvar AND channel 1 is not explicitly opted out (`GetChannelPrimvarConfig(1).GetPrimvarName().IsEmpty()`) AND VertexCount() > 0 AND FaceCount() > 0 | MAX-GEO-004 | 2026-06-20 |
 | Per-face matIds on a mesh whose bound material is non-MultiMtl | (no GeomSubsets; first matId stored as `customData.3dsmax.matId` on the Mesh prim) | bug normalization | (Mesh prim; not a shader nodedef) | `materialIdToFacesMap.size() > 1` AND `node->GetMtl()` is null or a non-MultiMtl AND the prim does not already have existing `materialBind` subsets | MAX-GEO-002 | 2026-06-20 |
-| GeomSubset name for the null / non-Multi / unnamed-slot fallback path | `mat_{maxScriptId}` (single material) / `mat_{maxScriptId}_{subMtlName}` (multi w/o slot name) | cosmetic normalization | (Mesh / GeomSubset prim name; not a shader nodedef) | `MaterialUtils::CreateSubsetName` is invoked AND (the bound material is null/non-Multi OR the Multi/Sub-Object slot name is empty) | (this PR) | 2026-06-20 |
+| GeomSubset name for the null / non-Multi / unnamed-slot fallback path | `mat_{maxScriptId}` (single material) / `mat_{maxScriptId}_{subMtlName}` (multi w/o slot name) | cosmetic normalization | (Mesh / GeomSubset prim name; not a shader nodedef) | `MaterialUtils::CreateSubsetName` is invoked AND (the bound material is null/non-Multi OR the Multi/Sub-Object slot name is empty) | MAX-GEO-003 | 2026-06-20 |
+| 3ds Max camera Near Clip / Far Clip values (every camera type, regardless of "Clip Manually") | `UsdGeomCamera.clippingRange` | bug normalization | (camera schema attribute; not a shader nodedef) | `CameraWriter::Write` is invoked AND the camera object resolves as a `GenCamera` -- the writer now authors `clippingRange` unconditionally from `GetClipDist(...)` rather than gating on `GetManualClip() != 0`, with degenerate values (≤ 0, NaN, far ≤ near) sanity-clamped to `(1.0, 1000.0)` in scene units | (this PR) | 2026-06-20 |
 
 ## Notes per expression
 
@@ -725,6 +726,84 @@ USD ecosystem standardises a different prefix (`submat_N`, `face_N`)
 and the fork wants to align. The Python validator's prefix match
 (`r'_(\d+)_(.*)'`) would then become the migration helper.
 
+### 3ds Max camera Near/Far Clip → UsdGeomCamera.clippingRange  (MAX-CAM-001)
+
+**Symptom.** `CameraWriter::Write` only authored
+`UsdGeomCamera.clippingRange` when `maxCamera->GetManualClip() != 0`
+(i.e. when the artist explicitly enabled the "Clip Manually" checkbox
+on the camera). In any other case the attribute was left unauthored and
+USD silently fell back to the `UsdGeomCamera` schema default of
+`(1.0, 1000000.0)` -- a far plane of one million scene units. With
+`metersPerUnit = 0.0254` (Max's default inch unit), that is a near
+plane at 1 inch and a far plane at roughly 25 km. The diagnostic
+corpus (`samples/complex_export.usda` / `complex_export.usdz`) exhibits
+this on its sole camera: `/root/Cam` has no `clippingRange` attribute.
+
+**Why it matters.** Three downstream costs:
+
+* **File is silent about intent.** A tool inspecting the layer cannot
+  tell whether the artist meant the (1, 1e6) range, never thought about
+  clipping at all, or had specific near/far values that the writer
+  dropped. The first two are indistinguishable in the file.
+* **Depth precision.** A far plane four orders of magnitude past the
+  scene's actual extent collapses depth-buffer precision into the
+  first 0.01% of the range. Renderers that rasterise (Hydra Storm,
+  realtime engines, USDZ viewers) lose mid-scene z-resolution.
+* **Far-plane clipping divergence.** Any artist who *did* author Near
+  Clip / Far Clip values in Max (without checking "Clip Manually" --
+  the values are still stored, Max's renderer just ignores them) sees
+  USD consumers ignore those values too. The visual demonstration in
+  `intended_example.md` shows backdrop spheres past Max's authored
+  far clip rendering anyway, because USD's silent (1, 1e6) fallback
+  swamps the artist's intent.
+
+**Fix.** Remove the `GetManualClip() != 0` gate around the
+`CreateClippingRangeAttr()` author in `CameraWriter::Write`. Always
+read `GetClipDist(timeVal, CAM_HITHER_CLIP / CAM_YON_CLIP)` (those
+values are stored on every Max camera regardless of the "Clip
+Manually" toggle -- the toggle only controls whether Max's *renderer*
+honours them) and write the result to USD. Sanity-clamp degenerate
+values: `near` falls back to `1.0` if non-positive / NaN / Inf;
+`far` falls back to `near + 1000.0` if `far ≤ near`.
+
+**Bounds (where the fix conservatively does nothing):**
+
+* The splines-export warning is still gated on
+  `GetManualClip() != 0`, because that is the only path that can carry
+  animated near/far values from Max's UI. Cameras with
+  "Clip Manually" off cannot have animated clip distances, so spamming
+  the warning on every non-physical-camera export would just be noise.
+* `MaxSDK::IPhysicalCamera` (the Physical Camera path) inherits from
+  `GenCamera` and uses the same `GetClipDist(...)` accessor, so the
+  unified codepath covers Physical / Target / Free / Orthographic.
+* The C++ change is in `CameraWriter::Write` only; the import path
+  (`CameraReader.cpp` / `CameraConverter.cpp`) was already reading
+  `clippingRange` correctly and is untouched.
+
+**Validator.** `validate_clipping_range_fix.py` (under the arch-build
+artifacts) opens the diagnostic corpus (`complex_export.usda`),
+confirms `/root/Cam` exhibits the bug (no `HasAuthoredValue()` on
+`clippingRange`), then mirrors the C++ change at the USD layer by
+authoring `clippingRange = (1.0, 1000.0)` on every Camera prim that
+lacks one. The postfix file is then verified to have an authored,
+sensible (positive, near < far) `clippingRange` on every camera, and
+a re-run is asserted to be a no-op (idempotence). Collateral check
+confirms that no other attribute on the Camera prim was disturbed.
+
+**Visual demonstration.** `intended_example.md`,
+`fixture_{prefix,postfix,reference}.usda`, and the three rendered
+PNGs (`render_karma_prefix.png`, `render_karma_postfix.png`,
+`render_unreal_reference.png`, side-by-side composite
+`compare_side_by_side.png`). The fixture deliberately includes
+backdrop geometry past the camera's stored far clip of 1000 so the
+fix's effect is observable -- the postfix correctly clips the
+backdrop spheres while the prefix renders them anyway.
+
+**Retirement condition.** Permanent. The Max camera's clip distance
+values are the only intentional near/far metadata Max carries about a
+camera; honouring them is correct regardless of the upstream
+`GetManualClip()` toggle.
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -766,6 +845,25 @@ and the fork wants to align. The Python validator's prefix match
   a Multi/Sub-Object material). Surfaces a `MaxUsd::Log::Warn` so
   the artist knows the per-face partition was dropped and how to
   preserve it (bind a Multi/Sub-Object material at the source node).
+* 2026-06-20 — MAX-CAM-001 camera clippingRange unconditional author:
+  remove the `maxCamera->GetManualClip() != 0` gate in
+  `CameraWriter::Write` so every exported camera authors an explicit
+  `UsdGeomCamera.clippingRange` from `GetClipDist(...)`, instead of
+  leaving the attribute unauthored and falling back to the
+  `UsdGeomCamera` default of `(1.0, 1000000.0)`. The Max camera's
+  clip distance values are stored on every camera regardless of the
+  "Clip Manually" toggle; the toggle only controls whether Max's own
+  renderer honours them, so honouring them in USD is correct in both
+  cases. Degenerate values (≤ 0, NaN, far ≤ near) are sanity-clamped
+  to `(1.0, 1000.0)` in scene units. The splines-mode warning that
+  was previously inside the `GetManualClip()` branch is preserved
+  with the same gate, because that is still the only path that can
+  carry animated clip values. The existing integration test
+  `test_default_physical_camera_attributes` in `io_camera_test.ms`,
+  which previously codified the broken behaviour (asserted USD's
+  `(1, 1000000)` fallback on a default-constructed `Physical`
+  camera), now asserts that the writer emits the camera's stored
+  `clip_near` / `clip_far` instead.
 * 2026-06-20 — MAX-GEO-003 GeomSubset name normalization: replace the
   legacy underscore-wrapped fallback pattern `_{N}_` in
   `MaterialUtils::CreateSubsetName` with the readable `mat_{N}` form.
