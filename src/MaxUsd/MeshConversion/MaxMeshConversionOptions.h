@@ -41,14 +41,19 @@ class MaxMeshConversionOptions : public DictionaryOptionProvider
 {
 public:
     /**
-     * \brief Conversion mode for normals. Normals can either be exported as primvars, or as simple attributes.
+     * \brief Conversion mode for normals. Normals can be exported as a USD primvar,
+     * as the UsdGeomMesh schema attribute, as both (primvar AND schema attribute, the
+     * default -- maximally compatible with both modern Hydra delegates and older
+     * consumers that only read the schema attribute, e.g. ARKit Quick Look), or
+     * omitted entirely.
      * \comment value of enum is important as it reflects the index in the ui of qcombobox
      */
     enum class MaxUSDAPI NormalsMode
     {
         AsPrimvar = 0,
         AsAttribute = 1,
-        None = 2
+        None = 2,
+        Both = 3
     };
 
     /**
