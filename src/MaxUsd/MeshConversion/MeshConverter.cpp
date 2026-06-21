@@ -642,19 +642,36 @@ bool MeshConverter::ApplyMaxNormals(
     pxr::UsdTimeCode                timeCode,
     bool                            animated)
 {
-    if (options.GetNormalMode() == MaxMeshConversionOptions::NormalsMode::None) {
+    const auto normalMode = options.GetNormalMode();
+    if (normalMode == MaxMeshConversionOptions::NormalsMode::None) {
         return false;
     }
 
+    const bool writePrimvar = (normalMode == MaxMeshConversionOptions::NormalsMode::AsPrimvar
+                               || normalMode == MaxMeshConversionOptions::NormalsMode::Both);
+    const bool writeSchemaAttr
+        = (normalMode == MaxMeshConversionOptions::NormalsMode::AsAttribute
+           || normalMode == MaxMeshConversionOptions::NormalsMode::Both);
+
     pxr::UsdAttribute                    normalsAttr;
+    pxr::UsdAttribute                    schemaNormalsAttr;
     std::unique_ptr<pxr::UsdGeomPrimvar> primvar;
-    if (options.GetNormalMode() == MaxMeshConversionOptions::NormalsMode::AsPrimvar) {
+    if (writePrimvar) {
         pxr::UsdGeomPrimvarsAPI primVarApi(mesh.GetPrim());
         primvar = std::make_unique<pxr::UsdGeomPrimvar>(primVarApi.CreatePrimvar(
             pxr::UsdImagingTokens->primvarsNormals, pxr::SdfValueTypeNames->Float3Array));
         normalsAttr = primvar->GetAttr();
-    } else {
-        normalsAttr = mesh.GetNormalsAttr();
+    }
+    if (writeSchemaAttr) {
+        schemaNormalsAttr = mesh.GetNormalsAttr();
+        // For AsAttribute mode `normalsAttr` is unset above; use the schema
+        // attribute as the primary authored attribute for the
+        // _checkWriteAttribute() animation-skipping decision below. For Both
+        // mode either attribute serves equally; keep using the primvar so
+        // the skip decision is identical to the historical AsPrimvar path.
+        if (!writePrimvar) {
+            normalsAttr = schemaNormalsAttr;
+        }
     }
 
     // Check if we need to write out normals at this time, given the concerned channels
@@ -692,13 +709,32 @@ bool MeshConverter::ApplyMaxNormals(
         ? MappedAttributeBuilder::DataLayout(pxr::UsdGeomTokens->faceVarying, true)
         : primvarConverter.InferAttributeDataLayout();
 
-    if (options.GetNormalMode() == MaxMeshConversionOptions::NormalsMode::AsPrimvar) {
+    if (writePrimvar) {
         primvar->SetInterpolation(dataLayout.GetInterpolation());
-    } else {
+    }
+    if (writeSchemaAttr) {
         mesh.SetNormalsInterpolation(dataLayout.GetInterpolation());
     }
 
-    return primvarConverter.PopulateAttribute(normalsAttr, dataLayout, primvar.get(), timeCode);
+    // PopulateAttribute writes one attribute at a time. For Both mode call
+    // it twice -- once for the indexed primvar (which carries
+    // primvar->SetIndices when the layout is indexed-vertex) and once for
+    // the schema attribute (which receives the flattened representation,
+    // since UsdGeomMesh.normals does not support primvar-style indices).
+    bool ok = true;
+    if (writePrimvar) {
+        ok = primvarConverter.PopulateAttribute(normalsAttr, dataLayout, primvar.get(), timeCode);
+    }
+    if (writeSchemaAttr) {
+        // Force non-indexed (flattened) layout for the schema attribute --
+        // it has no sidecar indices array. Primvar layout is unchanged.
+        MappedAttributeBuilder::DataLayout schemaLayout(
+            dataLayout.GetInterpolation(), /* indexed */ false);
+        const bool schemaOk
+            = primvarConverter.PopulateAttribute(schemaNormalsAttr, schemaLayout, nullptr, timeCode);
+        ok = ok && schemaOk;
+    }
+    return ok;
 }
 
 bool MeshConverter::ChannelToPrimvar(
