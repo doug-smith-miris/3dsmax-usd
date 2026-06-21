@@ -57,7 +57,8 @@ Status legend:
 | PhysicalMaterial.emission (none authored) | `standard_surface.emission` + `standard_surface.emission_color` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits `emission = 1.0` AND `emission_color = (0, 0, 0)`, both static | MAX-MAT-002 | 2026-06-20 |
 | Node.wireColor / Node.material.diffuse | `UsdGeomMesh.primvars:displayColor` | bug normalization | (mesh primvar; not a shader nodedef) | `MeshConverter` is about to author wireColor into `primvars:displayColor` AND `node->GetMtl() != nullptr` | MAX-MAT-003 | 2026-06-20 |
 | Mesh normals (every interpolation) | `primvars:normals` AND `UsdGeomMesh.normals` (the schema attribute) | bug normalization | (mesh attribute; not a shader nodedef) | `NormalsMode` default is now `Both` -- both locations are authored unless the user explicitly picks `AsPrimvar` or `AsAttribute` | MAX-GEO-001 | 2026-06-20 |
-| Map channel 1 missing on the converted MNMesh | `primvars:st` (channel 1's configured primvar) | approximating workaround | (mesh primvar; not a shader nodedef) | `ApplyMaxMapChannels` did not author the channel-1 primvar AND channel 1 is not explicitly opted out (`GetChannelPrimvarConfig(1).GetPrimvarName().IsEmpty()`) AND VertexCount() > 0 AND FaceCount() > 0 | (this PR) | 2026-06-20 |
+| Map channel 1 missing on the converted MNMesh | `primvars:st` (channel 1's configured primvar) | approximating workaround | (mesh primvar; not a shader nodedef) | `ApplyMaxMapChannels` did not author the channel-1 primvar AND channel 1 is not explicitly opted out (`GetChannelPrimvarConfig(1).GetPrimvarName().IsEmpty()`) AND VertexCount() > 0 AND FaceCount() > 0 | MAX-GEO-004 | 2026-06-20 |
+| Per-face matIds on a mesh whose bound material is non-MultiMtl | (no GeomSubsets; first matId stored as `customData.3dsmax.matId` on the Mesh prim) | bug normalization | (Mesh prim; not a shader nodedef) | `materialIdToFacesMap.size() > 1` AND `node->GetMtl()` is null or a non-MultiMtl AND the prim does not already have existing `materialBind` subsets | (this PR) | 2026-06-20 |
 
 ## Notes per expression
 
@@ -483,6 +484,128 @@ source mesh (no UV channel in → no UV primvar out); for now the
 fallback is unconditional whenever channel 1 is configured to write,
 which is the catalog's "best practice" default.
 
+### Per-face matIds on a non-MultiMtl mesh → drop GeomSubsets, keep first matId as customData (MAX-GEO-002)
+
+**Symptom.** `MaxUsd::MeshConverter::ApplyMaxMaterialIDs()` creates a
+`GeomSubset` per distinct face mat-ID in the `materialBind` family
+whenever `materialIdToFacesMap.size() > 1`, regardless of what is bound
+to the mesh. 3ds Max parametric primitives (`Box`, `Cylinder`, `Cone`,
+`ChamferBox`, ...) default *each face* to a distinct sub-material ID
+even when the artist has bound a single (non-Multi) material at the
+node level — Box → matIds 1..6 (one per face), Cylinder → matIds 1..3
+(side / top / bottom), and so on. The diagnostic corpus exhibits the
+result: `/root/Box` carries six `GeomSubset`s named `_1_` … `_6_` and
+`/root/Cylinder` carries three (`_1_` / `_2_` / `_3_`). Each subset has
+`familyName = "materialBind"`, an `indices` array selecting one face,
+and a `customData.3dsmax.matId` value, but **no** `material:binding`
+relationship of its own. The mesh-level `material:binding` is a single
+PhysicalMaterial.
+
+**Why it matters.** A subset in the `materialBind` family is only
+meaningful if something reads its `customData.3dsmax.matId` and picks
+a corresponding submaterial from a bound MultiMtl. The MaxUSD importer
+does exactly that — `MaxUsdTranslatorMaterial::AssignMaterial` casts
+`node->GetMtl()` to `MultiMtl*` and consults the subsets only when the
+cast succeeds. When the bound material is a single PhysicalMaterial /
+OpenPBR / MaterialXMaterial / ... (the common case for parametric
+primitives), the cast fails and the subsets contribute nothing on
+round-trip. Net effects:
+
+* Layer bloat. The diagnostic corpus exports nine ghost prims (six on
+  Box, three on Cylinder) that mean nothing semantically.
+* False signal. `familyName = "materialBind"` plus
+  `subsetFamily:materialBind:familyType = "partition"` declares
+  "the writer wants this mesh's faces partitioned for per-face material
+  binding." Downstream consumers (USDZ packagers, scene-graph viewers,
+  some Hydra delegate configurations) may treat that declaration as
+  an authoring intent and warn that no submaterials are bound, or even
+  refuse to bake a single-material thumbnail. The writer authored that
+  intent unintentionally — the artist bound a single material.
+* Round-trip noise. The matId customData on each subset is consulted
+  by `MeshConverter::ApplyUSDMaterialIDs` on import. With no MultiMtl
+  bound, nothing reads the matIds back, and a future re-export
+  recreates the same ghost subsets — the bloat is sticky.
+
+PBR renderers (Karma, Hydra Storm, RenderMan) render the mesh
+identically prefix vs postfix: the mesh-level `material:binding` is
+the only resolvable binding either way, the subsets carry no shader,
+and Karma's BSDF math has nothing to act on. The bug is silent at
+render time and visible only in the layer / metadata.
+
+**Fix.** Generalize the existing `materialIdToFacesMap.size() == 1`
+early-out in `ApplyMaxMaterialIDs`. When the bound material is null
+or non-MultiMtl, and the prim does not already carry pre-existing
+`materialBind` subsets (which would imply an earlier authoring pass
+we should not destroy), collapse to the same single-matId metadata
+path the size-1 case uses:
+
+```cpp
+const bool boundIsMultiMtl = (mtl != nullptr) && mtl->IsMultiMtl();
+if (!boundIsMultiMtl) {
+    pxr::UsdShadeMaterialBindingAPI meshBindingAPIForCheck(usdPrim);
+    const auto existingSubsetsCheck =
+        meshBindingAPIForCheck.GetMaterialBindSubsets();
+    if (existingSubsetsCheck.empty()) {
+        int matId = materialIdToFacesMap.begin()->first + 1;
+        usdPrim.SetCustomDataByKey(
+            MaxUsd::MetaData::matId, pxr::VtValue(matId));
+        MaxUsd::Log::Warn(/* MAX-GEO-002 explainer */);
+        return;
+    }
+    // Fall through if subsets already exist -- a previous authoring
+    // pass put them there, don't fight it.
+}
+```
+
+`MaxUsd::MetaData::matId` records the *first* face's matId so the
+round-trip importer's `GetMaterialIdFromCustomData` sees a sensible
+value rather than nothing. Per-face matId variation is lost — but it
+was never driving any rendered difference, because the bound
+material is a single shader. The warning explains exactly that: bind
+a MultiMtl with one submaterial per matId to preserve the partition.
+
+**Bounds (where the fix conservatively does nothing):**
+
+* `mtl != nullptr && mtl->IsMultiMtl()` — subsets *can* drive
+  submaterial selection. The existing partition-authoring path is
+  retained verbatim.
+* `materialIdToFacesMap.size() == 1` — only one matId in the source
+  mesh. Handled by the existing early-return; no subsets needed
+  regardless of material type.
+* `existingSubsets` non-empty — the writer is being re-run over a
+  prim that already has materialBind subsets (e.g. animated
+  re-export over time samples). The new gate falls through to the
+  existing index-writing loop so we don't destroy prior authoring.
+* `materialIdToFacesMap.empty()` — the caller already guards on this
+  before calling `ApplyMaxMaterialIDs`, so the function never runs
+  in that case.
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/a45838e5-b07d-473e-9015-5a016422b430/normalize_ghost_geomsubsets.py`
+mirrors the C++ branch at the USD layer. Running it on the
+post-MAX-GEO-004 corpus
+(`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/f787408d-043c-445e-a483-5c5a21577376/complex_export_postfix.usda`)
+removes nine ghost subsets (six from Box, three from Cylinder),
+strips the per-mesh
+`subsetFamily:materialBind:familyType = "partition"` metadata, and
+sets `customData.3dsmax.matId = 1` on each former-host mesh while
+preserving every mesh-level `material:binding`. The other four
+meshes (Ground, Teapot, Sphere, Torus) are unchanged — they already
+had zero subsets.
+
+Karma renders of the prefix and postfix corpus are SHA-256-identical:
+the PBR-path zero-regression signal. The subsets contributed nothing
+to the BSDF and stripping them cannot change a single pixel.
+
+**Retirement condition.** This is not a workaround for an external
+3ds Max bug — the code being fixed is the fork's own
+`MeshConverter::ApplyMaxMaterialIDs`. The fix is permanent. A future
+bite may add an opt-in `MaxMeshConversionOptions::SetEmitGhostMaterialSubsets(true)`
+for round-trip purists who want a 1:1 representation of the source
+mesh (every face mat-ID round-trips as a subset, even when nothing
+binds to it). For now the default is "don't pollute the layer with
+ghost partitions," which matches the catalog's "best practice".
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -513,3 +636,14 @@ which is the catalog's "best practice" default.
   already exist, or when the mesh is degenerate. Surfaces a
   `MaxUsd::Log::Warn` so the artist knows to enable `Generate Mapping
   Coords.` or apply a UVW Map modifier for accurate UVs.
+* 2026-06-20 — MAX-GEO-002 ghost GeomSubset suppression: generalise
+  the existing `materialIdToFacesMap.size() == 1` early-out in
+  `MeshConverter::ApplyMaxMaterialIDs` to also short-circuit when the
+  bound material is null or a non-MultiMtl, collapsing the per-face
+  matId partition to a single `customData.3dsmax.matId` on the mesh
+  prim. Avoids emitting `materialBind`-family GeomSubsets that carry
+  no `material:binding` of their own (the common pattern on
+  parametric primitives whose default face mat-IDs are not driven by
+  a Multi/Sub-Object material). Surfaces a `MaxUsd::Log::Warn` so
+  the artist knows the per-face partition was dropped and how to
+  preserve it (bind a Multi/Sub-Object material at the source node).

@@ -1188,6 +1188,67 @@ void MeshConverter::ApplyMaxMaterialIDs(
         return;
     }
 
+    // MAX-GEO-002: ghost GeomSubsets are pure overhead when the bound material
+    // is not a MultiMtl. A subset in the `materialBind` family only contributes
+    // when something can read its matId customData and pick a corresponding
+    // submaterial -- which only happens when the mesh-level binding is a
+    // MultiMtl (see MaxUsdTranslatorMaterial::AssignMaterial, which casts
+    // node->GetMtl() to MultiMtl* before consulting the subsets). With a
+    // single material at the mesh level (or no material at all), the subsets
+    // carry no material:binding rel of their own, contribute nothing on
+    // round-trip import, bloat the USD layer (the diagnostic corpus's Box
+    // exports 6 such ghost subsets and Cylinder exports 3), and mislead any
+    // consumer that interprets `familyName = "materialBind"` as a request for
+    // per-face material variation.
+    //
+    // The parametric Max primitives (Box, Cylinder, Cone, ChamferBox, ...)
+    // are the common source: each parametric face seeds a distinct default
+    // sub-material id even when the artist has bound a single material at
+    // the node level. The result is the layer-bloat pattern documented in
+    // doc/translation-mapping.md (MAX-GEO-002).
+    //
+    // Collapse to the single-matId metadata path (preserve the first matId
+    // as customData so the round-trip importer's GetMaterialIdFromCustomData
+    // sees something sensible) when the bound material is not a MultiMtl.
+    // Emit a Log::Warn so the artist knows the per-face partition was
+    // dropped and how to surface it again (bind a MultiMtl with one
+    // submaterial per matId).
+    //
+    // Bounds (where the fix conservatively does nothing):
+    //  - mtl != nullptr && mtl->IsMultiMtl() -- subsets can drive submaterial
+    //    selection, keep them and the existing partition-authoring behavior.
+    //  - materialIdToFacesMap.size() == 1 -- handled by the early return
+    //    above, no subset partitioning needed regardless of material type.
+    //  - existingSubsets already populated -- the writer is re-running over a
+    //    prim that already has subsets (e.g. animated re-export of subset
+    //    indices over time), preserve the existing layer shape so we don't
+    //    fight an earlier authoring pass.
+    const bool boundIsMultiMtl = (mtl != nullptr) && mtl->IsMultiMtl();
+    if (!boundIsMultiMtl) {
+        pxr::UsdShadeMaterialBindingAPI meshBindingAPIForCheck(usdPrim);
+        const auto existingSubsetsCheck = meshBindingAPIForCheck.GetMaterialBindSubsets();
+        if (existingSubsetsCheck.empty()) {
+            int matId = materialIdToFacesMap.begin()->first + 1;
+            usdPrim.SetCustomDataByKey(MaxUsd::MetaData::matId, pxr::VtValue(matId));
+            MaxUsd::Log::Warn(
+                "{0} has {1} per-face material ids but its bound material is not a "
+                "Multi/Sub-Object material; collapsing to the first matId ({2}) and "
+                "skipping GeomSubset creation. Ghost GeomSubsets in the materialBind "
+                "family with no material:binding of their own bloat the USD layer and "
+                "mislead consumers that expect familyName=\"materialBind\" to mean "
+                "per-face material variation. To preserve per-face material assignment, "
+                "bind a Multi/Sub-Object material at the source node with one "
+                "submaterial per matId (MAX-GEO-002).",
+                usdPrim.GetPath().GetString(),
+                materialIdToFacesMap.size(),
+                matId);
+            return;
+        }
+        // Fall through to the existing partition-writing path when subsets
+        // already exist on the prim; we only want to avoid *creating* new
+        // ghost subsets, not destroying any pre-existing authoring.
+    }
+
     pxr::UsdShadeMaterialBindingAPI meshBindingAPI(usdPrim);
     const auto                      existingSubsets = meshBindingAPI.GetMaterialBindSubsets();
     bool                            createSubsets = existingSubsets.empty();
