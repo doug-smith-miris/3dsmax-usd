@@ -226,11 +226,38 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
         }
 
         {
-            // If the displayColor is not already authored, set it to the wireColor.
+            // MAX-MAT-003: derive primvars:displayColor from the bound
+            // material's diffuse color when a material is assigned to the
+            // node. The 3ds Max viewport wireframe color is a scene-graph
+            // organizational tag (a hue used to distinguish nodes in the
+            // viewport); it has no relationship to the surface's actual
+            // color. Writing it as primvars:displayColor misleads any USD
+            // consumer that falls back to displayColor when the bound
+            // UsdShade material cannot be evaluated -- minimal Hydra
+            // delegates, ARKit Quick Look paths without MaterialX, the
+            // usdview displayColor overlay, thumbnailers, etc. Use the
+            // material's diffuse instead so the fallback color agrees with
+            // the authored material.
+            //
+            // When no material is bound the wireframe color is the best
+            // representational color we have, so the existing behavior
+            // (write the wireframe color) is preserved as the fallback.
+            //
+            // Mtl::GetDiffuse(int mtlNum = 0) is the universal accessor for
+            // a "main" diffuse on any material plugin and is what the
+            // LastResortUSDPreviewSurfaceWriter uses to author the bound
+            // material's diffuseColor. For a MultiMtl it returns the first
+            // sub-material's diffuse, which is still more representative of
+            // the artist's intent than the viewport wireframe color.
             if (!usdMesh.GetDisplayColorAttr().IsAuthored()) {
-                Color             wireColor(node->GetWireColor());
-                pxr::VtVec3fArray usdDisplayColor
-                    = { pxr::GfVec3f(wireColor.r, wireColor.g, wireColor.b) };
+                Color displayColorSrc;
+                if (Mtl* boundMtl = node->GetMtl()) {
+                    displayColorSrc = boundMtl->GetDiffuse();
+                } else {
+                    displayColorSrc = Color(node->GetWireColor());
+                }
+                pxr::VtVec3fArray usdDisplayColor = { pxr::GfVec3f(
+                    displayColorSrc.r, displayColorSrc.g, displayColorSrc.b) };
                 usdMesh.CreateDisplayColorAttr().Set(usdDisplayColor);
             }
         }
@@ -615,19 +642,36 @@ bool MeshConverter::ApplyMaxNormals(
     pxr::UsdTimeCode                timeCode,
     bool                            animated)
 {
-    if (options.GetNormalMode() == MaxMeshConversionOptions::NormalsMode::None) {
+    const auto normalMode = options.GetNormalMode();
+    if (normalMode == MaxMeshConversionOptions::NormalsMode::None) {
         return false;
     }
 
+    const bool writePrimvar = (normalMode == MaxMeshConversionOptions::NormalsMode::AsPrimvar
+                               || normalMode == MaxMeshConversionOptions::NormalsMode::Both);
+    const bool writeSchemaAttr
+        = (normalMode == MaxMeshConversionOptions::NormalsMode::AsAttribute
+           || normalMode == MaxMeshConversionOptions::NormalsMode::Both);
+
     pxr::UsdAttribute                    normalsAttr;
+    pxr::UsdAttribute                    schemaNormalsAttr;
     std::unique_ptr<pxr::UsdGeomPrimvar> primvar;
-    if (options.GetNormalMode() == MaxMeshConversionOptions::NormalsMode::AsPrimvar) {
+    if (writePrimvar) {
         pxr::UsdGeomPrimvarsAPI primVarApi(mesh.GetPrim());
         primvar = std::make_unique<pxr::UsdGeomPrimvar>(primVarApi.CreatePrimvar(
             pxr::UsdImagingTokens->primvarsNormals, pxr::SdfValueTypeNames->Float3Array));
         normalsAttr = primvar->GetAttr();
-    } else {
-        normalsAttr = mesh.GetNormalsAttr();
+    }
+    if (writeSchemaAttr) {
+        schemaNormalsAttr = mesh.GetNormalsAttr();
+        // For AsAttribute mode `normalsAttr` is unset above; use the schema
+        // attribute as the primary authored attribute for the
+        // _checkWriteAttribute() animation-skipping decision below. For Both
+        // mode either attribute serves equally; keep using the primvar so
+        // the skip decision is identical to the historical AsPrimvar path.
+        if (!writePrimvar) {
+            normalsAttr = schemaNormalsAttr;
+        }
     }
 
     // Check if we need to write out normals at this time, given the concerned channels
@@ -665,13 +709,32 @@ bool MeshConverter::ApplyMaxNormals(
         ? MappedAttributeBuilder::DataLayout(pxr::UsdGeomTokens->faceVarying, true)
         : primvarConverter.InferAttributeDataLayout();
 
-    if (options.GetNormalMode() == MaxMeshConversionOptions::NormalsMode::AsPrimvar) {
+    if (writePrimvar) {
         primvar->SetInterpolation(dataLayout.GetInterpolation());
-    } else {
+    }
+    if (writeSchemaAttr) {
         mesh.SetNormalsInterpolation(dataLayout.GetInterpolation());
     }
 
-    return primvarConverter.PopulateAttribute(normalsAttr, dataLayout, primvar.get(), timeCode);
+    // PopulateAttribute writes one attribute at a time. For Both mode call
+    // it twice -- once for the indexed primvar (which carries
+    // primvar->SetIndices when the layout is indexed-vertex) and once for
+    // the schema attribute (which receives the flattened representation,
+    // since UsdGeomMesh.normals does not support primvar-style indices).
+    bool ok = true;
+    if (writePrimvar) {
+        ok = primvarConverter.PopulateAttribute(normalsAttr, dataLayout, primvar.get(), timeCode);
+    }
+    if (writeSchemaAttr) {
+        // Force non-indexed (flattened) layout for the schema attribute --
+        // it has no sidecar indices array. Primvar layout is unchanged.
+        MappedAttributeBuilder::DataLayout schemaLayout(
+            dataLayout.GetInterpolation(), /* indexed */ false);
+        const bool schemaOk
+            = primvarConverter.PopulateAttribute(schemaNormalsAttr, schemaLayout, nullptr, timeCode);
+        ok = ok && schemaOk;
+    }
+    return ok;
 }
 
 bool MeshConverter::ChannelToPrimvar(
