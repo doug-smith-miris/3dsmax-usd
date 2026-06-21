@@ -58,7 +58,8 @@ Status legend:
 | Node.wireColor / Node.material.diffuse | `UsdGeomMesh.primvars:displayColor` | bug normalization | (mesh primvar; not a shader nodedef) | `MeshConverter` is about to author wireColor into `primvars:displayColor` AND `node->GetMtl() != nullptr` | MAX-MAT-003 | 2026-06-20 |
 | Mesh normals (every interpolation) | `primvars:normals` AND `UsdGeomMesh.normals` (the schema attribute) | bug normalization | (mesh attribute; not a shader nodedef) | `NormalsMode` default is now `Both` -- both locations are authored unless the user explicitly picks `AsPrimvar` or `AsAttribute` | MAX-GEO-001 | 2026-06-20 |
 | Map channel 1 missing on the converted MNMesh | `primvars:st` (channel 1's configured primvar) | approximating workaround | (mesh primvar; not a shader nodedef) | `ApplyMaxMapChannels` did not author the channel-1 primvar AND channel 1 is not explicitly opted out (`GetChannelPrimvarConfig(1).GetPrimvarName().IsEmpty()`) AND VertexCount() > 0 AND FaceCount() > 0 | MAX-GEO-004 | 2026-06-20 |
-| Per-face matIds on a mesh whose bound material is non-MultiMtl | (no GeomSubsets; first matId stored as `customData.3dsmax.matId` on the Mesh prim) | bug normalization | (Mesh prim; not a shader nodedef) | `materialIdToFacesMap.size() > 1` AND `node->GetMtl()` is null or a non-MultiMtl AND the prim does not already have existing `materialBind` subsets | (this PR) | 2026-06-20 |
+| Per-face matIds on a mesh whose bound material is non-MultiMtl | (no GeomSubsets; first matId stored as `customData.3dsmax.matId` on the Mesh prim) | bug normalization | (Mesh prim; not a shader nodedef) | `materialIdToFacesMap.size() > 1` AND `node->GetMtl()` is null or a non-MultiMtl AND the prim does not already have existing `materialBind` subsets | MAX-GEO-002 | 2026-06-20 |
+| GeomSubset name for the null / non-Multi / unnamed-slot fallback path | `mat_{maxScriptId}` (single material) / `mat_{maxScriptId}_{subMtlName}` (multi w/o slot name) | cosmetic normalization | (Mesh / GeomSubset prim name; not a shader nodedef) | `MaterialUtils::CreateSubsetName` is invoked AND (the bound material is null/non-Multi OR the Multi/Sub-Object slot name is empty) | (this PR) | 2026-06-20 |
 
 ## Notes per expression
 
@@ -606,6 +607,124 @@ mesh (every face mat-ID round-trips as a subset, even when nothing
 binds to it). For now the default is "don't pollute the layer with
 ghost partitions," which matches the catalog's "best practice".
 
+### GeomSubset name fallback → `mat_{maxScriptId}` instead of `_{maxScriptId}_`  (MAX-GEO-003)
+
+**Symptom.** `MaxUsd::MaterialUtils::CreateSubsetName` constructs USD
+`GeomSubset` prim names from the source-mesh face matId. When the bound
+material is null or non-Multi (the legacy single-material fallback
+branch), or when a `MultiMtl` is bound but the artist never set a slot
+name, the writer wraps the integer matId in **both** a leading and a
+trailing underscore: `_1_`, `_2_`, …, `_6_`. The diagnostic corpus
+shows the pattern on the parametric-primitive subsets the
+pre-MAX-GEO-002 writer used to emit:
+
+```
+/root/Box/_1_        # matId 1
+/root/Box/_2_        # matId 2
+...
+/root/Cylinder/_1_   # matId 1
+```
+
+USD identifiers cannot start with a digit (`/root/Box/1` is illegal),
+so *some* leading character is required, and the writer chose `_`. But
+the **trailing** underscore — and the wrapping pattern — were never
+necessary. They make the names harder to grep, uglier in the
+Layer Explorer / `usdview` Prim Tree, and inconsistent with the
+neighbouring "real slot name" branch (which uses bare
+`material_slot_name`).
+
+The multi-material-with-no-slot-name branch had the same wart:
+`_{N}_{subMaterialName}` (e.g. `_3_some_material_name`) — a leading
+underscore on a name that already had a perfectly usable suffix.
+
+**Why it matters.** Cosmetic only — `_N_` is a legal USD identifier
+and round-trips through the importer fine (`TranslatorMaterial.cpp`
+uses `subsetPrim.GetPath().GetName()` as an opaque string for
+MultiMtl slot lookup, never parses the format). The bug doesn't
+render and doesn't break round-trip semantics:
+
+* USDView / Layer Editor: subsets sort alphabetically as `_1_`, `_2_`,
+  … which lines up *visually* but the leading underscore is noise.
+* Grep / scripting: `grep '/_[0-9]\+_$'` works but is awkward;
+  `grep '/mat_[0-9]\+$'` reads as intent.
+* Convention: the rest of the USD ecosystem (Maya USD exporter,
+  Houdini Solaris, asset-validation suites) names per-face material
+  subsets with a `mat_*` or `submat_*` prefix. The legacy 3ds Max
+  format diverges for no functional reason.
+
+PBR renderers (Karma, Hydra Storm, RenderMan) treat the name as
+opaque metadata — renaming `_1_` → `mat_1` cannot change a single
+pixel.
+
+**Fix.** Rewrite the two branches in `CreateSubsetName` to use
+`mat_{maxScriptId}` instead of the underscore-wrapped pattern:
+
+```cpp
+// null / non-Multi material:
+//   was: name.append("_").append(maxScriptId).append("_");
+//   now: name.append("mat_").append(maxScriptId);
+
+// Multi material, slot name empty:
+//   was: name.append("_").append(maxScriptId).append("_");
+//        then optionally append subMtl->GetName().
+//   now: name.append("mat_").append(maxScriptId);
+//        then append "_" + subMtl->GetName() when non-empty.
+```
+
+The third branch — `MultiMtl` with a non-empty slot name — was
+already clean (`material_slot_name`) and is unchanged.
+
+`pxr::TfMakeValidIdentifier` is still called as the last step so any
+non-identifier characters in a sub-material name continue to be
+sanitised (spaces → `_`, etc).
+
+**Bounds (where the fix conservatively does nothing):**
+
+* `MultiMtl` with a non-empty slot name — already used the slot name
+  verbatim, no leading underscore to strip.
+* Subset names imported from existing USD files (the `_N_` legacy
+  ones) — the import path (`TranslatorMaterial.cpp`,
+  `import_material_id_test.ms`) treats the name as opaque and keeps
+  whatever the file says. Old `_N_`-style files round-trip unchanged.
+* Names that have already been deduplicated by
+  `UniqueNameGenerator::GetName` — `MeshConverter.cpp` still applies
+  it after `CreateSubsetName`, so a hypothetical collision between
+  `mat_1` and a sibling subset already named `mat_1` resolves the
+  same way it always did (`mat_1_1`, `mat_1_2`, …).
+
+**Test updates that follow the rename:**
+
+* `src/Tests/Unit/MaxUsd.MaterialUtils.test.cpp` — asserts the new
+  names directly (`mat_1`, `mat_6`, `mat_11`, `mat_3_some_material_name`).
+* `src/Tests/Integration/ShellMtl_ShaderWriter_test.ms` — the
+  Shell_Material test that exercises the same `CreateSubsetName`
+  fallback now expects `mat_1` … `mat_6` for the per-face subsets.
+* `src/Tests/Integration/import_material_id_test.ms` is intentionally
+  **not** changed: it constructs synthetic USDs with `_N_` subset
+  names and verifies the *importer* preserves them as MultiMtl slot
+  names. That's the backward-compat read path and is independent of
+  the exporter's naming convention.
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/c53f77f5-d3ee-40c5-8cb6-d6003bfd230e/normalize_geomsubset_naming.py`
+mirrors the rename at the USD layer. Running it on the pre-MAX-GEO-002
+corpus
+(`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/44966a53-f273-422c-9ce9-c1f2d7e477c1/complex_export_prefix.usda`)
+renames the nine subsets (`/root/Box/_1_` … `/root/Box/_6_` and
+`/root/Cylinder/_1_` … `/root/Cylinder/_3_`) to `mat_1` … `mat_6` and
+`mat_1` … `mat_3`, preserves every `indices`, `familyName`,
+`customData.3dsmax.matId`, and `material:binding` (none of those exist
+on the ghost subsets, but the assertion is unconditional), and is
+idempotent (re-running on the postfix is a no-op). Karma renders of
+the prefix and postfix corpus are SHA-256-identical: the rename
+contributes nothing to the BSDF and cannot change a single pixel.
+
+**Retirement condition.** Permanent. This is the fork's own naming
+convention; the only reason a future change might revisit it is if the
+USD ecosystem standardises a different prefix (`submat_N`, `face_N`)
+and the fork wants to align. The Python validator's prefix match
+(`r'_(\d+)_(.*)'`) would then become the migration helper.
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -647,3 +766,18 @@ ghost partitions," which matches the catalog's "best practice".
   a Multi/Sub-Object material). Surfaces a `MaxUsd::Log::Warn` so
   the artist knows the per-face partition was dropped and how to
   preserve it (bind a Multi/Sub-Object material at the source node).
+* 2026-06-20 — MAX-GEO-003 GeomSubset name normalization: replace the
+  legacy underscore-wrapped fallback pattern `_{N}_` in
+  `MaterialUtils::CreateSubsetName` with the readable `mat_{N}` form.
+  Applies to two branches: (a) null / non-Multi bound material; and
+  (b) Multi/Sub-Object material with an empty slot name (the name
+  becomes `mat_{N}_{subMtlName}` once the suffix is appended). The
+  third branch — `MultiMtl` with a populated slot name — already used
+  the slot name verbatim and is unchanged. Cosmetic only: subset
+  names are opaque metadata to renderers (Karma SHA-256-identical
+  prefix vs postfix) and the round-trip importer
+  (`TranslatorMaterial.cpp`) consumes the name as a string. Older USD
+  files with `_N_` subsets read back unchanged. Unit and ShellMtl
+  integration tests updated to assert the new pattern; the
+  back-compat read test (`import_material_id_test.ms`) still
+  constructs synthetic `_N_` inputs and is intentionally unchanged.
