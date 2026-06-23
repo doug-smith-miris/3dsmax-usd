@@ -226,11 +226,38 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
         }
 
         {
-            // If the displayColor is not already authored, set it to the wireColor.
+            // MAX-MAT-003: derive primvars:displayColor from the bound
+            // material's diffuse color when a material is assigned to the
+            // node. The 3ds Max viewport wireframe color is a scene-graph
+            // organizational tag (a hue used to distinguish nodes in the
+            // viewport); it has no relationship to the surface's actual
+            // color. Writing it as primvars:displayColor misleads any USD
+            // consumer that falls back to displayColor when the bound
+            // UsdShade material cannot be evaluated -- minimal Hydra
+            // delegates, ARKit Quick Look paths without MaterialX, the
+            // usdview displayColor overlay, thumbnailers, etc. Use the
+            // material's diffuse instead so the fallback color agrees with
+            // the authored material.
+            //
+            // When no material is bound the wireframe color is the best
+            // representational color we have, so the existing behavior
+            // (write the wireframe color) is preserved as the fallback.
+            //
+            // Mtl::GetDiffuse(int mtlNum = 0) is the universal accessor for
+            // a "main" diffuse on any material plugin and is what the
+            // LastResortUSDPreviewSurfaceWriter uses to author the bound
+            // material's diffuseColor. For a MultiMtl it returns the first
+            // sub-material's diffuse, which is still more representative of
+            // the artist's intent than the viewport wireframe color.
             if (!usdMesh.GetDisplayColorAttr().IsAuthored()) {
-                Color             wireColor(node->GetWireColor());
-                pxr::VtVec3fArray usdDisplayColor
-                    = { pxr::GfVec3f(wireColor.r, wireColor.g, wireColor.b) };
+                Color displayColorSrc;
+                if (Mtl* boundMtl = node->GetMtl()) {
+                    displayColorSrc = boundMtl->GetDiffuse();
+                } else {
+                    displayColorSrc = Color(node->GetWireColor());
+                }
+                pxr::VtVec3fArray usdDisplayColor = { pxr::GfVec3f(
+                    displayColorSrc.r, displayColorSrc.g, displayColorSrc.b) };
                 usdMesh.CreateDisplayColorAttr().Set(usdDisplayColor);
             }
         }
@@ -461,6 +488,11 @@ void MeshConverter::ConvertToUSDMesh(
     ApplyMaxNormals(maxMesh, usdMesh, options, intervals, usdTime, animated);
     ApplyMaxMapChannels(maxMesh, usdMesh, options, intervals, usdTime, animated);
 
+    // MAX-GEO-004: backfill the channel-1 UV primvar (default `st`) with a
+    // planar-projection fallback when the source mesh did not contribute
+    // any UVs through ApplyMaxMapChannels. See doc/translation-mapping.md.
+    EnsureFallbackStPrimvar(maxMesh, usdMesh, options, usdTime);
+
     if (maxMesh.HasCreaseSupport()) {
         ApplyMaxVertCreases(maxMesh, usdMesh, usdTime);
         ApplyMaxEdgeCreases(maxMesh, usdMesh, usdTime);
@@ -615,19 +647,36 @@ bool MeshConverter::ApplyMaxNormals(
     pxr::UsdTimeCode                timeCode,
     bool                            animated)
 {
-    if (options.GetNormalMode() == MaxMeshConversionOptions::NormalsMode::None) {
+    const auto normalMode = options.GetNormalMode();
+    if (normalMode == MaxMeshConversionOptions::NormalsMode::None) {
         return false;
     }
 
+    const bool writePrimvar = (normalMode == MaxMeshConversionOptions::NormalsMode::AsPrimvar
+                               || normalMode == MaxMeshConversionOptions::NormalsMode::Both);
+    const bool writeSchemaAttr
+        = (normalMode == MaxMeshConversionOptions::NormalsMode::AsAttribute
+           || normalMode == MaxMeshConversionOptions::NormalsMode::Both);
+
     pxr::UsdAttribute                    normalsAttr;
+    pxr::UsdAttribute                    schemaNormalsAttr;
     std::unique_ptr<pxr::UsdGeomPrimvar> primvar;
-    if (options.GetNormalMode() == MaxMeshConversionOptions::NormalsMode::AsPrimvar) {
+    if (writePrimvar) {
         pxr::UsdGeomPrimvarsAPI primVarApi(mesh.GetPrim());
         primvar = std::make_unique<pxr::UsdGeomPrimvar>(primVarApi.CreatePrimvar(
             pxr::UsdImagingTokens->primvarsNormals, pxr::SdfValueTypeNames->Float3Array));
         normalsAttr = primvar->GetAttr();
-    } else {
-        normalsAttr = mesh.GetNormalsAttr();
+    }
+    if (writeSchemaAttr) {
+        schemaNormalsAttr = mesh.GetNormalsAttr();
+        // For AsAttribute mode `normalsAttr` is unset above; use the schema
+        // attribute as the primary authored attribute for the
+        // _checkWriteAttribute() animation-skipping decision below. For Both
+        // mode either attribute serves equally; keep using the primvar so
+        // the skip decision is identical to the historical AsPrimvar path.
+        if (!writePrimvar) {
+            normalsAttr = schemaNormalsAttr;
+        }
     }
 
     // Check if we need to write out normals at this time, given the concerned channels
@@ -665,13 +714,32 @@ bool MeshConverter::ApplyMaxNormals(
         ? MappedAttributeBuilder::DataLayout(pxr::UsdGeomTokens->faceVarying, true)
         : primvarConverter.InferAttributeDataLayout();
 
-    if (options.GetNormalMode() == MaxMeshConversionOptions::NormalsMode::AsPrimvar) {
+    if (writePrimvar) {
         primvar->SetInterpolation(dataLayout.GetInterpolation());
-    } else {
+    }
+    if (writeSchemaAttr) {
         mesh.SetNormalsInterpolation(dataLayout.GetInterpolation());
     }
 
-    return primvarConverter.PopulateAttribute(normalsAttr, dataLayout, primvar.get(), timeCode);
+    // PopulateAttribute writes one attribute at a time. For Both mode call
+    // it twice -- once for the indexed primvar (which carries
+    // primvar->SetIndices when the layout is indexed-vertex) and once for
+    // the schema attribute (which receives the flattened representation,
+    // since UsdGeomMesh.normals does not support primvar-style indices).
+    bool ok = true;
+    if (writePrimvar) {
+        ok = primvarConverter.PopulateAttribute(normalsAttr, dataLayout, primvar.get(), timeCode);
+    }
+    if (writeSchemaAttr) {
+        // Force non-indexed (flattened) layout for the schema attribute --
+        // it has no sidecar indices array. Primvar layout is unchanged.
+        MappedAttributeBuilder::DataLayout schemaLayout(
+            dataLayout.GetInterpolation(), /* indexed */ false);
+        const bool schemaOk
+            = primvarConverter.PopulateAttribute(schemaNormalsAttr, schemaLayout, nullptr, timeCode);
+        ok = ok && schemaOk;
+    }
+    return ok;
 }
 
 bool MeshConverter::ChannelToPrimvar(
@@ -737,6 +805,102 @@ void MeshConverter::ApplyMaxMapChannels(
         const MappedAttributeBuilder::Config& primConfig = options.GetChannelPrimvarConfig(i);
         ChannelToPrimvar(maxMesh, i, mesh, primConfig, channelIntervals, timeCode, animated);
     }
+}
+
+void MeshConverter::EnsureFallbackStPrimvar(
+    MeshFacade&                     maxMesh,
+    pxr::UsdGeomMesh&               mesh,
+    const MaxMeshConversionOptions& options,
+    const pxr::UsdTimeCode&         timeCode)
+{
+    // MAX-GEO-004: when a mesh has no UV channel 1 (the conventional carrier
+    // for `primvars:st`), emit a fallback planar projection so any
+    // texture-bearing material bound to the mesh has a deterministic UV
+    // stream to sample.
+    //
+    // 3ds Max parametric primitives (Box / Sphere / Cylinder / Torus /
+    // Teapot) default `Generate Mapping Coords.` to false when created via
+    // MAXScript without an explicit `mapCoords:true` argument, leaving the
+    // converted MNMesh's map channel 1 empty. Without this fallback,
+    // textured materials bound to such primitives render untextured
+    // (no UV stream means no texture sampling, so the renderer falls back
+    // to either the texture's default value or the BSDF default colour).
+    //
+    // The fallback is a top-down (Z-axis) planar projection: each vertex's
+    // (X, Y) is normalized into [0, 1] using the mesh's bounding-box X / Y
+    // extents. This is "wrong" for non-planar surfaces (a sphere / cylinder
+    // will see the texture pinched at the poles or wrapped along the axis)
+    // but it is finite, deterministic, and visible -- the artist sees the
+    // texture appear, sees the warp on curved geometry, and knows to fix it
+    // properly via `Generate Mapping Coords.` on the source primitive or a
+    // UVW Map modifier in the scene. The warning emitted below tells them
+    // exactly that.
+    //
+    // Bounds (where the fallback conservatively does nothing):
+    //  - Channel 1's configured primvar name is empty -> user opted out of
+    //    channel-1 export, do not fight them.
+    //  - The mesh already has a primvar with that name -> `ApplyMaxMapChannels`
+    //    wrote real UV data, leave it alone.
+    //  - VertexCount() or FaceCount() is 0 -> nothing to project.
+    //  - Degenerate bounding box on both X and Y -> still emit `(0, 0)` for
+    //    every vertex so the renderer has a sampleable stream, but the UVs
+    //    are uninformative; the warning is still emitted.
+
+    const auto& channel1Config = options.GetChannelPrimvarConfig(1);
+    const pxr::TfToken& stTokenName = channel1Config.GetPrimvarName();
+    if (stTokenName.IsEmpty()) {
+        return;
+    }
+
+    pxr::UsdGeomPrimvarsAPI primvarsAPI(mesh);
+    if (primvarsAPI.HasPrimvar(stTokenName)) {
+        return;
+    }
+
+    const int vertexCount = maxMesh.VertexCount();
+    const int faceCount = maxMesh.FaceCount();
+    if (vertexCount == 0 || faceCount == 0) {
+        return;
+    }
+
+    const auto  bbox = maxMesh.BoundingBox();
+    const float sizeX = bbox.Max().x - bbox.Min().x;
+    const float sizeY = bbox.Max().y - bbox.Min().y;
+    const float divX = (sizeX > 0.0f) ? sizeX : 1.0f;
+    const float divY = (sizeY > 0.0f) ? sizeY : 1.0f;
+    const float minX = bbox.Min().x;
+    const float minY = bbox.Min().y;
+
+    pxr::VtVec2fArray stData;
+    stData.reserve(vertexCount);
+    for (int i = 0; i < vertexCount; ++i) {
+        const auto& v = maxMesh.Vertex(i);
+        stData.emplace_back((v.x - minX) / divX, (v.y - minY) / divY);
+    }
+
+    auto primvar = primvarsAPI.CreatePrimvar(
+        stTokenName,
+        pxr::SdfValueTypeNames->TexCoord2fArray,
+        pxr::UsdGeomTokens->vertex);
+    if (!primvar.IsDefined()) {
+        MaxUsd::Log::Warn(
+            "Unable to create the fallback {0} primvar on {1}. The configured name may "
+            "be a reserved keyword or invalid.",
+            stTokenName.GetString(),
+            mesh.GetPath().GetString());
+        return;
+    }
+    primvar.GetAttr().Set(stData, timeCode);
+
+    MaxUsd::Log::Warn(
+        "{0} has no UV mapping channel; generated fallback planar UVs as "
+        "primvars:{1} (vertex interpolation, top-down XY projection from the mesh's "
+        "bounding box). Textured materials bound to this mesh will render with a "
+        "warped projection on curved surfaces. For accurate UVs, enable 'Generate "
+        "Mapping Coords.' on the source object's parameters, or apply a UVW Map "
+        "modifier (MAX-GEO-004).",
+        mesh.GetPath().GetString(),
+        stTokenName.GetString());
 }
 
 void MeshConverter::ResolveChannelPrimvars(
@@ -1022,6 +1186,67 @@ void MeshConverter::ApplyMaxMaterialIDs(
         int matId = materialIdToFacesMap.begin()->first + 1;
         usdPrim.SetCustomDataByKey(MaxUsd::MetaData::matId, pxr::VtValue(matId));
         return;
+    }
+
+    // MAX-GEO-002: ghost GeomSubsets are pure overhead when the bound material
+    // is not a MultiMtl. A subset in the `materialBind` family only contributes
+    // when something can read its matId customData and pick a corresponding
+    // submaterial -- which only happens when the mesh-level binding is a
+    // MultiMtl (see MaxUsdTranslatorMaterial::AssignMaterial, which casts
+    // node->GetMtl() to MultiMtl* before consulting the subsets). With a
+    // single material at the mesh level (or no material at all), the subsets
+    // carry no material:binding rel of their own, contribute nothing on
+    // round-trip import, bloat the USD layer (the diagnostic corpus's Box
+    // exports 6 such ghost subsets and Cylinder exports 3), and mislead any
+    // consumer that interprets `familyName = "materialBind"` as a request for
+    // per-face material variation.
+    //
+    // The parametric Max primitives (Box, Cylinder, Cone, ChamferBox, ...)
+    // are the common source: each parametric face seeds a distinct default
+    // sub-material id even when the artist has bound a single material at
+    // the node level. The result is the layer-bloat pattern documented in
+    // doc/translation-mapping.md (MAX-GEO-002).
+    //
+    // Collapse to the single-matId metadata path (preserve the first matId
+    // as customData so the round-trip importer's GetMaterialIdFromCustomData
+    // sees something sensible) when the bound material is not a MultiMtl.
+    // Emit a Log::Warn so the artist knows the per-face partition was
+    // dropped and how to surface it again (bind a MultiMtl with one
+    // submaterial per matId).
+    //
+    // Bounds (where the fix conservatively does nothing):
+    //  - mtl != nullptr && mtl->IsMultiMtl() -- subsets can drive submaterial
+    //    selection, keep them and the existing partition-authoring behavior.
+    //  - materialIdToFacesMap.size() == 1 -- handled by the early return
+    //    above, no subset partitioning needed regardless of material type.
+    //  - existingSubsets already populated -- the writer is re-running over a
+    //    prim that already has subsets (e.g. animated re-export of subset
+    //    indices over time), preserve the existing layer shape so we don't
+    //    fight an earlier authoring pass.
+    const bool boundIsMultiMtl = (mtl != nullptr) && mtl->IsMultiMtl();
+    if (!boundIsMultiMtl) {
+        pxr::UsdShadeMaterialBindingAPI meshBindingAPIForCheck(usdPrim);
+        const auto existingSubsetsCheck = meshBindingAPIForCheck.GetMaterialBindSubsets();
+        if (existingSubsetsCheck.empty()) {
+            int matId = materialIdToFacesMap.begin()->first + 1;
+            usdPrim.SetCustomDataByKey(MaxUsd::MetaData::matId, pxr::VtValue(matId));
+            MaxUsd::Log::Warn(
+                "{0} has {1} per-face material ids but its bound material is not a "
+                "Multi/Sub-Object material; collapsing to the first matId ({2}) and "
+                "skipping GeomSubset creation. Ghost GeomSubsets in the materialBind "
+                "family with no material:binding of their own bloat the USD layer and "
+                "mislead consumers that expect familyName=\"materialBind\" to mean "
+                "per-face material variation. To preserve per-face material assignment, "
+                "bind a Multi/Sub-Object material at the source node with one "
+                "submaterial per matId (MAX-GEO-002).",
+                usdPrim.GetPath().GetString(),
+                materialIdToFacesMap.size(),
+                matId);
+            return;
+        }
+        // Fall through to the existing partition-writing path when subsets
+        // already exist on the prim; we only want to avoid *creating* new
+        // ghost subsets, not destroying any pre-existing authoring.
     }
 
     pxr::UsdShadeMaterialBindingAPI meshBindingAPI(usdPrim);

@@ -168,6 +168,11 @@
           <string>None</string>
          </property>
         </item>
+        <item>
+         <property name="text">
+          <string>Primvar + Attribute</string>
+         </property>
+        </item>
        </widget>
       </item>
       <item row="6" column="1">
