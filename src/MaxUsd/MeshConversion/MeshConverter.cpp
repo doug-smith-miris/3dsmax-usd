@@ -249,6 +249,45 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
             // material's diffuseColor. For a MultiMtl it returns the first
             // sub-material's diffuse, which is still more representative of
             // the artist's intent than the viewport wireframe color.
+            //
+            // Surgical bounds (negative cases, ALL must reach this block
+            // without overwriting a pre-authored value or substituting the
+            // wrong source -- enforced by the regression suite via
+            // src/Tests/Integration/io_color_n_visibility_test.ms ::
+            //     test_display_color_override
+            //     test_display_color_preserves_authored_when_material_bound
+            //     test_display_color_still_uses_wire_color_when_no_material
+            //     test_display_color_uses_material_diffuse_when_bound
+            // plus the doc-linked Python validator
+            // validate_display_color_surgical.py):
+            //   * GetDisplayColorAttr().IsAuthored() is already true -- the
+            //     vertex-color -> displayColor channel mapping
+            //     (SetChannelPrimvarMapping 0 "displayColor") ran first and
+            //     wrote the artist-authored value. We must NEVER overwrite
+            //     it, regardless of whether a material is bound.
+            //   * node->GetMtl() == nullptr -- no material bound. The
+            //     wireframe color is the only representational color
+            //     available, so the historical behaviour (write the
+            //     wireframe color) is preserved.
+            //   * node->GetMtl() is a MultiMtl -- GetDiffuse(0) returns the
+            //     first sub-material's diffuse. That is still closer to
+            //     the artist's intent than the viewport wireframe color
+            //     (a per-face displayColor would require GeomSubset-level
+            //     authoring; out of scope here).
+            //   * boundMtl->GetDiffuse() returns black / white / any value
+            //     that coincides with a "default-looking" color. The gate
+            //     has no value filter -- whatever the material returns is
+            //     authored verbatim. Future regressions that add a
+            //     "skip default-looking diffuse" branch would silently
+            //     fall through to the wireframe color for legitimate
+            //     pure-black or pure-white materials.
+            //
+            // A future refactor that widens any of these gates would
+            // silently corrupt artist-authored displayColor or substitute
+            // the wrong source. Both the .ms surgical tests and the Python
+            // validator name the specific bound they exercise, so a
+            // regression in any branch fails with a useful, localised
+            // error.
             if (!usdMesh.GetDisplayColorAttr().IsAuthored()) {
                 Color displayColorSrc;
                 if (Mtl* boundMtl = node->GetMtl()) {

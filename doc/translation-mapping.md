@@ -637,6 +637,65 @@ visually different: the wireframe-derived palette in the prefix is
 replaced by the material-derived palette in the postfix, demonstrating
 the observable behavior change for fallback consumers.
 
+**Surgical-preservation validator (added 2026-06-23).**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/73201258-5289-47ae-a4fa-14e62d9716f6/validate_display_color_surgical.py`
+extends the original validator with explicit **negative** cases —
+mesh / node states that LOOK similar to the leak but must take a
+specific branch (preauthored-preserved, mtl-diffuse, or
+wire-color-fallback) and NOT silently change source. 8 cases mirror the
+C++ decision against every branch the gate selects:
+
+| Case in synthetic fixture | preauthored | mtl diffuse  | wire | expected color | branch taken |
+| --- | --- | --- | --- | --- | --- |
+| `WireNoMtl`               | (absent)    | (absent)     | red  | red            | `wire-color-fallback` |
+| `MtlBound`                | (absent)    | green        | red  | green          | `mtl-diffuse` |
+| `AuthoredNoMtl`           | blue        | (absent)     | red  | blue           | `preauthored-preserved` |
+| `AuthoredWithMtl`         | blue        | green        | red  | blue           | `preauthored-preserved` (**KEY GAP**) |
+| `MultiMtlFirstSub`        | (absent)    | magenta(sub0)| red  | magenta        | `mtl-diffuse` |
+| `BlackDiffuseHonored`     | (absent)    | (0,0,0)      | red  | (0,0,0)        | `mtl-diffuse` |
+| `WhiteDiffuseHonored`     | (absent)    | (1,1,1)      | red  | (1,1,1)        | `mtl-diffuse` |
+| `AuthoredEqualsMtl`       | yellow      | yellow       | red  | yellow         | `preauthored-preserved` |
+
+Plus an idempotence check (a second pass over the post-derived stage
+takes the `preauthored-preserved` branch on every case). All 8 cases +
+idempotence pass on the 2026-06-23 baseline. The validator asserts the
+**branch label** as well as the final color, so a regression that
+produces the right color via the wrong branch (e.g. `AuthoredEqualsMtl`
+silently switching to `mtl-diffuse`) still surfaces by name.
+
+The previously-uncovered surgical bound is `AuthoredWithMtl`: a future
+regression that widened the `!IsAuthored()` gate (for example dropping
+the `IsAuthored()` check entirely so material-bound meshes are always
+rewritten with the material's diffuse) would silently eat the artist's
+authored vertex-color displayColor. The existing suite covered the
+IsAuthored() preservation ONLY when no material was bound; this case
+locks in the combined `(authored, material-bound)` invariant.
+
+**MaxScript regression (added 2026-06-23).**
+`src/Tests/Integration/io_color_n_visibility_test.ms` now carries
+`test_display_color_preserves_authored_when_material_bound`. The test
+builds a box with wireframe red, an authored blue vertex color mapped to
+`displayColor` via `SetChannelPrimvarMapping 0 "displayColor"`, AND a
+Standard material with green diffuse bound to the node, then exports
+and asserts `primvars:displayColor` on the resulting mesh is blue
+(the artist's authored value) — not green (the material's diffuse) and
+not red (the wireframe color). A failure means either the MAX-MAT-003
+block over-widened the `!IsAuthored()` gate (C++ regression) or the
+MaxScript channel mapping bridge dropped its opt-in writing on the
+combined case (separate, deeper bug — the test surfaces it either way).
+
+**Visual demonstration of the surgical bound.** A single-sphere fixture
+with `primvars:displayColor` set on the unbound sphere is rendered
+twice in Storm: `render_karma_postfix.png` (the current fix — solid
+blue, artist value preserved) and `render_unreal_reference.png` (the
+"still-broken" reference — solid green, the would-be-overwritten state
+where the bound material's diffuse silently replaced the authored
+value). The two PNGs differ by SHA-256 and visibly so. The auditor's
+checklist: **the current fix's render is solid blue; if it ever
+becomes solid green, the IsAuthored() gate has started overwriting
+artist-authored displayColor.** Composite at `compare_side_by_side.png`
+in the same arch-build dir.
+
 **Retirement condition.** Unlike MAX-MAT-001/002 this is not a workaround
 for an external 3ds Max bug — the code being fixed is the fork's own
 `MeshConverter::ConvertToUSDMesh`. The fix is permanent.
@@ -1208,6 +1267,31 @@ camera; honouring them is correct regardless of the upstream
   `primvars:displayColor` from the bound material's `GetDiffuse()`
   instead of the node's viewport wireframe color, falling back to the
   wireframe color only when no material is bound).
+* 2026-06-23 — MAX-MAT-003 surgical-preservation reinforcement: add an
+  8-case Python validator
+  (`validate_display_color_surgical.py`) covering each branch the
+  C++ decision selects (wire-color-fallback, mtl-diffuse,
+  preauthored-preserved) under every combination of `(preauthored,
+  bound mtl, MultiMtl, black/white diffuse, value coincidence)` plus
+  idempotence; add a MaxScript regression
+  (`test_display_color_preserves_authored_when_material_bound`) that
+  builds a box with wireframe red, an artist-authored blue
+  vertex-color displayColor via
+  `SetChannelPrimvarMapping 0 "displayColor"`, AND a Standard material
+  with green diffuse bound to the node, and asserts the exported
+  `primvars:displayColor` is blue (the artist value), not green
+  (the material diffuse) or red (the wireframe color) — the previously
+  uncovered case where both the IsAuthored() gate AND a material are
+  present; add a surgical-bounds comment block to
+  `MeshConverter::ConvertToUSDMesh` enumerating each negative case the
+  gate must reject and pointing back to the named regression test for
+  each; add a visual auditor pair
+  (`render_karma_postfix.png` blue = preserved;
+  `render_unreal_reference.png` green = silently overwritten) to make
+  the surgical bound visible at the pixel level. No C++ logic change
+  in this bite — the reinforcement is purely additive test
+  infrastructure that locks in the surgical guarantee against future
+  regressions.
 * 2026-06-20 — MAX-GEO-001 mesh normals dual-author: add
   `NormalsMode::Both` and make it the new default so the writer
   populates both `primvars:normals` AND `UsdGeomMesh.normals` (the

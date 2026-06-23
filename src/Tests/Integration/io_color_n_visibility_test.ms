@@ -300,6 +300,50 @@ struct io_color_n_visibility_test
         assert_equal 0 dispColor[3] message:"Unexpected displayColor[2], should be from the wireframe color (red) when no material is bound."
     ),
 
+    -- MAX-MAT-003 SURGICAL BOUND: the GetDisplayColorAttr().IsAuthored()
+    -- gate must short-circuit even when a material IS bound. The existing
+    -- test_display_color_override covers the IsAuthored() case ONLY when no
+    -- material is bound; this test exercises the combined case (artist opted
+    -- in to vertex-color -> displayColor mapping AND assigned a material).
+    -- A future refactor that widened the gate to "always overwrite with the
+    -- bound material's diffuse" would silently eat the artist's authored
+    -- vertex-color displayColor and the existing regression suite would not
+    -- catch it.
+    function test_display_color_preserves_authored_when_material_bound = (
+        testFilePath = output_prefix + "test_display_color_preserves_authored_when_material_bound.usd"
+        local b = box name:"box"
+        convertToPoly b
+        -- Wireframe color: red. Material diffuse: green. Authored vertex
+        -- color: blue. The fix must preserve blue (artist authoring wins
+        -- over both the wire color and the material diffuse).
+        b.wireColor = Color 255 0 0
+        local blueColor = Color 0 0 255
+        polyop.setVertColor b 0 #(1,2,3,4,5,6,7,8) blueColor
+
+        local mtl = Standard()
+        mtl.name = "matGreen"
+        mtl.diffuse = Color 0 255 0
+        b.material = mtl
+
+        -- Explicitly map the vertex color channel to primvar:displayColor.
+        -- This causes GetDisplayColorAttr().IsAuthored() to be true BEFORE
+        -- the MAX-MAT-003 block runs, and the surgical bound requires the
+        -- block to skip the bound-material derivation entirely.
+        exportOptions.SetChannelPrimvarMapping 0 "displayColor"
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = pyUsdGeom.Gprim.Get stage ("/" + b.name)
+        local mesh = pyUsdGeom.Mesh(prim)
+        local displayColorAttr = mesh.GetDisplayColorAttr()
+        local dispColor = (displayColorAttr.Get())[0]
+        -- Expect blue: the artist-authored vertex color, NOT the material's
+        -- green diffuse and NOT the wireframe red.
+        assert_equal 0 dispColor[1] message:"Unexpected displayColor[0], pre-authored vertex color (blue) must survive over the material diffuse (green)."
+        assert_equal 0 dispColor[2] message:"Unexpected displayColor[1], pre-authored vertex color (blue) must survive over the material diffuse (green)."
+        assert_equal 1 dispColor[3] message:"Unexpected displayColor[2], pre-authored vertex color (blue) must survive over the material diffuse (green)."
+    ),
+
     function teardown = (
     ),
 
@@ -309,7 +353,8 @@ struct io_color_n_visibility_test
         test_import_inherited_visibility,
         test_export_visibility_warnings,
         test_display_color_uses_material_diffuse_when_bound,
-        test_display_color_still_uses_wire_color_when_no_material)
+        test_display_color_still_uses_wire_color_when_no_material,
+        test_display_color_preserves_authored_when_material_bound)
 )
 
 runUsdTestFixture io_color_n_visibility_test (getThisScriptFilename())
