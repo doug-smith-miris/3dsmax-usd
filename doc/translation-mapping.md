@@ -57,6 +57,7 @@ Status legend:
 | PhysicalMaterial.emission (none authored) | `standard_surface.emission` + `standard_surface.emission_color` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits `emission = 1.0` AND `emission_color = (0, 0, 0)`, both static | MAX-MAT-002 | 2026-06-20 |
 | PhysicalMaterial.coat (none authored) | `standard_surface.coat_IOR`, `.coat_affect_color`, `.coat_affect_roughness`, `.coat_roughness` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits the coat-block preset (`coat_IOR = 1.52`, `coat_affect_color = 0.5`, `coat_affect_roughness = 0.5`, `coat_roughness = 0.0`) on every shader AND `coat` is statically zero or absent. Each leak input is stripped independently when it matches its leak value; user overrides are preserved | MAX-MAT-004 | 2026-06-23 |
 | PhysicalMaterial.subsurface (none authored) | `standard_surface.subsurface_radius` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits the Pixar/Hery skin SSS triple `(0.794704, 0.531734, 0.292854)` on every shader AND `subsurface` is statically zero or absent. After strip falls back to the nodedef default `(1, 1, 1)`; user overrides away from the leak triple are preserved | MAX-MAT-005 | 2026-06-23 |
+| PhysicalMaterial — every shader, no source-DCC bind | 13 `standard_surface` inputs authored redundantly at their nodedef default (`base`, `coat`, `coat_color`, `diffuse_roughness`, `specular`, `specular_color`, `subsurface`, `subsurface_color`, `subsurface_scale`, `thin_walled`, `transmission`, `transmission_color`, `transmission_depth`) | bug normalization | `ND_standard_surface_surfaceshader` v1.0.1 | Bridge authors any of the 13 inputs at its v1.0.1 nodedef-default value AND the input is not connected. Each input is stripped independently; values that differ from the nodedef default are preserved as artist intent | MAX-MAT-006 | 2026-06-23 |
 | Node.wireColor / Node.material.diffuse | `UsdGeomMesh.primvars:displayColor` | bug normalization | (mesh primvar; not a shader nodedef) | `MeshConverter` is about to author wireColor into `primvars:displayColor` AND `node->GetMtl() != nullptr` | MAX-MAT-003 | 2026-06-20 |
 | Mesh normals (every interpolation) | `primvars:normals` AND `UsdGeomMesh.normals` (the schema attribute) | bug normalization | (mesh attribute; not a shader nodedef) | `NormalsMode` default is now `Both` -- both locations are authored unless the user explicitly picks `AsPrimvar` or `AsAttribute` | MAX-GEO-001 | 2026-06-20 |
 | Map channel 1 missing on the converted MNMesh | `primvars:st` (channel 1's configured primvar) | approximating workaround | (mesh primvar; not a shader nodedef) | `ApplyMaxMapChannels` did not author the channel-1 primvar AND channel 1 is not explicitly opted out (`GetChannelPrimvarConfig(1).GetPrimvarName().IsEmpty()`) AND VertexCount() > 0 AND FaceCount() > 0 | MAX-GEO-004 | 2026-06-20 |
@@ -548,6 +549,199 @@ the visible divergence in the **stressed case**.
 Autodesk fixes `MtlxIOUtil` to stop emitting the spurious skin SSS
 radius, the pass becomes inert (no node matches the trigger
 condition). Safe to keep as a guard for older 3ds Max installs.
+
+### PhysicalMaterial — bridge writes 13 spec-default inputs on every shader → `standard_surface` inputs at nodedef default  (MAX-MAT-006)
+
+**Symptom.** The 3ds Max-shipped `MtlxIOUtil.ExportMtlxString` MaxScript
+bridge authors 13 inputs on every `ND_standard_surface_surfaceshader`
+at their MaterialX nodedef-default value, regardless of whether the
+source PhysicalMaterial set any of them. The 13 inputs and their
+bridge-emitted (= nodedef-default v1.0.1) values are:
+
+| Float input | Default | Color3 input | Default | Bool input | Default |
+| --- | --- | --- | --- | --- | --- |
+| `base`               | 1.0 | `coat_color`         | (1, 1, 1) | `thin_walled` | false |
+| `coat`               | 0.0 | `specular_color`     | (1, 1, 1) | | |
+| `diffuse_roughness`  | 0.0 | `subsurface_color`   | (1, 1, 1) | | |
+| `specular`           | 1.0 | `transmission_color` | (1, 1, 1) | | |
+| `subsurface`         | 0.0 |                      |           | | |
+| `subsurface_scale`   | 1.0 |                      |           | | |
+| `transmission`       | 0.0 |                      |           | | |
+| `transmission_depth` | 0.0 |                      |           | | |
+
+Six out of six materials in the diagnostic corpus
+(`/Users/d.smith/MirisProjects/Agent Builder/agent/pipeline-runs/3e596cac-1d4f-45fe-82eb-afa09679eae9/complex_export.usda`)
+exhibit this — every material carries all 13 inputs authored at exactly
+the same nodedef-default value, contributing 78 redundant attribute
+writes (6 × 13) on the corpus. The diagnostic agent's
+`findings_evidence.json` records the per-material list verbatim. On a
+single material, the 13 redundantly-authored inputs are roughly 30% of
+its `standard_surface` attribute count.
+
+**Why it matters.** Unlike MAX-MAT-001/002/004/005, this is **not** a
+latent-contamination bug. The 13 inputs carry the nodedef-default
+values, so even if a downstream context flipped a gating scalar
+(`coat > 0`, `subsurface > 0`), the resulting BSDF would evaluate to
+the same parameters whether the inputs were present-at-default or
+absent. The cost is purely structural:
+
+* **Layer bloat.** 78 redundant attribute writes on the 6-material
+  corpus, ~13 per material. On real-world scenes with dozens or
+  hundreds of materials, this multiplies into kilobytes-to-megabytes
+  of pure noise per layer.
+* **`usddiff` legibility.** A `usddiff` between two layers carrying
+  these redundant defaults sees them as authored values that need to
+  match byte-for-byte. A meaningful diff is buried under 13 lines of
+  same-on-both-sides noise per material.
+* **Authoring-intent signal.** With the strip applied, every input
+  remaining in the layer carries semantic intent — the artist (or
+  upstream tool) set it deliberately. Without the strip, "input is
+  authored" no longer correlates with "artist had an opinion."
+* **Round-trip ambiguity.** A re-importing tool can't distinguish
+  "artist explicitly set this to the default" from "bridge dumped a
+  default value here." Both states encode "use the default," but
+  variant sets / layer overrides treat them differently (an explicit
+  author wins over a stronger layer's override; an absent input lets
+  the strongest layer prevail).
+
+**Fix.** Add a fifth post-parse normalization pass in
+`MtlxShaderWriter::Write()` (run immediately after MAX-MAT-005's pass)
+that walks the parsed `MaterialX::Document` and, for each
+`standard_surface` node, removes each of the 13 inputs independently
+when *all* of:
+
+* The input is present on the node.
+* The input is not connected (static value only).
+* The input's static value exactly matches the
+  `ND_standard_surface_surfaceshader` v1.0.1 nodedef default
+  (tolerant of float noise on numeric types; exact `"true"`/`"false"`
+  string match on `thin_walled`).
+
+After strip each input falls through to its nodedef default. Because
+the stripped value *is* the default, the renderer sees the same BSDF
+parameters as before and the visual output is unchanged — the fix is
+purely structural.
+
+Per-input independence mirrors MAX-MAT-004's design: each of the 13
+inputs is multiplied / interpolated into the BSDF separately, so each
+can be tested and stripped on its own merits. A user who explicitly
+overrides one of them (say `base = 0.6`) keeps that override while the
+other twelve (still at their nodedef-default values) are removed.
+
+**MaterialX 1.39 `ND_standard_surface_surfaceshader` v1.0.1.** The
+nodedef ships in two versions: v1.0.0
+(`ND_standard_surface_surfaceshader_100`) and v1.0.1
+(`ND_standard_surface_surfaceshader`, marked
+`isdefaultversion="true"`). v1.0.1 inherits from v1.0.0 but overrides
+`base` (0.8 → 1.0) and `base_color` ((1, 1, 1) → (0.8, 0.8, 0.8)). The
+Max bridge writes the v1.0.1 nodedef name on every shader (verified on
+the corpus: `info:id = "ND_standard_surface_surfaceshader"`), so the
+strip pass compares against v1.0.1 defaults. `base = 1.0` is therefore
+the default that gets stripped; `base = 0.8` is treated as artist intent
+(it matches the *v1.0.0* default but not v1.0.1). `base_color` is not in
+the 13-input list because its v1.0.1 default `(0.8, 0.8, 0.8)` is a
+non-neutral grey that artists virtually always override.
+
+**Bounds (where the fix conservatively does nothing):**
+
+* The input is connected to a node, nodegraph, or output — could carry
+  a procedural value that resolves to a non-default at runtime; keep.
+* The input's static value differs from the nodedef default — artist
+  authoring intent; keep.
+* The shader is not a `standard_surface` — out of scope for this pass
+  (the 13-input list and the nodedef defaults are specific to
+  `ND_standard_surface_surfaceshader`).
+* The input is absent — already at the nodedef default; nothing to do.
+
+**Care with the other four normalizers.** MAX-MAT-001
+(`specular_rotation = 0.25`), MAX-MAT-002 (`emission = 1.0` /
+`emission_color = (0, 0, 0)`), MAX-MAT-004 (`coat_IOR = 1.52`,
+`coat_affect_color = 0.5`, `coat_affect_roughness = 0.5`,
+`coat_roughness = 0.0`) and MAX-MAT-005
+(`subsurface_radius = (0.794704, 0.531734, 0.292854)`) all strip
+bridge-leaked values that *differ* from the nodedef default. The
+MAX-MAT-006 list (the 13 above) is intentionally **disjoint** from
+those — it only includes inputs whose bridge value matches the nodedef
+default. The five passes run in order; after all five complete, a
+default PhysicalMaterial roundtrips through the bridge with zero
+redundantly-authored `standard_surface` inputs.
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/aee592c2-bd87-4e17-b8d8-ee1a4d6c6e2b/normalize_spec_default_inputs.py`
+mirrors the C++ logic at the USD layer (the C++ runs at the
+MaterialX-doc layer earlier in the pipeline). Running it on the
+captured `complex_export.usda` strips exactly 78 inputs
+(6 materials × 13 inputs), with zero collateral changes and idempotent
+on a second pass:
+
+```
+== normalize_spec_default_inputs pass 1 ==
+  shaders_inspected: 6
+  materials_touched: 6
+  total_strips:      78
+    base                  : 6
+    coat                  : 6
+    coat_color            : 6
+    diffuse_roughness     : 6
+    specular              : 6
+    specular_color        : 6
+    subsurface            : 6
+    subsurface_color      : 6
+    subsurface_scale      : 6
+    thin_walled           : 6
+    transmission          : 6
+    transmission_color    : 6
+    transmission_depth    : 6
+== collateral diff ==
+  total removed: 78
+  total added:   0
+== pass 2 (idempotence) ==
+  total_strips: 0
+```
+
+The diff is purely structural at the USD-layer level — exactly the 13
+`inputs:<name>` attributes the bridge over-authored, on exactly the six
+materials that had them, with zero side effects on every other
+attribute on every other prim.
+
+**Karma renders.**
+`render_karma_prefix.png` (the captured corpus with the redundant
+defaults) and `render_karma_postfix.png` (the validator-applied corpus)
+are visually indistinguishable, at the Karma 21.0.700 CPU sampler-noise
+floor:
+
+```
+prefix vs postfix:   max 19/255   mean 0.0221/255   nonzero 4.34%
+```
+
+Same magnitude as the MAX-MAT-004 noise-floor signal (max 20/255,
+mean 0.0166/255, 4.33% nonzero — re-rendering the same stage twice).
+The fix is a visual no-op exactly because the stripped values equal the
+nodedef defaults the renderer resolves absent inputs to — a visible
+difference here would mean the strip targeted the *wrong* default,
+i.e. a code bug.
+
+**Visual auditor pair.** Because this is a structural-only fix with no
+latent visual case, the auditor pair degenerates: the "what fixed looks
+like" reference image and the "what we got" postfix image are the same
+image (both render the same BSDF). `render_unreal_reference.png` is a
+byte-identical copy of `render_karma_postfix.png`; the auditor's
+checklist is **prefix and postfix renders are visually indistinguishable
+modulo Karma sampler noise (max delta ≤ ~20/255, mean ≤ ~0.025/255),
+AND the structural validator output reports 78 strips with zero
+collateral**. If the prefix and postfix diverge beyond the noise floor,
+the C++ strip targeted a wrong default and the BSDF math has shifted —
+that's the regression signal.
+
+**Retirement condition.** Same as MAX-MAT-001/002/004/005: when
+Autodesk fixes `MtlxIOUtil` to stop authoring nodedef-default values on
+every shader, the pass becomes inert (no input matches the trigger
+condition). Safe to keep as a guard for older 3ds Max installs. The
+13-input list is also resilient to MaterialX version bumps — a future
+v1.0.2 that changes one of these defaults will simply mean the existing
+strip stops firing for that input (the static value no longer matches);
+the strip never *adds* an attribute, so a stale default value is at
+worst a missed-cleanup opportunity, not a correctness regression.
 
 ### Node.wireColor / Node.material.diffuse → UsdGeomMesh.primvars:displayColor  (MAX-MAT-003)
 
@@ -1373,6 +1567,28 @@ camera; honouring them is correct regardless of the upstream
   regardless of base material) rather than the cleaner neutral nodedef
   default. The stressed-overlay Karma renders visualise the divergence
   end-to-end.
+* 2026-06-23 — MAX-MAT-006 spec-default-input normalization: strip the 13
+  inputs (`base`, `coat`, `coat_color`, `diffuse_roughness`, `specular`,
+  `specular_color`, `subsurface`, `subsurface_color`, `subsurface_scale`,
+  `thin_walled`, `transmission`, `transmission_color`,
+  `transmission_depth`) that 3ds Max's `MtlxIOUtil` bridge writes on every
+  `ND_standard_surface_surfaceshader` at the v1.0.1 nodedef-default value
+  regardless of source intent. Each input is stripped independently when
+  it equals the nodedef default exactly and is not connected; values an
+  artist or upstream tool authored away from the default are preserved as
+  intent. The fix is purely structural: 6 materials × 13 inputs = 78
+  redundant attribute writes removed from the diagnostic corpus, ~30% of
+  the per-material standard_surface attribute count. Karma renders are
+  visually identical prefix vs postfix (within sampler-noise floor) by
+  construction — stripped values equal the nodedef defaults the renderer
+  resolves absent inputs to, so the BSDF math is unchanged. Unlike
+  MAX-MAT-004/005 there is no latent-contamination case: the leaked
+  values *are* the defaults, so even under downstream gate-flips
+  (`coat > 0`, `subsurface > 0`) the resulting BSDF would evaluate
+  identically with or without the redundant authoring. The benefit is
+  reduced layer bloat, more legible `usddiff` output, and a clean
+  "input is authored ⇔ artist had an opinion" invariant for downstream
+  tools and variant sets.
 * 2026-06-20 — MAX-GEO-003 GeomSubset name normalization: replace the
   legacy underscore-wrapped fallback pattern `_{N}_` in
   `MaterialUtils::CreateSubsetName` with the readable `mat_{N}` form.

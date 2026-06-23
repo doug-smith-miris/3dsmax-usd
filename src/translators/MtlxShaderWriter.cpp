@@ -65,6 +65,32 @@ bool _TryGetStaticFloat(const MaterialX::InputPtr& input, float& outValue)
     return true;
 }
 
+// Returns the static boolean value of a MaterialX input if it is not
+// connected. MaterialX serializes booleans as "true"/"false" (case-sensitive
+// per the spec); we accept the canonical forms only so an off-spec value
+// does not silently parse as false. Returns false (the "not statically
+// known" signal, not a value) on connection, empty string, or any other
+// token.
+bool _TryGetStaticBool(const MaterialX::InputPtr& input, bool& outValue)
+{
+    if (!input) {
+        return false;
+    }
+    if (input->hasNodeName() || input->hasNodeGraphString() || input->hasOutputString()) {
+        return false;
+    }
+    const std::string& valStr = input->getValueString();
+    if (valStr == "true") {
+        outValue = true;
+        return true;
+    }
+    if (valStr == "false") {
+        outValue = false;
+        return true;
+    }
+    return false;
+}
+
 // Parses a MaterialX color3 value string ("r, g, b" or "r g b") when the
 // input is not connected. Tolerates commas, semicolons, and whitespace
 // between components so we read whatever the MaterialX serializer wrote.
@@ -364,6 +390,136 @@ void _NormalizeStandardSurfaceSpecularRotation(const MaterialX::DocumentPtr& doc
             }
         }
         node->removeInput("specular_rotation");
+    }
+}
+
+// MAX-MAT-006 workaround: 3ds Max's MtlxIOUtil bridge authors 13 inputs on
+// every ND_standard_surface_surfaceshader at their MaterialX nodedef-default
+// value, regardless of whether the source PhysicalMaterial set them. The 13
+// inputs and their bridge-emitted == nodedef-default values:
+//
+//     base                 = 1.0      coat_color           = (1, 1, 1)
+//     coat                 = 0.0      specular_color       = (1, 1, 1)
+//     diffuse_roughness    = 0.0      subsurface_color     = (1, 1, 1)
+//     specular             = 1.0      transmission_color   = (1, 1, 1)
+//     subsurface           = 0.0      thin_walled          = false
+//     subsurface_scale     = 1.0
+//     transmission         = 0.0
+//     transmission_depth   = 0.0
+//
+// Values match the ND_standard_surface_surfaceshader v1.0.1 defaults shipped
+// with MaterialX 1.39 (the version bundled with Max 2027's MtlxIOUtil and
+// with Houdini 21.0.700's library). On the 6-material diagnostic corpus the
+// 13 inputs are authored on every shader at these exact values, contributing
+// 78 redundant attribute writes (~30% of the per-material standard_surface
+// attribute count). Visually inert — the renderer would resolve absent
+// inputs to the same nodedef defaults — but they bloat layer size, obscure
+// which inputs the artist actually set, and make usddiff reports harder to
+// read.
+//
+// Strip each input independently when:
+//   * The input is present on a standard_surface node.
+//   * The input is not connected (static value only).
+//   * The static value exactly matches the nodedef default (tolerant of
+//     float noise on numeric types; exact "true"/"false" string match on
+//     thin_walled).
+//
+// After strip the input falls through to the nodedef default — same
+// semantics, less noise.
+//
+// Surgical bounds (where the fix conservatively does nothing):
+//   * The input is connected to a node, nodegraph, or output -- carries a
+//     runtime value the static comparison cannot reason about; keep.
+//   * The static value differs from the nodedef default -- artist or DCC
+//     intent; keep.
+//   * The shader is not a standard_surface -- out of scope for this pass.
+//   * The input is absent -- already at the default; nothing to do.
+//
+// Care taken with the four other MtlxIOUtil leaks normalized in this file:
+// MAT-001 specular_rotation, MAT-002 emission/emission_color, MAT-004
+// coat_IOR/coat_affect_color/coat_affect_roughness/coat_roughness, MAT-005
+// subsurface_radius. Their bridge-leaked values DIFFER from the nodedef
+// defaults and are stripped by their own dedicated passes BEFORE this one;
+// MAT-006's 13-input list is intentionally disjoint from them. After all
+// five passes run in order, a default PhysicalMaterial roundtrips through
+// the bridge with zero redundantly-authored standard_surface inputs --
+// every input either carries an artist-set non-default value or is absent.
+void _StripStandardSurfaceSpecDefaultInputs(const MaterialX::DocumentPtr& doc)
+{
+    if (!doc) {
+        return;
+    }
+    struct FloatDefault {
+        const char* name;
+        float       value;
+    };
+    struct Color3Default {
+        const char* name;
+        float       value[3];
+    };
+    // ND_standard_surface_surfaceshader v1.0.1 defaults (MaterialX 1.39
+    // bxdf/standard_surface.mtlx). v1.0.1 overrides v1.0.0 on `base`
+    // (0.8 -> 1.0) and `base_color` ((1,1,1) -> (0.8,0.8,0.8)); base_color
+    // is not in this list because its default has been a non-neutral grey
+    // since the override, and artists virtually always author a color.
+    static constexpr FloatDefault kFloatDefaults[] = {
+        { "base",               1.0f },
+        { "coat",               0.0f },
+        { "diffuse_roughness",  0.0f },
+        { "specular",           1.0f },
+        { "subsurface",         0.0f },
+        { "subsurface_scale",   1.0f },
+        { "transmission",       0.0f },
+        { "transmission_depth", 0.0f },
+    };
+    static constexpr Color3Default kColor3Defaults[] = {
+        { "coat_color",         { 1.0f, 1.0f, 1.0f } },
+        { "specular_color",     { 1.0f, 1.0f, 1.0f } },
+        { "subsurface_color",   { 1.0f, 1.0f, 1.0f } },
+        { "transmission_color", { 1.0f, 1.0f, 1.0f } },
+    };
+    static constexpr float kFloatEpsilon = 1e-6f;
+
+    for (const auto& node : doc->getNodes("standard_surface")) {
+        for (const auto& leak : kFloatDefaults) {
+            auto input = node->getInput(leak.name);
+            if (!input) {
+                continue;
+            }
+            float value = 0.f;
+            if (!_TryGetStaticFloat(input, value)) {
+                continue;
+            }
+            if (std::fabs(value - leak.value) > kFloatEpsilon) {
+                continue;
+            }
+            node->removeInput(leak.name);
+        }
+        for (const auto& leak : kColor3Defaults) {
+            auto input = node->getInput(leak.name);
+            if (!input) {
+                continue;
+            }
+            float value[3] = { 0.f, 0.f, 0.f };
+            if (!_TryGetStaticColor3(input, value)) {
+                continue;
+            }
+            if (std::fabs(value[0] - leak.value[0]) > kFloatEpsilon
+                || std::fabs(value[1] - leak.value[1]) > kFloatEpsilon
+                || std::fabs(value[2] - leak.value[2]) > kFloatEpsilon) {
+                continue;
+            }
+            node->removeInput(leak.name);
+        }
+        // thin_walled is the lone boolean in the 13. Nodedef default is
+        // false; strip only when the input is statically false (true means
+        // the artist asked for thin-walled refraction).
+        if (auto thinInput = node->getInput("thin_walled")) {
+            bool value = false;
+            if (_TryGetStaticBool(thinInput, value) && !value) {
+                node->removeInput("thin_walled");
+            }
+        }
     }
 }
 
@@ -855,6 +1011,7 @@ void MtlxShaderWriter::Write()
     _NormalizeStandardSurfaceEmissionDefault(mtlxDoc);
     _NormalizeStandardSurfaceCoatDefaults(mtlxDoc);
     _NormalizeStandardSurfaceSubsurfaceRadiusDefault(mtlxDoc);
+    _StripStandardSurfaceSpecDefaultInputs(mtlxDoc);
 
     // Sanitize the material name using the same logic as with the MaterialX component
     // to match the node name produced by the MaterialX exporter. createValidName

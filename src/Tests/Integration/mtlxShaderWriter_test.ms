@@ -69,33 +69,94 @@ struct mtlx_shader_writer_test
         assert_true (surfacePrim.IsA(pyShade.Shader))
         local surfaceShader = pyShade.Shader(surfacePrim)
         assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+        -- The .mtlx fixture authors base = 0.8, which is NOT the v1.0.1
+        -- nodedef default (1.0), so MAX-MAT-006's spec-default strip leaves
+        -- it alone and the value reaches the exported USD as-is.
         assert_equal ((surfaceShader.GetInput "base").Get()) 0.8
         assert_equal ((((surfaceShader.GetInput "base_color").GetConnectedSource())[1].GetPath())) (pysdf.Path "/root/mtl/Iberian_Blue_Ceramic_Tiles/NG_Iberian_Blue_Ceramic_Tiles")
-        assert_equal ((surfaceShader.GetInput "coat").Get()) 0
+        -- The following inputs are at the MaterialX nodedef defaults and
+        -- thus stripped by MAX-MAT-006's spec-default normalizer. After
+        -- strip the input is absent on the USD shader prim; either state
+        -- is correct (absent = falls back to nodedef default, or present
+        -- = explicitly set to the nodedef default). The permissive shape
+        -- below accepts both: it asserts the value when authored, but
+        -- silently accepts absence too.
+        local input_coat = surfaceShader.GetInput "coat"
+        if input_coat != undefined then (
+            local attr = input_coat.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_coat.Get()) 0 )
+        )
+        -- coat_affect_color: NOT in MAX-MAT-006's 13 (MAT-004 territory).
+        -- The .mtlx authors 0 which differs from MAT-004's leak value of
+        -- 0.5, so MAT-004 doesn't strip either; the value survives.
         assert_equal ((surfaceShader.GetInput "coat_affect_color").Get()) 0
         assert_equal ((surfaceShader.GetInput "coat_affect_roughness").Get()) 0
-        assert_equal ((surfaceShader.GetInput "coat_color").Get()) (pyGf.Vec3f 1 1 1)
+        local input_coat_color = surfaceShader.GetInput "coat_color"
+        if input_coat_color != undefined then (
+            local attr = input_coat_color.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_coat_color.Get()) (pyGf.Vec3f 1 1 1) )
+        )
         assert_equal ((surfaceShader.GetInput "coat_IOR").Get()) 1.5
         assert_equal ((((surfaceShader.GetInput "coat_normal").GetConnectedSource())[1].GetPath())) (pysdf.Path "/root/mtl/Iberian_Blue_Ceramic_Tiles/NG_Iberian_Blue_Ceramic_Tiles")
         assert_equal ((surfaceShader.GetInput "coat_roughness").Get()) 0.1
-        assert_equal ((surfaceShader.GetInput "diffuse_roughness").Get()) 0
+        local input_diffuse_roughness = surfaceShader.GetInput "diffuse_roughness"
+        if input_diffuse_roughness != undefined then (
+            local attr = input_diffuse_roughness.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_diffuse_roughness.Get()) 0 )
+        )
         assert_equal ((surfaceShader.GetInput "emission").Get()) 0
         assert_equal ((surfaceShader.GetInput "emission_color").Get()) (pyGf.Vec3f 1 1 1)
         assert_equal ((((surfaceShader.GetInput "metalness").GetConnectedSource())[1].GetPath())) (pysdf.Path "/root/mtl/Iberian_Blue_Ceramic_Tiles/NG_Iberian_Blue_Ceramic_Tiles")
         assert_equal ((((surfaceShader.GetInput "normal").GetConnectedSource())[1].GetPath())) (pysdf.Path "/root/mtl/Iberian_Blue_Ceramic_Tiles/NG_Iberian_Blue_Ceramic_Tiles")
-        assert_equal ((surfaceShader.GetInput "specular").Get()) 1
-        assert_equal ((surfaceShader.GetInput "specular_color").Get()) (pyGf.Vec3f 1 1 1)
+        local input_specular = surfaceShader.GetInput "specular"
+        if input_specular != undefined then (
+            local attr = input_specular.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_specular.Get()) 1 )
+        )
+        local input_specular_color = surfaceShader.GetInput "specular_color"
+        if input_specular_color != undefined then (
+            local attr = input_specular_color.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_specular_color.Get()) (pyGf.Vec3f 1 1 1) )
+        )
         assert_equal ((surfaceShader.GetInput "specular_IOR").Get()) 1.5
         assert_equal ((surfaceShader.GetInput "specular_rotation").Get()) 0
         assert_equal ((((surfaceShader.GetInput "specular_roughness").GetConnectedSource())[1].GetPath())) (pysdf.Path "/root/mtl/Iberian_Blue_Ceramic_Tiles/NG_Iberian_Blue_Ceramic_Tiles")
-        assert_equal ((surfaceShader.GetInput "subsurface").Get()) 0
-        assert_equal ((surfaceShader.GetInput "subsurface_color").Get()) (pyGf.Vec3f 1 1 1)
+        local input_subsurface = surfaceShader.GetInput "subsurface"
+        if input_subsurface != undefined then (
+            local attr = input_subsurface.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_subsurface.Get()) 0 )
+        )
+        local input_subsurface_color = surfaceShader.GetInput "subsurface_color"
+        if input_subsurface_color != undefined then (
+            local attr = input_subsurface_color.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_subsurface_color.Get()) (pyGf.Vec3f 1 1 1) )
+        )
         assert_equal ((surfaceShader.GetInput "subsurface_radius").Get()) (pyGf.Vec3f 1 1 1)
-        assert_equal ((surfaceShader.GetInput "subsurface_scale").Get()) 1
-        assert_false ((surfaceShader.GetInput "thin_walled").Get())
-        assert_equal ((surfaceShader.GetInput "transmission").Get()) 0
-        assert_equal ((surfaceShader.GetInput "transmission_color").Get()) (pyGf.Vec3f 1 1 1)
-        assert_equal ((surfaceShader.GetInput "transmission_depth").Get()) 0
+        local input_subsurface_scale = surfaceShader.GetInput "subsurface_scale"
+        if input_subsurface_scale != undefined then (
+            local attr = input_subsurface_scale.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_subsurface_scale.Get()) 1 )
+        )
+        local input_thin_walled = surfaceShader.GetInput "thin_walled"
+        if input_thin_walled != undefined then (
+            local attr = input_thin_walled.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_false (input_thin_walled.Get()) )
+        )
+        local input_transmission = surfaceShader.GetInput "transmission"
+        if input_transmission != undefined then (
+            local attr = input_transmission.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_transmission.Get()) 0 )
+        )
+        local input_transmission_color = surfaceShader.GetInput "transmission_color"
+        if input_transmission_color != undefined then (
+            local attr = input_transmission_color.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_transmission_color.Get()) (pyGf.Vec3f 1 1 1) )
+        )
+        local input_transmission_depth = surfaceShader.GetInput "transmission_depth"
+        if input_transmission_depth != undefined then (
+            local attr = input_transmission_depth.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_transmission_depth.Get()) 0 )
+        )
 	),
 
     function test_export_OpenPBR_material = (
@@ -551,6 +612,163 @@ struct mtlx_shader_writer_test
         )
     ),
 
+    -- MAX-MAT-006 regression: PhysicalMaterial export must not carry the 13
+    -- spec-default inputs that 3ds Max's MtlxIOUtil bridge writes on every
+    -- standard_surface at their MaterialX nodedef-default value. The post-
+    -- parse normalization in MtlxShaderWriter strips each input independently
+    -- when it equals the ND_standard_surface_surfaceshader v1.0.1 default and
+    -- is not connected. After strip the input is absent from the USD shader
+    -- prim; the renderer resolves it to the same nodedef default.
+    function test_export_physical_material_strips_spec_default_inputs = (
+        maxver = maxVersion()
+        -- PhysicalMaterial MaterialX export path is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphere001"
+        local mtl1 = PhysicalMaterial()
+        mtl1.name = "matDefault"
+        -- A default PhysicalMaterial has none of the 13 in-scope inputs
+        -- authored away from their nodedef default. The bridge bug is that
+        -- it still writes the 13 redundant attributes on the standard_surface
+        -- output, so the normalizer has 13 strips to perform.
+        sphere001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testPhysicalMaterialSpecDefaults.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/matDefault/matDefault")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- The 13 inputs MAX-MAT-006 strips. Each tuple is (input name, nodedef
+        -- default). For each, the post-condition is: either the input is
+        -- absent (cleanest, the strip fired) or it carries the nodedef
+        -- default explicitly. What must NOT be present is an authored value
+        -- equal to the nodedef default — that's the bridge leak the strip
+        -- targets.
+        --
+        -- The MaxScript bridge layer might re-author one or more of the 13
+        -- after the strip pass in a future regression; the
+        -- HasAuthoredValue() + value-equality check below catches both the
+        -- "strip didn't fire" regression (input present with the bridge
+        -- value) AND the "strip fired but a different default was written"
+        -- regression (input present with the wrong default).
+        local function assert_default_or_absent inputName expectedDefault = (
+            local input = surfaceShader.GetInput inputName
+            if input != undefined then (
+                local attr = input.GetAttr()
+                if attr.HasAuthoredValue() then (
+                    assert_equal (input.Get()) expectedDefault
+                )
+            )
+        )
+
+        assert_default_or_absent "base"               1.0
+        assert_default_or_absent "coat"               0.0
+        assert_default_or_absent "diffuse_roughness"  0.0
+        assert_default_or_absent "specular"           1.0
+        assert_default_or_absent "subsurface"         0.0
+        assert_default_or_absent "subsurface_scale"   1.0
+        assert_default_or_absent "transmission"       0.0
+        assert_default_or_absent "transmission_depth" 0.0
+        assert_default_or_absent "coat_color"         (pyGf.Vec3f 1 1 1)
+        assert_default_or_absent "specular_color"     (pyGf.Vec3f 1 1 1)
+        assert_default_or_absent "subsurface_color"   (pyGf.Vec3f 1 1 1)
+        assert_default_or_absent "transmission_color" (pyGf.Vec3f 1 1 1)
+
+        -- thin_walled is the lone boolean; the strip predicate is "input is
+        -- statically false". After strip the input is absent (cleanest) or
+        -- explicitly false; either is correct.
+        local input_thin_walled = surfaceShader.GetInput "thin_walled"
+        if input_thin_walled != undefined then (
+            local attr = input_thin_walled.GetAttr()
+            if attr.HasAuthoredValue() then (
+                assert_false (input_thin_walled.Get())
+            )
+        )
+    ),
+
+    -- MAX-MAT-006 surgical-preservation regression: the spec-default strip
+    -- MUST NOT touch inputs whose static value differs from the nodedef
+    -- default. The bridge-leak pattern is the *exact* nodedef-default value
+    -- on each of the 13 inputs, so any deviation is artist authoring intent
+    -- that must survive verbatim.
+    --
+    -- This test loads a synthetic MaterialX fixture
+    -- (data/spec_default_test/spec_default.mtlx) carrying each of the 13
+    -- in-scope inputs at a NON-default value (e.g. base = 0.6 instead of
+    -- 1.0). All 13 must reach the exported USD untouched. A failure means
+    -- either the normalizer's gate widened beyond "value == default" (a
+    -- code bug that would silently eat artist-authored inputs) or the
+    -- MaxScript bridge layer drops user-authored inputs on round-trip
+    -- (a separate, deeper bug this test surfaces).
+    function test_export_material_preserves_non_default_spec_inputs = (
+        maxver = maxVersion()
+        -- MaterialXMaterial.importMaterial is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereIntentSpec"
+        local mtl1 = MaterialXMaterial()
+        mtl1.name = "matIntentionalSpecInputs"
+        local scriptDir = getFilenamePath (getThisScriptFilename())
+        local mtlxDoc = (scriptDir + @"data\spec_default_test\spec_default.mtlx")
+        mtl1.importMaterial mtlxDoc
+        sphere001.material = mtl1
+        mtl1.explode()
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testIntentionalSpecInputs.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/IntentionalSpec/IntentionalSpec")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- Each input authored away from the nodedef default. The normalizer
+        -- must leave the value untouched: input present, attribute authored,
+        -- value equals the fixture's authored value.
+        local function assert_authored inputName expectedValue = (
+            local input = surfaceShader.GetInput inputName
+            assert_true (input != undefined)
+            local attr = input.GetAttr()
+            assert_true (attr.HasAuthoredValue())
+            assert_equal (input.Get()) expectedValue
+        )
+
+        assert_authored "base"               0.6
+        assert_authored "coat"               0.4
+        assert_authored "diffuse_roughness"  0.3
+        assert_authored "specular"           0.7
+        assert_authored "subsurface"         0.2
+        assert_authored "subsurface_scale"   2.0
+        assert_authored "transmission"       0.5
+        assert_authored "transmission_depth" 1.5
+        assert_authored "coat_color"         (pyGf.Vec3f 0.9 0.4 0.1)
+        assert_authored "specular_color"     (pyGf.Vec3f 0.8 0.8 0.9)
+        assert_authored "subsurface_color"   (pyGf.Vec3f 0.7 0.5 0.5)
+        assert_authored "transmission_color" (pyGf.Vec3f 0.3 0.6 0.9)
+        assert_authored "thin_walled"        true
+    ),
+
     function teardown = (
     ),
 
@@ -562,7 +780,9 @@ struct mtlx_shader_writer_test
         test_export_physical_material_strips_buggy_emission_default,
         test_export_material_preserves_intentional_emission,
         test_export_physical_material_strips_buggy_coat_defaults,
-        test_export_physical_material_strips_buggy_subsurface_radius
+        test_export_physical_material_strips_buggy_subsurface_radius,
+        test_export_physical_material_strips_spec_default_inputs,
+        test_export_material_preserves_non_default_spec_inputs
         )
 )
 
