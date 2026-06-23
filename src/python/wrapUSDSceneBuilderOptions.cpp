@@ -268,6 +268,7 @@ TF_REGISTRY_FUNCTION(TfEnum)
     TF_ADD_ENUM_NAME(MaxUsd::MaxMeshConversionOptions::NormalsMode::None);
     TF_ADD_ENUM_NAME(MaxUsd::MaxMeshConversionOptions::NormalsMode::AsAttribute);
     TF_ADD_ENUM_NAME(MaxUsd::MaxMeshConversionOptions::NormalsMode::AsPrimvar);
+    TF_ADD_ENUM_NAME(MaxUsd::MaxMeshConversionOptions::NormalsMode::Both);
 
     TF_ADD_ENUM_NAME(MaxUsd::MaxMeshConversionOptions::MeshFormat::FromScene);
     TF_ADD_ENUM_NAME(MaxUsd::MaxMeshConversionOptions::MeshFormat::TriMesh);

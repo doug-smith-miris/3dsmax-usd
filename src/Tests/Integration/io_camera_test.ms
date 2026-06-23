@@ -248,13 +248,18 @@ struct io_camera_test
         local usdGfCameraFOV = usdGfCamera.frustum.GetFOV()
         assert_float phys_camera.fov usdGfCameraFOV message:"Expected FOV value is not equal to physical camera setting"
 
-        -- the clipping plane range was not specified nor enabled at the
-        -- physical camera creation, however, the default USD camera values
-        -- should be in effect
+        -- Clipping plane range. The physical camera was created without enabling
+        -- 'Clip Manually', so Max's *renderer* ignores the clip distances -- but the
+        -- distances themselves are always stored on every camera and represent the
+        -- only intentional near/far metadata Max carries. The USD writer authors them
+        -- unconditionally (MAX-CAM-001) so the file is unambiguous, instead of leaving
+        -- the attribute unauthored and silently falling back to UsdGeomCamera's default
+        -- of (1, 1000000) -- which at metersPerUnit = 0.0254 would mean a 25 km far
+        -- plane.
         assert_false phys_camera.clip_on message:("Expected physical camera not to enable the clipping planes by default")
         local usdGfCameraClipRange = usdGfCamera.clippingRange
-        assert_float 1.0f (usdGfCameraClipRange.GetMin()) message:("Expected default minimum value for 'clippingRange' when setting is not explicitly exported")
-        assert_float 1000000f (usdGfCameraClipRange.GetMax()) message:("Expected default maximum value for 'clippingRange' when setting is not explicitly exported")
+        assert_float phys_camera.clip_near (usdGfCameraClipRange.GetMin()) message:("Expected minimum value for 'clippingRange' to be equal to physical camera setting even when clip_on is false")
+        assert_float phys_camera.clip_far (usdGfCameraClipRange.GetMax()) message:("Expected maximum value for 'clippingRange' to be equal to physical camera setting even when clip_on is false")
 
         -- other verified values from the physical camera
         assert_float phys_camera.f_number usdGfCamera.fStop message:("'fStop' value is not equal to physical camera setting")

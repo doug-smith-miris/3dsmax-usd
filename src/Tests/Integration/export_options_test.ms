@@ -83,7 +83,7 @@ struct export_options_test
         assert_equal ((GetDir #temp) + "\\MaxUsdExport.log") uiExportOptions.LogPath message:"The LogPath property was not properly initialized."
         assert_equal #off uiExportOptions.LogLevel message:"The LogLevel property was not properly initialized."
         assert_false uiExportOptions.PreserveEdgeOrientation message:"The PreserveEdgeOrientation property was not properly initialized to default (false)."
-        assert_equal #asPrimvar uiExportOptions.Normals message:"Normals property was not properly initialized to defaults (#asPrimvar)."
+        assert_equal #both uiExportOptions.Normals message:"Normals property was not properly initialized to defaults (#both)."
         assert_equal #fromScene uiExportOptions.MeshFormat message:"MeshFormat property was not properly initialized to defaults (#fromScene)."
         assert_equal #current uiExportOptions.TimeMode message:"The TimeMode property was not properly initialized to defaults (#current)."
         assert_equal 0.0 uiExportOptions.StartFrame message:"The StartFrame property was not properly initialized to defaults (0.0)."
@@ -250,7 +250,7 @@ struct export_options_test
         assert_equal ((GetDir #temp) + "\\MaxUsdExport.log") uiExportOptions.LogPath message:"The LogPath property was not properly reset."
         assert_equal #off uiExportOptions.LogLevel message:"The LogLevel property was not properly reset."
         assert_false uiExportOptions.PreserveEdgeOrientation message:"The PreserveEdgeOrientation property was not properly reset to default (false)."
-        assert_equal #asPrimvar uiExportOptions.Normals message:"Normals property was not properly reset to defaults (#asPrimvar)."
+        assert_equal #both uiExportOptions.Normals message:"Normals property was not properly reset to defaults (#both)."
         assert_equal #fromScene uiExportOptions.MeshFormat message:"MeshFormat property was not properly reset to defaults (#fromScene)."
         assert_equal #current uiExportOptions.TimeMode message:"The TimeMode property was not properly reset to defaults (#current)."
         assert_equal 0.0 uiExportOptions.StartFrame message:"The StartFrame property was not properly reset to defaults (0.0)."
@@ -1084,7 +1084,7 @@ struct export_options_test
         assert_equal "none" ((cubeGeom.GetSubdivisionSchemeAttr()).Get()) message:"Should be using none subdiv scheme when exporting normals."
             
         -- Test exporting normals as attribute
-            
+
         exportPath = output_prefix + "attribute_normals.usda"
         exportOptions.Normals = #asAttribute
         UsdExporter.ExportFile exportPath exportOptions:exportOptions
@@ -1100,13 +1100,31 @@ struct export_options_test
         assert_defined ((cubeGeom.GetNormalsAttr()).Get()) message:"Should have exported normals to an attribute."
         -- Subdiv scheme should be None. As normals are explicit.
         assert_equal "none" ((cubeGeom.GetSubdivisionSchemeAttr()).Get())  message:"Should be using none subdiv scheme when exporting normals."
-            
+
+        -- MAX-GEO-001: Test exporting normals as both primvar AND schema attribute.
+
+        exportPath = output_prefix + "both_normals.usda"
+        exportOptions.Normals = #both
+        UsdExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+        local cubePrim = stage.GetPrimAtPath("/" + nodeName)
+        assert_true (pyUsd.Prim.IsValid(cubePrim)) message:"Box should have exported to a valid prim."
+        assert_true (cubePrim.IsA(pyUsdGeom.Mesh)) message:"Box should have exported to a valid UsdMesh"
+        -- Should have a normals primvar.
+        local primvarApi = pyUsdGeom.PrimvarsAPI(cubePrim)
+        assert_true (primvarApi.HasPrimvar("normals")) message:"Should have a normals primvar when using #both."
+        -- AND should also have the schema normals attribute populated.
+        local cubeGeom = pyUsdGeom.Mesh(cubePrim)
+        assert_defined ((cubeGeom.GetNormalsAttr()).Get()) message:"Should also have a schema normals attribute when using #both."
+        -- Subdiv scheme should be None. As normals are explicit.
+        assert_equal "none" ((cubeGeom.GetSubdivisionSchemeAttr()).Get()) message:"Should be using none subdiv scheme when exporting normals."
+
         -- Test that invalid normal modes are rejected.
         try (
             local exportOptions = USDExporter.CreateOptions()
             exportOptions.Normals = 10
         )
-        catch 
+        catch
         (
             exceptionThrown = true
         )
