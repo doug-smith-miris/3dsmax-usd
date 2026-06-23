@@ -56,6 +56,7 @@ Status legend:
 | PhysicalMaterial.anisotropy_angle | `standard_surface.specular_rotation` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits `0.25` AND `specular_anisotropy` is static-zero or absent | MAX-MAT-001 | 2026-06-20 |
 | PhysicalMaterial.emission (none authored) | `standard_surface.emission` + `standard_surface.emission_color` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits `emission = 1.0` AND `emission_color = (0, 0, 0)`, both static | MAX-MAT-002 | 2026-06-20 |
 | PhysicalMaterial.coat (none authored) | `standard_surface.coat_IOR`, `.coat_affect_color`, `.coat_affect_roughness`, `.coat_roughness` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits the coat-block preset (`coat_IOR = 1.52`, `coat_affect_color = 0.5`, `coat_affect_roughness = 0.5`, `coat_roughness = 0.0`) on every shader AND `coat` is statically zero or absent. Each leak input is stripped independently when it matches its leak value; user overrides are preserved | MAX-MAT-004 | 2026-06-23 |
+| PhysicalMaterial.subsurface (none authored) | `standard_surface.subsurface_radius` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits the Pixar/Hery skin SSS triple `(0.794704, 0.531734, 0.292854)` on every shader AND `subsurface` is statically zero or absent. After strip falls back to the nodedef default `(1, 1, 1)`; user overrides away from the leak triple are preserved | MAX-MAT-005 | 2026-06-23 |
 | Node.wireColor / Node.material.diffuse | `UsdGeomMesh.primvars:displayColor` | bug normalization | (mesh primvar; not a shader nodedef) | `MeshConverter` is about to author wireColor into `primvars:displayColor` AND `node->GetMtl() != nullptr` | MAX-MAT-003 | 2026-06-20 |
 | Mesh normals (every interpolation) | `primvars:normals` AND `UsdGeomMesh.normals` (the schema attribute) | bug normalization | (mesh attribute; not a shader nodedef) | `NormalsMode` default is now `Both` -- both locations are authored unless the user explicitly picks `AsPrimvar` or `AsAttribute` | MAX-GEO-001 | 2026-06-20 |
 | Map channel 1 missing on the converted MNMesh | `primvars:st` (channel 1's configured primvar) | approximating workaround | (mesh primvar; not a shader nodedef) | `ApplyMaxMapChannels` did not author the channel-1 primvar AND channel 1 is not explicitly opted out (`GetChannelPrimvarConfig(1).GetPrimvarName().IsEmpty()`) AND VertexCount() > 0 AND FaceCount() > 0 | MAX-GEO-004 | 2026-06-20 |
@@ -348,6 +349,155 @@ override would diverge measurably between prefix and postfix.
 fixes `MtlxIOUtil` to stop emitting the spurious coat-block preset,
 the pass becomes inert (no node matches the trigger condition). Safe
 to keep as a guard for older 3ds Max installs.
+
+### PhysicalMaterial.subsurface (none authored) → standard_surface.subsurface_radius  (MAX-MAT-005)
+
+**Symptom.** The 3ds Max-shipped `MtlxIOUtil.ExportMtlxString` MaxScript
+bridge always emits
+
+```
+<input name="subsurface_radius" type="color3"
+       value="0.794704, 0.531734, 0.292854" />
+```
+
+on every `ND_standard_surface_surfaceshader`, regardless of whether the
+source PhysicalMaterial has any subsurface scattering enabled. Six out
+of six materials in the diagnostic corpus exhibit this — every distinct
+material carries the same triple byte-for-byte
+(`distinct_values_across_6_materials == 1` in
+`findings_evidence.json`). The MaterialX `standard_surface` nodedef
+default for `subsurface_radius` is **`(1, 1, 1)`** — neutral white.
+
+The triple `(0.794704, 0.531734, 0.292854)` is the canonical
+Pixar / Christophe-Hery **caucasian-skin SSS radius**: RGB attenuation
+distances tuned for human skin in PRMan/RIS production paths. The
+bridge stamps it on every material's `subsurface_radius` input, which
+the MtlxIOUtil source presumably uses as an internal "reasonable
+default if the user enables SSS" — but the value is opinionated and
+domain-specific, not a neutral baseline.
+
+**Why it matters.** The leak is visually inert on the current corpus
+because the bridge also (correctly) authors `subsurface = 0.0`, and
+the standard_surface BSDF multiplies the subsurface lobe contribution
+by `subsurface`, zeroing the lobe out entirely. The bug surfaces the
+moment any downstream context flips `subsurface > 0`:
+
+* A USD variant set or shader override that enables SSS on any of
+  the six materials (e.g. to author a "translucent" variant of a
+  ceramic, a wax variant of a metal, a candle variant of a plastic)
+  silently inherits Max's opinionated skin-tone scattering rather
+  than the neutral `(1, 1, 1)` nodedef default. Red attenuates much
+  less than green which attenuates much less than blue, so a Red
+  Plastic that turns on SSS would scatter as if it were skin — its
+  blue channel attenuates fastest, the surface picks up a warm
+  red-shifted core indistinguishable from human flesh.
+* A compositing layer that targets the subsurface scalar inherits
+  the same skin profile regardless of the material it's targeting:
+  a blue ceramic would scatter pink, gold metal would scatter pink,
+  brushed steel would scatter pink — every material scatters with
+  the same opinionated RGB attenuation tuned for caucasian skin.
+* Round-trip importers that read `subsurface_radius = (0.794704,
+  0.531734, 0.292854)` may treat the triple as authored intent
+  ("the artist chose a specific scatter profile") rather than the
+  bridge-emitted default that should fall through to the nodedef.
+* The values do not match the source DCC: the PhysicalMaterial has
+  no SSS knobs touched. The exported document misrepresents what
+  the artist authored.
+
+**Fix.** Add a fourth post-parse normalization pass in
+`MtlxShaderWriter::Write()` (run immediately after MAX-MAT-004's pass)
+that walks the parsed `MaterialX::Document` and, for each
+`standard_surface` node, removes the `subsurface_radius` input when
+*all* of:
+
+* The node's `subsurface` input is provably zero (absent, or present
+  and statically `0.0`, tolerant of float noise). A connected
+  `subsurface` could carry a runtime non-zero value, so the input is
+  preserved in that case. A statically non-zero `subsurface` means
+  the lobe is active and the radius is observable — preserve it as
+  authored.
+* The `subsurface_radius` input is not connected (static value only).
+* The static triple matches the bridge's hard-coded skin leak
+  `(0.794704, 0.531734, 0.292854)` within a tolerance of `1e-4`
+  per channel. The looser epsilon (vs the `1e-6` used elsewhere)
+  absorbs the single-precision round-trip through the MaterialX XML
+  serializer; the next-nearest neighbor a user might author by
+  intent is far outside `1e-4`.
+
+After normalization the input falls back to the nodedef default
+`(1, 1, 1)`, which is the correct "no SSS profile was authored"
+neutral state. A downstream context that later turns SSS on will see
+a uniform-scattering neutral white instead of the opinionated skin
+profile.
+
+**Bounds (where the fix conservatively does nothing):**
+
+* `subsurface` is connected to a node or nodegraph — runtime value
+  unknown; assume the SSS lobe may be intentional and keep the
+  radius as-is.
+* `subsurface` is statically non-zero — the lobe is active and the
+  radius is observable; keep it as authored.
+* `subsurface_radius` is connected — could carry an intentional
+  procedural radius driven by a texture or attribute; keep it
+  regardless of `subsurface`.
+* `subsurface_radius` has a static triple that differs from the
+  leak triple by more than `1e-4` on any channel — user authored
+  it explicitly; keep it.
+* The node has no `subsurface_radius` input at all — already at the
+  nodedef default; nothing to do.
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/fac3976c-b89a-4cbc-8851-ccf62cfdb993/normalize_subsurface_radius_default.py`
+mirrors the C++ logic at the USD layer (the C++ runs at the
+MaterialX-doc layer earlier in the pipeline). Running it on the
+captured `complex_export.usda` strips exactly 6 leak inputs
+(6 materials × 1 input), with zero collateral changes and idempotent
+on a second pass:
+
+```
+== normalize_subsurface_radius_default pass 1 ==
+  subsurface_radius: 6
+  materials_touched: 6
+== collateral diff ==
+  total removed: 6
+  total added:   0
+== pass 2 (idempotence) ==
+  subsurface_radius: 0
+```
+
+The diff is purely structural at the USD-layer level — exactly the
+six `inputs:subsurface_radius` attributes the bridge over-authored,
+on exactly the six materials that had them, with zero side effects
+on every other attribute on every other prim.
+
+**Karma renders.** Same two-render protocol as MAX-MAT-004:
+
+* **Gated case** (`subsurface = 0` on every material — the corpus
+  default): `render_karma_prefix.png` (leak present) and
+  `render_karma_postfix.png` (leak stripped) sit at or below the
+  Karma 21.0.700 sampler-noise floor. The fix delta is a visual
+  no-op — exactly what the BSDF math predicts since `subsurface * 0
+  == 0`, regardless of what radius the dead lobe would have used.
+* **Stressed case** (`subsurface = 1.0` overlaid on every material):
+  `render_karma_stress_prefix.png` and `render_karma_stress_postfix.png`
+  diverge measurably. The prefix renders every material with the
+  skin-tone RGB attenuation; the postfix renders every material with
+  the neutral white attenuation. The stress overlay also pushes
+  `subsurface_color` to a neutral grey to make the radius's effect
+  on chromatic attenuation the dominant variable (otherwise the
+  redundant `subsurface_color = (1, 1, 1)` corpus default would mask
+  the radius delta on a flat white scatter target).
+
+The observable that proves the fix in the **common case** is
+structural — the six `inputs:subsurface_radius` attributes
+disappear from the USDA. The observable that proves the fix is
+*meaningful* (i.e. that the leak was real and consequential) is
+the visible divergence in the **stressed case**.
+
+**Retirement condition.** Same as MAX-MAT-001/002/004: when
+Autodesk fixes `MtlxIOUtil` to stop emitting the spurious skin SSS
+radius, the pass becomes inert (no node matches the trigger
+condition). Safe to keep as a guard for older 3ds Max installs.
 
 ### Node.wireColor / Node.material.diffuse → UsdGeomMesh.primvars:displayColor  (MAX-MAT-003)
 
@@ -1050,6 +1200,24 @@ camera; honouring them is correct regardless of the upstream
   moment any downstream context flips `coat > 0`: previously the
   override would silently inherit Max's opinionated coat profile
   rather than the cleaner nodedef defaults.
+* 2026-06-23 — MAX-MAT-005 subsurface-radius preset normalization: strip
+  the spurious `subsurface_radius = (0.794704, 0.531734, 0.292854)` triple
+  (the Pixar/Hery caucasian-skin SSS radius) that 3ds Max's `MtlxIOUtil`
+  bridge emits on every `ND_standard_surface_surfaceshader` regardless of
+  the source PhysicalMaterial, but only when `subsurface` is provably zero
+  (absent or static 0.0) so the triple is visually inert under the current
+  BSDF gate. After normalization the stripped input falls back to the
+  MaterialX `standard_surface` nodedef default `(1, 1, 1)`, a neutral
+  white scatter radius — the correct "no SSS profile was authored" state.
+  The fix is visually inert while the SSS lobe is gated off (Karma
+  prefix-vs-postfix pixel delta sits at or below the sampler-noise floor)
+  but eliminates a latent regression that surfaces the moment any
+  downstream context flips `subsurface > 0`: previously the override
+  would silently inherit Max's skin-tone RGB attenuation (red attenuates
+  least, blue attenuates fastest — pink-red core on every scatter,
+  regardless of base material) rather than the cleaner neutral nodedef
+  default. The stressed-overlay Karma renders visualise the divergence
+  end-to-end.
 * 2026-06-20 — MAX-GEO-003 GeomSubset name normalization: replace the
   legacy underscore-wrapped fallback pattern `_{N}_` in
   `MaterialUtils::CreateSubsetName` with the readable `mat_{N}` form.

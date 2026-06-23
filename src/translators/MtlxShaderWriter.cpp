@@ -233,6 +233,79 @@ void _NormalizeStandardSurfaceCoatDefaults(const MaterialX::DocumentPtr& doc)
     }
 }
 
+// MAX-MAT-005 workaround: 3ds Max's MtlxIOUtil bridge emits
+// subsurface_radius = (0.794704, 0.531734, 0.292854) on every standard_surface
+// node, regardless of whether the source PhysicalMaterial has any subsurface
+// scattering enabled. The triple is the canonical Pixar/Christophe-Hery
+// caucasian-skin SSS radius (RGB attenuation distances tuned for human skin);
+// the MaterialX standard_surface nodedef default for subsurface_radius is
+// (1, 1, 1), a neutral white. The bridge also (correctly) authors
+// subsurface = 0.0, which gates the SSS lobe entirely out of the BSDF, so
+// the leak is visually inert on the captured corpus.
+//
+// The bug surfaces the moment any downstream context flips subsurface above
+// zero: a USD overlay / variant / re-export that enables SSS on any of these
+// materials silently inherits Max's opinionated skin-tone scattering rather
+// than the neutral nodedef default. A red plastic, a blue ceramic, a gold
+// metal — every material would scatter as if it were skin once SSS is
+// activated, because the bridge stamped the same skin radius on all of them
+// and nothing else in the document records that the artist never authored it.
+//
+// Strip subsurface_radius when it matches the buggy hard-coded triple
+// (tolerant of float noise), is not connected, AND subsurface is provably
+// zero (absent OR statically 0.0). A connected subsurface could carry a
+// runtime non-zero value, so the input is preserved in that case. A
+// statically non-zero subsurface means the lobe is active and the radius is
+// observable -- keep it as authored. A subsurface_radius that has been
+// explicitly overridden away from the leak triple is treated as intentional
+// and preserved.
+void _NormalizeStandardSurfaceSubsurfaceRadiusDefault(const MaterialX::DocumentPtr& doc)
+{
+    if (!doc) {
+        return;
+    }
+    // Bridge's hard-coded skin SSS radius. The values are stored as 32-bit
+    // floats in the MaterialX document, so the comparison uses a small
+    // epsilon to absorb the round-trip from the maxUsd findings_evidence
+    // triple (0.794704020023346, 0.531733989715576, 0.292854011058807) to
+    // whatever single-precision form ended up in the document.
+    static constexpr float kLeakRadius[3] = { 0.794704f, 0.531734f, 0.292854f };
+    static constexpr float kRadiusEpsilon = 1e-4f;
+
+    for (const auto& node : doc->getNodes("standard_surface")) {
+        // Gate: subsurface must be provably zero (absent counts as the
+        // nodedef default of 0.0).
+        if (auto subsurfaceInput = node->getInput("subsurface")) {
+            float subsurfaceValue = 0.f;
+            if (!_TryGetStaticFloat(subsurfaceInput, subsurfaceValue)) {
+                // Connected or unparseable -- could be non-zero at runtime.
+                continue;
+            }
+            if (std::fabs(subsurfaceValue) > 1e-6f) {
+                // Statically non-zero subsurface: lobe is active, radius
+                // matters.
+                continue;
+            }
+        }
+
+        auto radiusInput = node->getInput("subsurface_radius");
+        if (!radiusInput) {
+            continue;
+        }
+        float radius[3] = { 0.f, 0.f, 0.f };
+        if (!_TryGetStaticColor3(radiusInput, radius)) {
+            continue;
+        }
+        if (std::fabs(radius[0] - kLeakRadius[0]) > kRadiusEpsilon
+            || std::fabs(radius[1] - kLeakRadius[1]) > kRadiusEpsilon
+            || std::fabs(radius[2] - kLeakRadius[2]) > kRadiusEpsilon) {
+            // User authored a different radius -- preserve.
+            continue;
+        }
+        node->removeInput("subsurface_radius");
+    }
+}
+
 // MAX-MAT-001 workaround: 3ds Max's MtlxIOUtil bridge emits
 // specular_rotation = 0.25 on every standard_surface node, regardless of the
 // source PhysicalMaterial's anisotropy settings. The MaterialX standard_surface
@@ -763,6 +836,7 @@ void MtlxShaderWriter::Write()
     _NormalizeStandardSurfaceSpecularRotation(mtlxDoc);
     _NormalizeStandardSurfaceEmissionDefault(mtlxDoc);
     _NormalizeStandardSurfaceCoatDefaults(mtlxDoc);
+    _NormalizeStandardSurfaceSubsurfaceRadiusDefault(mtlxDoc);
 
     // Sanitize the material name using the same logic as with the MaterialX component
     // to match the node name produced by the MaterialX exporter. createValidName
