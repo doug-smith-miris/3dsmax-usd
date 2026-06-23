@@ -55,6 +55,7 @@ Status legend:
 | --- | --- | --- | --- | --- | --- | --- |
 | PhysicalMaterial.anisotropy_angle | `standard_surface.specular_rotation` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits `0.25` AND `specular_anisotropy` is static-zero or absent | MAX-MAT-001 | 2026-06-20 |
 | PhysicalMaterial.emission (none authored) | `standard_surface.emission` + `standard_surface.emission_color` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits `emission = 1.0` AND `emission_color = (0, 0, 0)`, both static | MAX-MAT-002 | 2026-06-20 |
+| PhysicalMaterial.coat (none authored) | `standard_surface.coat_IOR`, `.coat_affect_color`, `.coat_affect_roughness`, `.coat_roughness` | bug normalization | `ND_standard_surface_surfaceshader` | Bridge emits the coat-block preset (`coat_IOR = 1.52`, `coat_affect_color = 0.5`, `coat_affect_roughness = 0.5`, `coat_roughness = 0.0`) on every shader AND `coat` is statically zero or absent. Each leak input is stripped independently when it matches its leak value; user overrides are preserved | MAX-MAT-004 | 2026-06-23 |
 | Node.wireColor / Node.material.diffuse | `UsdGeomMesh.primvars:displayColor` | bug normalization | (mesh primvar; not a shader nodedef) | `MeshConverter` is about to author wireColor into `primvars:displayColor` AND `node->GetMtl() != nullptr` | MAX-MAT-003 | 2026-06-20 |
 | Mesh normals (every interpolation) | `primvars:normals` AND `UsdGeomMesh.normals` (the schema attribute) | bug normalization | (mesh attribute; not a shader nodedef) | `NormalsMode` default is now `Both` -- both locations are authored unless the user explicitly picks `AsPrimvar` or `AsAttribute` | MAX-GEO-001 | 2026-06-20 |
 | Map channel 1 missing on the converted MNMesh | `primvars:st` (channel 1's configured primvar) | approximating workaround | (mesh primvar; not a shader nodedef) | `ApplyMaxMapChannels` did not author the channel-1 primvar AND channel 1 is not explicitly opted out (`GetChannelPrimvarConfig(1).GetPrimvarName().IsEmpty()`) AND VertexCount() > 0 AND FaceCount() > 0 | MAX-GEO-004 | 2026-06-20 |
@@ -182,6 +183,171 @@ math predicts since `1 * black == 0 * white == 0`.
 **Retirement condition.** Same as MAX-MAT-001: when Autodesk fixes
 `MtlxIOUtil` to stop emitting the spurious emission pair, the pass
 becomes inert. Safe to keep as a guard for older 3ds Max installs.
+
+### PhysicalMaterial.coat (none authored) → standard_surface.coat_* preset block  (MAX-MAT-004)
+
+**Symptom.** The 3ds Max-shipped `MtlxIOUtil.ExportMtlxString` MaxScript
+bridge always emits the same four coat-block inputs on every
+`ND_standard_surface_surfaceshader`, regardless of whether the source
+PhysicalMaterial has any coating enabled:
+
+```
+<input name="coat_IOR"              type="float"  value="1.52" />
+<input name="coat_affect_color"     type="float"  value="0.5"  />
+<input name="coat_affect_roughness" type="float"  value="0.5"  />
+<input name="coat_roughness"        type="float"  value="0.0"  />
+```
+
+Six out of six materials in the diagnostic corpus
+(`/Users/d.smith/MirisProjects/Agent Builder/agent/pipeline-runs/3e596cac-1d4f-45fe-82eb-afa09679eae9/complex_export.usda`)
+exhibit this — every distinct material carries the same four leak
+values byte-for-byte (`distinct_values_across_6_materials == 1` per
+input in `findings_evidence.json`). The MaterialX `standard_surface`
+nodedef defaults are different on each input:
+
+| Input | Bridge leak | MaterialX nodedef default | Why the leak is "wrong" |
+| --- | --- | --- | --- |
+| `coat_IOR` | 1.52 | **1.5** | Hard-coded to a glass-coating IOR rather than the spec default. |
+| `coat_affect_color` | 0.5 | **0.0** | Bridge tints base by the coat color even when nothing is authored. |
+| `coat_affect_roughness` | 0.5 | **0.0** | Bridge couples coat roughness into specular roughness by default. |
+| `coat_roughness` | 0.0 | **0.1** | Bridge emits a perfectly-smooth coat where the spec assumes a 10% roughness baseline. |
+
+**Why it matters.** All four values are visually inert on the current
+corpus because the bridge correctly authors `coat = 0.0`, and the
+standard_surface BSDF multiplies the coat lobe contribution by `coat`,
+zeroing the lobe out entirely. The bug surfaces the moment any
+downstream context flips `coat > 0`:
+
+* A compositing layer that targets the coat scalar (e.g. to author a
+  glossy variant of a base material) inherits Max's opinionated coat
+  profile — `IOR = 1.52` rather than the cleaner `1.5` baseline, full
+  base-color tinting via `coat_affect_color = 0.5`, full
+  specular-roughness coupling via `coat_affect_roughness = 0.5`, and a
+  mirror-smooth coat from `coat_roughness = 0.0` instead of the spec's
+  10% roughness floor.
+* A USD variant set or shader override that swaps `coat` to a non-zero
+  value picks up the same opinionated profile silently — the artist
+  who authored the override has no way to know the rest of the
+  coat block was preset by the bridge rather than the source DCC.
+* Round-trip importers that read the four inputs may treat them as
+  authored intent ("the artist chose IOR 1.52 specifically") rather
+  than bridge-emitted defaults that should fall through to nodedef
+  defaults.
+* The values do not match the source DCC: the PhysicalMaterial has no
+  coat knobs touched. The exported document misrepresents what the
+  artist authored.
+
+**Fix.** Add a third post-parse normalization pass in
+`MtlxShaderWriter::Write()` (run immediately after MAX-MAT-002's pass)
+that walks the parsed `MaterialX::Document` and, for each
+`standard_surface` node, removes each of the four coat-block inputs
+**independently** when *all* of:
+
+* The node's `coat` input is provably zero (absent, or present and
+  statically `0.0`, tolerant of float noise). A connected `coat` could
+  carry a runtime non-zero value, so the whole block is preserved in
+  that case. A statically non-zero `coat` means the lobe is active and
+  the four inputs are observable — preserve them as authored.
+* The leak input is not connected (static value only).
+* The leak input's static value matches the bridge's hard-coded leak
+  value exactly (tolerant of float noise).
+
+Per-input independence is the key design difference vs MAT-002, which
+strips emission/emission_color as a *pair*: in MAT-002 the emission
+pair multiplies to zero so treating either half in isolation could
+destroy a real authored value. The four coat inputs in MAT-004 are not
+mutually dependent — they multiply / interpolate into the BSDF
+separately — so each can be tested and stripped on its own merits. A
+user who explicitly overrides one of them (say `coat_IOR = 1.45`)
+keeps that override while the other three (still at their leak
+values) are stripped.
+
+After normalization each stripped input falls back to its nodedef
+default, which is the correct "no coat was authored" state.
+
+**Bounds (where the fix conservatively does nothing):**
+
+* `coat` is connected to a node or nodegraph — runtime value unknown;
+  assume the coat lobe may be intentional and keep the entire block.
+* `coat` is statically non-zero — the lobe is active and the inputs
+  are observable; keep the entire block as authored.
+* A leak input is connected — could carry intentional procedural
+  values; keep it regardless of `coat`.
+* A leak input has a static value other than its known leak value —
+  user authored it explicitly; keep it.
+* The node is missing one of the four leak inputs entirely — already
+  at the nodedef default; nothing to do.
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/79e8fa61-668b-430f-9fde-70102c2abce6/normalize_coat_block_defaults.py`
+mirrors the C++ logic at the USD layer (the C++ runs at the
+MaterialX-doc layer earlier in the pipeline). Running it on the
+captured `complex_export.usda` strips exactly 24 leak inputs
+(6 materials × 4 inputs), with zero collateral changes and idempotent
+on a second pass:
+
+```
+== normalize_coat_block_defaults pass 1 ==
+  coat_IOR: 6
+  coat_affect_color: 6
+  coat_affect_roughness: 6
+  coat_roughness: 6
+  materials_touched: 6
+== collateral diff ==
+  total removed: 24
+  total added:   0
+== pass 2 (idempotence) ==
+  coat_IOR: 0
+  coat_affect_color: 0
+  coat_affect_roughness: 0
+  coat_roughness: 0
+```
+
+The diff is purely structural at the USD-layer level — exactly the
+four `inputs:coat_*` attributes the bridge over-authored, on exactly
+the six materials that had them, with zero side effects on every
+other attribute on every other prim.
+
+**Karma renders.**
+`render_karma_prefix.png` (the captured corpus with the leak) and
+`render_karma_postfix.png` (the validator-applied corpus) are *not*
+SHA-256-identical because this Karma CPU sampling preset is
+non-deterministic across runs (re-rendering the same stage twice
+produces max-pixel delta = 20/255, mean delta = 0.0166/255, ~4.3% of
+pixels non-zero — the sampler noise floor at the configured
+spp/threading). What matters is whether the prefix-vs-postfix delta
+exceeds the noise floor; it does not. Measured on the gated corpus:
+
+```
+prefix vs prefix-repeat (Karma noise floor):  max 20  mean 0.0166  nonzero 4.33%
+prefix vs postfix      (fix delta, coat=0):   max 18  mean 0.0162  nonzero 4.29%
+```
+
+The fix delta is *indistinguishable* from the sampler-noise floor —
+exactly what the BSDF math predicts since `coat == 0` zeros the lobe
+whether the four inputs hold leak values or fall through to nodedef
+defaults. The observable that proves the fix is therefore
+**structural** (the USDA-layer diff above), not visual: a frame-by-
+frame comparison cannot distinguish a leaked-but-gated coat block
+from a clean coat block, by design of the BSDF.
+
+A coat-stress overlay (`coat = 1.0` authored on every material in a
+fresh layer above the corpus reference) was also rendered — both
+prefix and postfix versions remain within the same noise floor under
+this lighting and camera setup. Reason: in the corpus `coat_color`
+is `(1, 1, 1)` (a separate redundant-default leak documented as
+MAX-MAT-006 territory, not stripped by this fix), which makes the
+`coat_affect_color` term reduce to a no-op; the small `coat_IOR`
+delta (1.52 vs 1.5) and the `coat_roughness` delta (0.0 vs 0.1) are
+insufficient to clear the noise floor without sharp specular content
+in the lighting. The latent risk remains real — any downstream
+context that combines `coat > 0` *with* an opinionated `coat_color`
+override would diverge measurably between prefix and postfix.
+
+**Retirement condition.** Same as MAX-MAT-001/002: when Autodesk
+fixes `MtlxIOUtil` to stop emitting the spurious coat-block preset,
+the pass becomes inert (no node matches the trigger condition). Safe
+to keep as a guard for older 3ds Max installs.
 
 ### Node.wireColor / Node.material.diffuse → UsdGeomMesh.primvars:displayColor  (MAX-MAT-003)
 
@@ -864,6 +1030,26 @@ camera; honouring them is correct regardless of the upstream
   `(1, 1000000)` fallback on a default-constructed `Physical`
   camera), now asserts that the writer emits the camera's stored
   `clip_near` / `clip_far` instead.
+* 2026-06-23 — MAX-MAT-004 coat-block preset normalization: strip the
+  four spurious coat-block inputs (`coat_IOR = 1.52`,
+  `coat_affect_color = 0.5`, `coat_affect_roughness = 0.5`,
+  `coat_roughness = 0.0`) that 3ds Max's `MtlxIOUtil` bridge emits on
+  every `ND_standard_surface_surfaceshader` regardless of the source
+  PhysicalMaterial, but only when `coat` is provably zero (absent or
+  static 0.0) so the four values are visually inert under the current
+  BSDF gate. Each input is tested and stripped independently — a user
+  who explicitly overrides one of the four to a non-leak value keeps
+  that override while the other three (still at their leak values) are
+  removed. After normalization the stripped inputs fall back to the
+  MaterialX `standard_surface` nodedef defaults (`coat_IOR = 1.5`,
+  `coat_affect_color = 0.0`, `coat_affect_roughness = 0.0`,
+  `coat_roughness = 0.1`), which is the correct "no coat was authored"
+  state. The fix is visually inert while the coat lobe is gated off
+  (Karma prefix-vs-postfix pixel delta is at or below the sampler-
+  noise floor) but eliminates a latent regression that surfaces the
+  moment any downstream context flips `coat > 0`: previously the
+  override would silently inherit Max's opinionated coat profile
+  rather than the cleaner nodedef defaults.
 * 2026-06-20 — MAX-GEO-003 GeomSubset name normalization: replace the
   legacy underscore-wrapped fallback pattern `_{N}_` in
   `MaterialUtils::CreateSubsetName` with the readable `mat_{N}` form.

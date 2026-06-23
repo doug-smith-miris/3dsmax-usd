@@ -156,6 +156,83 @@ void _NormalizeStandardSurfaceEmissionDefault(const MaterialX::DocumentPtr& doc)
     }
 }
 
+// MAX-MAT-004 workaround: 3ds Max's MtlxIOUtil bridge emits an opinionated
+// coat-block preset on every standard_surface node, regardless of the source
+// PhysicalMaterial. The four spurious inputs are
+//
+//     coat_IOR             = 1.52   (nodedef default = 1.5)
+//     coat_affect_color    = 0.5    (nodedef default = 0.0)
+//     coat_affect_roughness= 0.5    (nodedef default = 0.0)
+//     coat_roughness       = 0.0    (nodedef default = 0.1)
+//
+// They are visually inert on the corpus because the bridge correctly authors
+// coat = 0.0, and the coat lobe is gated by that scalar inside the
+// standard_surface BSDF. The bug surfaces the moment ANY downstream override
+// flips coat above zero (a USD overlay, a variant, a re-export with a coat
+// value, a round-trip importer that resolves coat from another source):
+// every coat_*-derived computation then silently inherits Max's opinionated
+// profile rather than the MaterialX nodedef defaults, producing a glossier,
+// higher-IOR, partially color-shifting clearcoat the artist never authored.
+//
+// Strip each of the four inputs independently when it matches the buggy
+// hard-coded value (tolerant of float noise), is not connected to anything,
+// AND coat is provably zero (absent OR statically 0.0). A connected coat
+// could carry a runtime non-zero value, so we conservatively keep the entire
+// block in that case. A statically non-zero coat means the lobe is active
+// and the values are observable -- keep them as authored. An input that has
+// been explicitly overridden away from the leak value is treated as
+// intentional and preserved.
+void _NormalizeStandardSurfaceCoatDefaults(const MaterialX::DocumentPtr& doc)
+{
+    if (!doc) {
+        return;
+    }
+    for (const auto& node : doc->getNodes("standard_surface")) {
+        // Gate: coat must be provably zero (absent counts as the nodedef
+        // default of 0.0).
+        if (auto coatInput = node->getInput("coat")) {
+            float coatValue = 0.f;
+            if (!_TryGetStaticFloat(coatInput, coatValue)) {
+                // Connected or unparseable -- could be non-zero at runtime.
+                continue;
+            }
+            if (std::fabs(coatValue) > 1e-6f) {
+                // Statically non-zero coat: lobe is active, values matter.
+                continue;
+            }
+        }
+
+        // Per-input independent strip. Each tuple: (input name, leak value).
+        // coat_roughness's leak value is 0.0; the input is still spurious
+        // because the nodedef default (0.1) is what every other tool will
+        // observe when the input is absent.
+        struct LeakInput {
+            const char* name;
+            float       leakValue;
+        };
+        static constexpr LeakInput kLeakInputs[] = {
+            { "coat_IOR",              1.52f },
+            { "coat_affect_color",     0.5f },
+            { "coat_affect_roughness", 0.5f },
+            { "coat_roughness",        0.0f },
+        };
+        for (const auto& leak : kLeakInputs) {
+            auto input = node->getInput(leak.name);
+            if (!input) {
+                continue;
+            }
+            float value = 0.f;
+            if (!_TryGetStaticFloat(input, value)) {
+                continue;
+            }
+            if (std::fabs(value - leak.leakValue) > 1e-6f) {
+                continue;
+            }
+            node->removeInput(leak.name);
+        }
+    }
+}
+
 // MAX-MAT-001 workaround: 3ds Max's MtlxIOUtil bridge emits
 // specular_rotation = 0.25 on every standard_surface node, regardless of the
 // source PhysicalMaterial's anisotropy settings. The MaterialX standard_surface
@@ -685,6 +762,7 @@ void MtlxShaderWriter::Write()
 
     _NormalizeStandardSurfaceSpecularRotation(mtlxDoc);
     _NormalizeStandardSurfaceEmissionDefault(mtlxDoc);
+    _NormalizeStandardSurfaceCoatDefaults(mtlxDoc);
 
     // Sanitize the material name using the same logic as with the MaterialX component
     // to match the node name produced by the MaterialX exporter. createValidName
