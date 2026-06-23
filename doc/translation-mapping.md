@@ -181,6 +181,56 @@ identical. Karma renders pre- and post-strip are byte-identical (same
 SHA-256), confirming the fix is a visual no-op — exactly what the BSDF
 math predicts since `1 * black == 0 * white == 0`.
 
+**Surgical-preservation validator (added 2026-06-23).**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/375b2235-daa3-442c-b8ad-b3a0ac67228a/validate_emission_normalize_surgical.py`
+extends the original validator with explicit **negative** cases —
+prims that LOOK similar to the leak but must NOT be stripped. 8 cases
+enumerate every line of the C++ gate plus the connection / shader-id
+filters:
+
+| Material in synthetic fixture | emission | emission_color    | strip? | bound exercised |
+| --- | --- | --- | --- | --- |
+| `LeakPair`                  | `1.0`        | `(0, 0, 0)`         | yes  | (the bug, must strip) |
+| `IntentionalColor`          | `1.0`        | `(0.8, 0.4, 0.1)`   | no   | color != `(0,0,0)` |
+| `IntentionalScalar`         | `0.5`        | `(0, 0, 0)`         | no   | scalar != `1.0` |
+| `NeitherDefault`            | `0.7`        | `(0.2, 0.5, 0.9)`   | no   | both off-leak |
+| `LonelyEmission`            | `1.0`        | (absent)            | no   | pair must coexist |
+| `LonelyColor`               | (absent)     | `(0, 0, 0)`         | no   | pair must coexist |
+| `ConnectedColor`            | `1.0`        | `(0,0,0)` + connect | no   | connected input |
+| `NonStandardSurface`        | `1.0`        | `(0, 0, 0)`         | no   | id != standard_surface |
+
+Plus an idempotence check (a second pass over the post-normalized
+fixture strips zero inputs). All 8 cases + idempotence pass on the
+2026-06-23 baseline, locking in the surgical bound. A future regression
+that widened the strip gate would fail by named case rather than just
+"some attribute disappeared somewhere."
+
+**MaxScript regression (added 2026-06-23).**
+`src/Tests/Integration/mtlxShaderWriter_test.ms` now carries
+`test_export_material_preserves_intentional_emission`. It loads
+`src/Tests/Integration/data/intentional_emission_test/intentional_emission.mtlx`
+(a synthetic `standard_surface` with `emission = 0.5`, `emission_color =
+(1.0, 0.3, 0.0)`) via `MaterialXMaterial.importMaterial`, exports
+through `USDExporter`, and asserts the standard_surface's `emission` and
+`emission_color` attributes are present, authored, and carry the
+fixture's authored values verbatim. The existing
+`test_export_physical_material_strips_buggy_emission_default` is also
+strengthened with a pair-level post-condition that the buggy
+(`1.0`, `(0, 0, 0)`) pair cannot coexist on the same shader, catching
+the half-leak case where a future refactor might preserve one half of
+the buggy pair while correctly stripping the other.
+
+**Visual demonstration of the surgical bound.** A single-sphere fixture
+carrying the intentional-emission shader is rendered twice in Karma:
+`render_karma_postfix.png` (the current fix — warm orange, emission
+preserved) and `render_unreal_reference.png` (the "still-broken"
+reference where emission has been over-stripped — neutral grey).
+The two PNGs differ by SHA-256 and visibly so. The auditor's
+checklist: **the current fix's render is warm orange; if it ever
+becomes neutral grey, the normalizer has started over-stripping
+intentional artist emission.** Composite at
+`compare_side_by_side.png` in the same arch-build dir.
+
 **Retirement condition.** Same as MAX-MAT-001: when Autodesk fixes
 `MtlxIOUtil` to stop emitting the spurious emission pair, the pass
 becomes inert. Safe to keep as a guard for older 3ds Max installs.
@@ -1133,6 +1183,27 @@ camera; honouring them is correct regardless of the upstream
 * 2026-06-20 — MAX-MAT-002 emission/emission_color default-pair
   normalization landed (strip `emission = 1.0` paired with
   `emission_color = (0, 0, 0)`).
+* 2026-06-23 — MAX-MAT-002 surgical-preservation reinforcement: add an
+  8-case Python validator
+  (`validate_emission_normalize_surgical.py`) covering each surgical
+  bound the C++ gate enforces (off-leak color, off-leak scalar,
+  half-leak, connected input, non-`standard_surface` shader, plus
+  idempotence); add a MaxScript regression
+  (`test_export_material_preserves_intentional_emission`) that loads a
+  synthetic `.mtlx` carrying intentional `emission = 0.5`,
+  `emission_color = (1.0, 0.3, 0.0)` and asserts the values survive
+  the round-trip + normalizer untouched; strengthen the existing
+  happy-path `.ms` test with a pair-level post-condition that the
+  buggy `(1.0, (0, 0, 0))` pair cannot coexist on the same shader
+  (catches the half-leak case where a future refactor might preserve
+  one half of the buggy pair while correctly stripping the other);
+  add a visual auditor pair
+  (`render_karma_postfix.png` warm orange = preserved;
+  `render_unreal_reference.png` neutral grey = over-stripped) to make
+  the surgical bound visible at the pixel level. No C++ logic change
+  in this bite — the reinforcement is purely additive test
+  infrastructure that locks in the surgical guarantee against future
+  regressions.
 * 2026-06-20 — MAX-MAT-003 mesh displayColor leak fixed (derive
   `primvars:displayColor` from the bound material's `GetDiffuse()`
   instead of the node's viewport wireframe color, falling back to the

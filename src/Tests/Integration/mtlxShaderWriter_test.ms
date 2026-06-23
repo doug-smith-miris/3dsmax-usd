@@ -284,6 +284,15 @@ struct mtlx_shader_writer_test
         -- is absent (cleanest), or it explicitly carries the nodedef
         -- default (emission = 0.0, emission_color = (1, 1, 1)). Both
         -- states fix the bug; what must NOT be present is the buggy pair.
+        --
+        -- The conditional shape below is the right one (an absent input
+        -- after the strip is the cleanest outcome, and an unauthored
+        -- attribute Get() returns the nodedef default which is also fine).
+        -- The point is: if the buggy pair survived the normalizer it would
+        -- carry an authored 1.0 / (0, 0, 0), so the explicit equality
+        -- checks below MUST fail in that regression. The new
+        -- post-condition assertion below is the belt-and-suspenders guard
+        -- that the leak pair cannot be re-introduced.
         local emInput = surfaceShader.GetInput "emission"
         if emInput != undefined then (
             local emAttr = emInput.GetAttr()
@@ -298,6 +307,103 @@ struct mtlx_shader_writer_test
                 assert_equal (emColorInput.Get()) (pyGf.Vec3f 1 1 1)
             )
         )
+
+        -- Belt-and-suspenders: positively assert the buggy pair does NOT
+        -- coexist on the same shader. If a future code change regressed
+        -- the normalizer (e.g. dropped the emission_color == (0,0,0) gate
+        -- and started over-stripping intentional black emission, or
+        -- weakened the emission == 1.0 gate, or both), one of these
+        -- inputs could still show up at its leak value while the other
+        -- looked fine on its own. The pair-level assertion catches that.
+        local emHasLeakValue = false
+        local emColorHasLeakValue = false
+        if emInput != undefined then (
+            local emAttr = emInput.GetAttr()
+            if emAttr.HasAuthoredValue() then (
+                emHasLeakValue = ((emInput.Get()) == 1.0)
+            )
+        )
+        if emColorInput != undefined then (
+            local emColorAttr = emColorInput.GetAttr()
+            if emColorAttr.HasAuthoredValue() then (
+                emColorHasLeakValue = ((emColorInput.Get()) == (pyGf.Vec3f 0 0 0))
+            )
+        )
+        assert_false (emHasLeakValue and emColorHasLeakValue)
+    ),
+
+    -- MAX-MAT-002 surgical-preservation regression: the post-parse
+    -- normalization that strips the buggy emission pair MUST NOT touch
+    -- shaders carrying INTENTIONAL emission values. The bug pattern is
+    -- the *exact* pair (emission = 1.0 AND emission_color = (0, 0, 0)),
+    -- so any deviation on either half is an artist authoring intent that
+    -- must survive verbatim.
+    --
+    -- This test loads a synthetic MaterialX fixture
+    -- (data/intentional_emission_test/intentional_emission.mtlx) carrying
+    -- emission = 0.5, emission_color = (1.0, 0.3, 0.0) -- a warm sunset
+    -- orange. Both inputs deviate from the leak values, so the normalizer
+    -- gate fails on both halves and both inputs must reach the exported
+    -- USD untouched.
+    --
+    -- A failure here means either:
+    --   1. The normalizer's strip gate was widened (a code bug that would
+    --      silently eat artist-authored emission), or
+    --   2. The MaxScript bridge layer drops user-authored emission on
+    --      MaterialXMaterial round-trip (a separate, deeper bug that
+    --      this test surfaces).
+    -- Either way the test fails noisily and points at the regression.
+    function test_export_material_preserves_intentional_emission = (
+        maxver = maxVersion()
+        -- MaterialXMaterial.importMaterial is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereIntentEm"
+        local mtl1 = MaterialXMaterial()
+        mtl1.name = "matIntentionalEmission"
+        local scriptDir = getFilenamePath (getThisScriptFilename())
+        local mtlxDoc = (scriptDir + @"data\intentional_emission_test\intentional_emission.mtlx")
+        mtl1.importMaterial mtlxDoc
+        sphere001.material = mtl1
+        mtl1.explode()
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testIntentionalEmission.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/IntentionalEmission/IntentionalEmission")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- The intentional emission scalar (0.5) is NOT the leak value
+        -- (1.0). The normalizer's gate fails on the first check and the
+        -- pair is left alone. The input must be present, authored, and
+        -- carry the fixture's authored value.
+        local emInput = surfaceShader.GetInput "emission"
+        assert_true (emInput != undefined)
+        local emAttr = emInput.GetAttr()
+        assert_true (emAttr.HasAuthoredValue())
+        assert_equal (emInput.Get()) 0.5
+
+        -- The intentional emission color (1.0, 0.3, 0.0) is NOT the leak
+        -- value ((0, 0, 0)). The normalizer's gate fails on the second
+        -- check and the input is left alone. The input must be present,
+        -- authored, and carry the fixture's authored colour.
+        local emColorInput = surfaceShader.GetInput "emission_color"
+        assert_true (emColorInput != undefined)
+        local emColorAttr = emColorInput.GetAttr()
+        assert_true (emColorAttr.HasAuthoredValue())
+        local got = emColorInput.Get()
+        assert_equal got (pyGf.Vec3f 1.0 0.3 0.0)
     ),
 
     -- MAX-MAT-004 regression: PhysicalMaterial export must not carry the
@@ -454,6 +560,7 @@ struct mtlx_shader_writer_test
         test_export_material_leading_digit_name,
         test_export_physical_material_strips_buggy_specular_rotation,
         test_export_physical_material_strips_buggy_emission_default,
+        test_export_material_preserves_intentional_emission,
         test_export_physical_material_strips_buggy_coat_defaults,
         test_export_physical_material_strips_buggy_subsurface_radius
         )

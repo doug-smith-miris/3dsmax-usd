@@ -124,6 +124,24 @@ bool _TryGetStaticColor3(
 // match the buggy pattern so the exported USD falls back to the nodedef
 // defaults (which also evaluate to zero emission, with the right meaning).
 // Connected inputs and any non-matching values are left untouched.
+//
+// Surgical bounds (negative cases, ALL must leave the inputs untouched --
+// enforced by the regression suite via
+// src/Tests/Integration/mtlxShaderWriter_test.ms ::
+//     test_export_material_preserves_intentional_emission
+// plus the doc-linked Python validator
+// validate_emission_normalize_surgical.py):
+//   * emission is statically not 1.0 -- artist-authored scalar.
+//   * emission_color is statically not (0, 0, 0) -- artist-authored colour.
+//   * Either input is connected (carries a procedural value).
+//   * One half of the pair is absent -- the bug is the pair, not either
+//     half on its own.
+//   * The shader is not a standard_surface (id != ND_standard_surface_*).
+//
+// A future refactor that widens any of these gates would silently start
+// eating artist-authored emission. Both the .ms surgical test and the
+// Python validator name the specific bound they exercise, so a regression
+// in any branch fails with a useful, localised error.
 void _NormalizeStandardSurfaceEmissionDefault(const MaterialX::DocumentPtr& doc)
 {
     if (!doc) {
