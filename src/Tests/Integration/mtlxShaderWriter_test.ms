@@ -383,6 +383,68 @@ struct mtlx_shader_writer_test
         )
     ),
 
+    -- MAX-MAT-005 regression: PhysicalMaterial export must not carry the
+    -- spurious subsurface_radius = (0.794704, 0.531734, 0.292854) default
+    -- (the Pixar/Hery caucasian-skin SSS radius preset) that 3ds Max's
+    -- MtlxIOUtil bridge writes on every standard_surface, gated by
+    -- subsurface = 0.0. The post-parse normalization in MtlxShaderWriter
+    -- strips subsurface_radius (when subsurface is statically zero or
+    -- absent and the input matches the buggy hard-coded triple), falling
+    -- back to the MaterialX nodedef default (subsurface_radius = (1, 1, 1)).
+    function test_export_physical_material_strips_buggy_subsurface_radius = (
+        maxver = maxVersion()
+        -- PhysicalMaterial MaterialX export path is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphere001"
+        local mtl1 = PhysicalMaterial()
+        mtl1.name = "matNoSss"
+        -- A default PhysicalMaterial has subsurface off. The bridge bug
+        -- surfaces regardless of this setting.
+        sphere001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testPhysicalMaterialNoSss.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/matNoSss/matNoSss")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- Gate: subsurface must be zero (the bridge always emits
+        -- subsurface = 0 for a default PhysicalMaterial, so the
+        -- normalization must have fired).
+        local subsurfaceInput = surfaceShader.GetInput "subsurface"
+        if subsurfaceInput != undefined then (
+            local subsurfaceAttr = subsurfaceInput.GetAttr()
+            if subsurfaceAttr.HasAuthoredValue() then (
+                assert_equal (subsurfaceInput.Get()) 0
+            )
+        )
+
+        -- After normalization the subsurface_radius is either absent
+        -- (cleanest) or explicitly set to the MaterialX nodedef default
+        -- of (1, 1, 1). Both states fix the bug; what must NOT be
+        -- present is the buggy skin SSS triple
+        -- (0.794704, 0.531734, 0.292854).
+        local radiusInput = surfaceShader.GetInput "subsurface_radius"
+        if radiusInput != undefined then (
+            local radiusAttr = radiusInput.GetAttr()
+            if radiusAttr.HasAuthoredValue() then (
+                assert_equal (radiusInput.Get()) (pyGf.Vec3f 1 1 1)
+            )
+        )
+    ),
+
     function teardown = (
     ),
 
@@ -392,7 +454,8 @@ struct mtlx_shader_writer_test
         test_export_material_leading_digit_name,
         test_export_physical_material_strips_buggy_specular_rotation,
         test_export_physical_material_strips_buggy_emission_default,
-        test_export_physical_material_strips_buggy_coat_defaults
+        test_export_physical_material_strips_buggy_coat_defaults,
+        test_export_physical_material_strips_buggy_subsurface_radius
         )
 )
 
