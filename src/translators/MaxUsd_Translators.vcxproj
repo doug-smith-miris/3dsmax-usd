@@ -17,6 +17,7 @@
     <ClInclude Include="CameraWriter.h" />
     <ClInclude Include="DLLEntry.h" />
     <ClInclude Include="HelperWriter.h" />
+    <ClInclude Include="LegacyLightWriter.h" />
     <ClInclude Include="maxusdtranslators_pch.h" />
     <ClInclude Include="MeshWriter.h" />
     <ClInclude Include="MtlSwitcherWriter.h" />
@@ -35,6 +36,7 @@
     <ClCompile Include="CameraWriter.cpp" />
     <ClCompile Include="DllEntry.cpp" />
     <ClCompile Include="HelperWriter.cpp" />
+    <ClCompile Include="LegacyLightWriter.cpp" />
     <ClCompile Include="LightReader.cpp" />
     <ClCompile Include="maxusdtranslators_pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
