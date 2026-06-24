@@ -1,6 +1,11 @@
 ## Changelog
 
 
+### Miris fork (unreleased)
+
+#### Fixes:
+- **[MAX-LIT-001]** Add `MaxUsdLegacyLightWriter` so legacy 3ds Max standard lights (`Omnilight`, `Skylight`) no longer silently drop from USD export. Omnilight is authored as a `UsdLuxSphereLight` with `treatAsPoint = true` and a `0.001` radius (matching the convention `PhotometricLightWriter` uses for photometric point lights); Skylight is authored as a `UsdLuxDomeLight`. Both inherit the common `inputs:color` / `inputs:intensity` / `inputs:normalize` / `UsdLuxShadowAPI` authoring shape, and respect the `exportOptions.Lights` global gate. See `doc/translation-mapping.md` for the full mapping entry and surgical-bound table.
+
 ### v0.15.0
 
 #### What's New:

@@ -32,6 +32,7 @@
                   # CameraWriter - all Camera class objects
                   # ShapeWriter - any Shape class objects
                   # PhotometricLightWriter - any LightScape light class objects
+                  # LegacyLightWriter - legacy standard lights (Omnilight, Skylight) the PhotometricLightWriter does not claim (MAX-LIT-001)
                   # SunPositionerWriter - any subject objects of SunPositioner class type
                   # HelperWriter - any PointHelper or Dummy class objects
                }

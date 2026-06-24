@@ -15,6 +15,7 @@
 //
 #include "CameraWriter.h"
 #include "HelperWriter.h"
+#include "LegacyLightWriter.h"
 #include "MeshWriter.h"
 #include "PhotometricLightWriter.h"
 #include "ShapeWriter.h"
@@ -44,6 +45,11 @@ TF_REGISTRY_FUNCTION(MaxUsdPrimWriterRegistry)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdMeshWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdCameraWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdPhotometricLightWriter)
+    // MAX-LIT-001: pick up legacy lights (Omnilight, Skylight) the
+    // photometric writer's LIGHTSCAPE_LIGHT_CLASS gate ignores. Order
+    // does not matter relative to PhotometricLightWriter because the
+    // two writers' CanExport() class-ID checks are mutually exclusive.
+    MAXUSD_REGISTER_BASEWRITER(MaxUsdLegacyLightWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdSunPositionerWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdHelperWriter)
 }
