@@ -123,6 +123,20 @@ bool MaxUsdCameraWriter::Write(
     }
 
 #ifdef USD_CURVES_SUPPORTED
+    // [MAX-ANIM-001] camera animation time-sampled export bound
+    // (lock-in only, no logic change). The `!= Curves` gate ADDITIVELY
+    // co-exists with `exportCurves` -- on Curves mode, BOTH spline AND
+    // time-sample attribute authoring fire (the spline is the artist-
+    // intent representation; the time-sample fallback keeps consumers
+    // without Ts support functional). A refactor that flipped this to
+    // `== TimeSamples` would silently drop the Curves-mode time-sample
+    // fallback that every Hydra / Karma / ARKit consumer reads. See the
+    // central [MAX-ANIM-001] block in
+    // `src/MaxUsd/Translators/AnimExportTask.cpp::Execute` and the
+    // validator cases `Animated_Camera_TimeSamples` /
+    // `Camera_ProjectionStatic_EvenInAnimatedStage` /
+    // `CrossWriter_Divergence` in
+    // `validate_animation_time_sampled_surgical.py`.
     const bool exportCurves = GetExportArgs().GetAnimationType()
             != MaxUsd::USDSceneBuilderOptions::AnimationType::TimeSamples
         && time.IsFirstFrame();

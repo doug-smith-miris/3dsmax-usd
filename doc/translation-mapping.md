@@ -80,6 +80,7 @@ Status legend:
 | 3ds Max legacy light classes that inherit `LightObject` but NOT `LightscapeLight` (`Omnilight` = `OMNI_LIGHT_CLASS_ID`; `Skylight` = `SKYLIGHT_CLASS_ID`; legacy `Target_Spot` / `Free_Spot` = `SPOT_LIGHT_CLASS_ID`; legacy `Target_Direct` / `Free_Direct` = `DIR_LIGHT_CLASS_ID`; mr_Sky, Daylight environment lights, etc.) | NO `UsdLux*` prim authored -- the writer-registry's only general-purpose light writer (`PhotometricLightWriter`) gates on `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)`, returns `ContextSupport::Unsupported` for every non-LightscapeLight, and `MaxUsdPrimWriterRegistry::FindWriter` returns nullptr (no other registered writer claims a `LightObject`). The light is silently dropped from the exported stage: no prim, no error, no warning | audit (lock-in of existing writer-registry surgical-coverage bound, no C++ logic change) | (UsdLux schema; not a shader nodedef -- the audit pins the writer-registry's bottom bound for lights) | `PhotometricLightWriter::CanExport` is invoked AND `!exportArgs.GetTranslateLights() || !object->IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)`. Surgical bounds: (a) the LIGHTSCAPE_LIGHT_CLASS branch returns `ContextSupport::Fallback` so in-scope photometric / physical lights are authored as the correct `UsdLuxDiskLight` / `UsdLuxRectLight` / `UsdLuxSphereLight` / `UsdLuxCylinderLight` per `GetPrimType` -- the positive control proves this still fires; (b) every non-LightscapeLight LightObject (legacy Omnilight, Skylight, Spot, Direct, etc.) returns Unsupported AND no other registered writer claims the LightObject category -- silent drop. A wildcard widening that returned `Fallback` for every LightObject and stamped out default UsdLuxSphereLight / UsdLuxDomeLight without per-class attribute translation would author spurious extra lights at every legacy light position (e.g. an Omnilight that was turned OFF / set to multiplier 0 / set to a non-default attenuation/color in Max would silently appear as a unit-intensity SphereLight in USD); (c) the `exportArgs.GetTranslateLights()` short-circuit fires BEFORE the class-id gate -- a user who disables light export sees the same nullptr for every light type, including in-scope photometrics; (d) `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)` is safely callable on non-light Objects (returns false) so the gate is well-behaved across all node types | MAX-LIT-001 | 2026-06-26 |
 | Color-space metadata across all three USD-shading writer paths: `MtlxShaderWriter::_SetInputValue` (color3/color4 inputs + filename-on-image-color-output inputs); `set_bitmap_scale_bias_sourcecolorspace` in `usd_material_writer.py` (every UsdUVTexture); `LastResortUSDPreviewSurfaceWriter::Write` (Color3f diffuseColor value, no UsdUVTexture) | Three divergent conventions, one per writer: MaterialX path authors `colorSpace` USD metadata on the UsdShade input attribute IFF `_TypeSupportsColorSpace(input)` is true AND `getActiveColorSpace()` is non-empty; UsdPreviewSurface Python writer authors `sourceColorSpace = "raw"` as a TOKEN INPUT on every baked UsdUVTexture (hardcoded with TODO retirement condition); LastResort C++ writer authors NEITHER colorSpace nor sourceColorSpace -- `diffuseColor` is linear by UsdPreviewSurface spec when authored as a Color3f value | audit (lock-in of existing cross-writer color-space surgical-coverage bound, no C++ logic change) | (multiple: `colorSpace` USD metadata on UsdShade input attrs for MaterialX shaders; `sourceColorSpace` TOKEN INPUT on UsdUVTexture for baked UsdPreviewSurface paths; no colorSpace anywhere on the LastResort value-only path) | `_SetInputValue` is invoked AND `_TypeSupportsColorSpace(input)` is true AND `getActiveColorSpace()` is non-empty -- the MaterialX path propagates; `set_bitmap_scale_bias_sourcecolorspace` is invoked on a baked UsdUVTexture -- always hardcoded "raw" pending TODO retirement; `LastResortUSDPreviewSurfaceWriter::Write` is invoked -- value-only, no UsdUVTexture, no colorSpace by UsdPreviewSurface spec. Surgical bounds: (a) `_TypeSupportsColorSpace` accepts ONLY color3/color4 typed inputs OR filename inputs on image nodes with color3/color4 output -- every other input type (float, vector3, matrix, etc.) MUST NEVER receive colorSpace metadata even when the MaterialX active color space resolves to a non-empty name; (b) `if (!colorSpace.empty())` short-circuit -- empty active color space MUST NOT cause `SetColorSpace(TfToken(""))` because that creates authored-empty metadata distinct from no-metadata-at-all; (c) hardcoded `sourceColorSpace = "raw"` is the acknowledged-incomplete UsdPreviewSurface bound -- retirement requires a future MAX-MAT-* that consults `from_tex.bitmap.gamma` and adds an sRGB-gamma test case to `export_texture_test.py`; (d) LastResort writer authors NO UsdUVTexture child AND NO `colorSpace` metadata on `diffuseColor` -- per UsdPreviewSurface spec, the value is linear by definition | MAX-MAT-009 | 2026-06-26 |
 | Two or more 3ds Max nodes that share one Object (USD-instance pair) but each Node has a different `.material` assignment (per-instance material override). Special case: at least one of the divergent materials is a MultiMtl whose Object carries per-face matIds (`ApplyMaxMaterialIDs` has authored `materialBind`-family GeomSubsets on the prototype child) | THREE override-structure carriers, one per surgical branch: (a) USD instancing PRESERVED (`IsInstanceable() == true`) with per-instance MaterialBindingAPI authored on the local instance prim spec (non-MultiMtl divergence, or MultiMtl-without-subsets divergence -- Branches B and C of the four-branch decision tree); (b) USD instancing BROKEN (`SetInstanceable(false)`) + the prototype's `materialBind`-family GeomSubsets COPIED to an override-child Mesh prim under the divergent instance with `customData[3dsmax:matId]` preserved across the copy + each copied subset bound to the divergent MultiMtl's sub-material (Branch D, the per-instance MultiMtl override case that requires breaking instancing because USD subset bindings on the prototype apply to every instance); (c) MtlSwitcher container materials authored as `UsdShade.Material` with `shadingVariant` UsdVariantSet of N internal-references (variant-sets export style, Branch E) OR single `AddInternalReference` to the active material with no variant set (active-only / 1-variant-fallback, Branch F) OR bare `UsdShade.Material` prim with no references and no variant set (empty switcher, Branch G) | audit (lock-in of existing four-Branches-A/B/C/D + three-Branches-E/F/G override-structure surgical-coverage bound, no C++ logic change) | (multiple non-shader USD constructs: `pxr::Usd.Prim.SetInstanceable`; `pxr::UsdGeom.Subset` + `customData[3dsmax:matId]`; `pxr::UsdShade.MaterialBindingAPI`; `pxr::Usd.VariantSet` (`shadingVariant`); `pxr::Usd.Prim.GetReferences().AddInternalReference`) | `_AddInstancePrimsToMaterialMap` is invoked AND `prototype.GetInstances()` returns >=2 instances. Surgical bounds: (a) sameMaterialForAllInstances == true -> KEEP instancing, bind on the inheritance-base prim's child (Branch A); (b) different non-MultiMtl materials -> KEEP instancing, per-instance MaterialBindingAPI on the instance prim's local spec (Branch B); (c) different MultiMtl, NO subsets on the prototype child -> KEEP instancing, per-instance MaterialBindingAPI via `customData[3dsmax:matId]` lookup (Branch C); (d) different MultiMtl, subsets DO exist on the prototype child -> `BreakInstancingAndCopySubset` runs: `SetInstanceable(false)` + subset copy with matId customData preserved + rebind copied subsets to divergent MultiMtl's sub-mtls (Branch D, the data-loss vector the audit primarily pins). Plus three switcher-shape bounds: (e) AsVariantSets >=2 variants -> `shadingVariant` UsdVariantSet authored with one internal-reference per variant (Branch E); (f) ActiveMaterialOnly OR 1-variant AsVariantSets fallback -> NO variant set, single `AddInternalReference` to active material (Branch F); (g) empty switcher -> warn + early-return, bare Material prim, NO variant set, NO references (Branch G) | MAX-MAT-010 | 2026-06-26 |
+| Animation / time-sampled export across the three writer paths that author time-coded attributes from animated 3ds Max scenes: `src/MaxUsd/Builders/USDSceneBuilder.cpp` (transform/xform via `AddTransformExportOp`); `src/translators/CameraWriter.cpp` (camera focalLength / clippingRange / aperture / fStop / focusDistance / DOF inputs); `src/translators/PhotometricLightWriter.cpp` (light intensity / inputs:color / extent attributes per UsdLux geometry type). The central `MaxUsd::AnimExportTask::Execute` scheduler resolves every per-op USD time code via the substitution `usdTime = animated ? UsdTimeCode(GetFrameFromTimeValue(maxTime)) : UsdTimeCode::Default()` (where `animated = timeConfig.IsAnimated() = startFrame != endFrame`) | Three divergent gate conventions, one per writer, plus a per-writer static-attribute partition that is NEVER time-coded regardless of the gate: (a) Transform `exportTimeSamples = animType == TimeSamples OR nodeTarget OR !isValidController` -- FORCES TimeSamples on lookat-target nodes AND invalid-controller nodes (List / PRS-without-keys / Expose / Linkage); (b) Camera `exportTimeSamples = animType != Curves` -- TimeSamples co-exists ADDITIVELY with the Curves spline path on Max 2026+ (Hydra / Karma / ARKit consumer fallback); (c) Light `exportTimeSamples = animType == TimeSamples` -- STRICT equality, no time-sample fallback on Curves mode (lights serialize as splines only). Each writer's static-attribute partition (camera `projection`; light `enableColorTemperature`, `normalize`, `shaping:ies:file` [MAX-LIT-002 IES branch bound], `colorTemperatureAttr` [MAX-LIT-002 Kelvin branch bound]) is authored at `UsdTimeCode::Default()` ONCE per write, outside the `if (exportTimeSamples)` blocks | audit (lock-in of existing three-writer-path animation surgical-coverage bound, no C++ logic change) | (multiple non-shader USD constructs: `pxr::UsdGeomXformOp` per-component attr time samples; `pxr::UsdGeomCamera.focalLength` / `.clippingRange` / `.horizontalAperture` / `.verticalAperture` / `.focusDistance` / `.fStop` time samples; `pxr::UsdLuxLightAPI.intensity` / `.color` time samples + UsdLux geometry-specific extent attrs `.radius` / `.width` / `.length`) | `AnimExportTask::Execute` is invoked AND `timeConfig.IsAnimated()` (start != end). Surgical bounds the audit pins: (a) `IsAnimated() == false` -> EVERY writer's `attr.Set(value, usdTime)` carries `usdTime = UsdTimeCode::Default()` (the static-asset convention); (b) `IsAnimated() == true` -> EVERY writer's `attr.Set(value, usdTime)` carries `usdTime = UsdTimeCode(frame)` at each frame in `[startTime, endTime]` step `timeStep = ticksPerFrame / samplesPerFrame`; (c) the Transform path's FORCE-TimeSamples cases for `nodeTarget` (lookat needs sample-time worldspace target lookup; spline cannot represent it) and `!isValidController` (List / PRS-without-keys / Expose / Linkage cannot serialize as Ts splines) -- both branch out of the Curves serialization path even when `animType == Curves`; (d) the Camera path's `!= Curves` gate co-exists with the spline path (Curves mode authors BOTH the spline AND the time-sample fallback); (e) the Light path's `== TimeSamples` strict-equality gate (Curves mode authors splines ONLY, no time-sample fallback); (f) each writer's never-time-coded static attrs (camera projection; light enableColorTemperature, normalize, colorTemperature, shaping:ies:file) stay at `UsdTimeCode::Default()` even on animated stages | MAX-ANIM-001 | 2026-06-26 |
 
 ## Notes per expression
 
@@ -3899,6 +3900,296 @@ non-instanceable prims; that swap is a separate concern with its
 own audit shape and would land alongside the existing audit, NOT
 as a replacement for it.
 
+### Animation / time-sampled export across the three writer paths (audit, transform/camera/light each STOP at their own static/animated partition) (MAX-ANIM-001)
+
+**Symptom.** The planner auto-emitted `animation-time-sampled-export`
+with severity High and rationale "Add time-sampled transform/camera/
+light export for animated 3ds Max scenes". The literal reading is
+that animation time-sampling does not yet exist on these writer
+paths and needs to be added from scratch. **That reading is wrong**
+on the current fork — the existing source tree at
+`src/MaxUsd/Builders/USDSceneBuilder.cpp` (`AddTransformExportOp`),
+`src/translators/CameraWriter.cpp` (11 `exportTimeSamples`
+branches), `src/translators/PhotometricLightWriter.cpp` (12
+`exportTimeSamples` branches), and the central scheduler
+`src/MaxUsd/Translators/AnimExportTask.cpp::Execute` all
+ALREADY implement time-sampled export. What is missing is
+**negative-test coverage and a documented surgical-coverage
+bound** that pins the three writers' static-vs-animated partition
+so a future "unify time-sampling across the writers" wildcard
+refactor lands visibly rather than silently corrupting output.
+
+The baseline diagnostic corpus the planner inferred this bite from
+(`pipeline-runs/3e596cac-1d4f-45fe-82eb-afa09679eae9`) was a
+single-frame STATIC scene whose layer metadata carries
+`timeCodesPerSecond = 24, framesPerSecond = 24, startTimeCode =
+endTimeCode = 0` — the diagnostic noted this as
+"static-scene FPS noise (proposed MAX-XPT-004)", NOT as broken
+animation export. There is no captured corpus of animated-scene
+mistranslations on this fork.
+
+**Why it matters.** Animation time-sampling is the cornerstone of
+every animated-scene export workflow downstream of MaxUSD —
+Karma / Solaris / OmniViewport / Hydra Hydra2 / ARKit / Quick
+Look / glTF / OpenUSD-CLI all consume `attr.timeSamples` on
+xformOps + camera attrs + light attrs and silently fail in
+incompatible-but-undetectable ways if any one writer regresses
+its static/animated partition. The three writer paths each
+encode a DIFFERENT gate convention:
+
+  * **Transform** — `exportTimeSamples = animType == TimeSamples
+    OR nodeTarget OR !isValidController`. The OR-branches FORCE
+    TimeSamples on the two cases that cannot serialize as Ts
+    splines: lookat-target nodes (the lookat depends on the
+    target's worldspace at sample time, not resolvable from a
+    self-contained spline) and invalid TM controllers (List,
+    PRS without keys, Expose, Linkage — none can serialize as
+    Ts curves). A simplification to a plain
+    `animType == TimeSamples` would silently drop both forced
+    cases onto Curves and ship empty xformOp:transform attrs
+    on the affected prims.
+  * **Camera** — `exportTimeSamples = animType != Curves`. The
+    `if (exportTimeSamples)` and `if (exportCurves)` branches
+    are ADDITIVE on Curves mode: BOTH the spline and the
+    time-sample fallback fire on the same animation, so Hydra
+    / Karma / ARKit consumers that read `focalLength.timeSamples`
+    rather than `focalLength.spline` stay functional on
+    Curves-mode exports.
+  * **Light** — `exportTimeSamples = animType == TimeSamples`.
+    STRICT equality, unlike CameraWriter's additive `!= Curves`
+    gate. On Curves mode photometric lights serialize as splines
+    ONLY — there is no time-sample fallback. A refactor that
+    copy-pasted the CameraWriter gate would silently DUAL-author
+    time samples + splines on every animated-light export.
+
+In addition, each writer carries attributes that are **never
+time-coded** regardless of the `exportTimeSamples` gate. These are
+authored at `UsdTimeCode::Default()` ONCE per write, outside the
+`if (exportTimeSamples)` blocks:
+
+  * Camera: `projection` (CameraWriter.cpp:74) — perspective vs
+    orthographic; not animatable in Max.
+  * Light: `enableColorTemperature`, `normalize`,
+    `shaping:ies:file` (MAX-LIT-002 IES branch bound) — the IES
+    profile is a fixed-on-disk asset, a per-frame asset path is
+    meaningless.
+  * Light: `colorTemperatureAttr` value when `useKelvin == true`
+    (MAX-LIT-002 Kelvin branch bound) — the Kelvin clamp is a
+    one-shot value held across the animation; per-frame Kelvin
+    sampling would imply the artist wants the BLACKBODY color
+    to vary frame-by-frame, which Max does not expose as an
+    animatable channel.
+
+A wildcard "unify time-sampling across the three writers" refactor
+that bridged them with a single helper would either:
+
+  (a) drop the never-time-coded static-attribute partition onto the
+      time-sample path, bloating every animated export with redundant
+      per-frame samples on projection / enableColorTemperature /
+      normalize / shaping:ies:file / colorTemperatureAttr;
+  (b) drop the Transform path's FORCED-TimeSamples cases
+      (nodeTarget, !isValidController) onto the Curves path,
+      shipping empty xformOp:transform attrs on every
+      lookat-targeted camera / List-controlled node;
+  (c) flip the Camera path's `!= Curves` gate to `== TimeSamples`,
+      dropping the Curves-mode time-sample fallback every Hydra /
+      Karma / ARKit consumer reads;
+  (d) flip the Light path's `== TimeSamples` gate to `!= Curves`,
+      dual-authoring time samples + splines on photometric lights;
+  (e) collapse the central `IsAnimated() ?  UsdTimeCode(frame) :
+      Default()` substitution to always-time-coded, authoring
+      every attribute on every static export as a time-coded
+      sample at frame 0 (breaking the `startTimeCode == endTimeCode
+      == 0` static-asset convention every single-frame export
+      today produces).
+
+This audit pins (a)-(e) by named case so each surfaces visibly in
+the validator below rather than silently corrupting USD on every
+animated export.
+
+**Surgical bounds (where the existing C++ does nothing more than
+the audit pins):**
+
+* The central `AnimExportTask::Execute` `animated` boolean is
+  `timeConfig.IsAnimated() = startFrame != endFrame` — single-
+  frame range collapses to `UsdTimeCode::Default()` authoring,
+  multi-frame range produces per-sample time codes.
+* The Transform path's `exportTimeSamples` includes the
+  `nodeTarget` and `!isValidController` OR-branches so curves-
+  mode falls back to time samples on lookat / invalid-controller
+  nodes.
+* The Camera path's `exportTimeSamples = animType != Curves`
+  gate is ADDITIVE with the Curves path; both fire on Curves
+  mode.
+* The Light path's `exportTimeSamples = animType == TimeSamples`
+  gate is STRICT equality; only TimeSamples mode fires the time-
+  sample blocks.
+* Camera `projection`, light `enableColorTemperature` / `normalize`
+  / `shaping:ies:file` / `colorTemperatureAttr` are authored at
+  `UsdTimeCode::Default()` ONCE per write regardless of
+  `exportTimeSamples`.
+
+**Cross-writer-path divergence (MAX-MAT-009 / MAX-MAT-010 shape).**
+The validator below builds a synthetic USD stage carrying BOTH
+animated and static prims of all three writer types side-by-side
+(`/World/Sphere_Animated`, `/World/Sphere_Static`,
+`/World/Cam_Animated`, `/World/Cam_Static`,
+`/World/Light_Animated`, `/World/Light_Static`) and asserts each
+writer preserves its own convention SIMULTANEOUSLY on the same
+stage. The 10th case `CrossWriter_Divergence` walks every prim
+and asserts every static / animated invariant in one sweep — a
+unification refactor that bridged any two of the three writers
+would fail by named case here even if the individual per-writer
+cases above passed by accident.
+
+**Validator (added 2026-06-26).**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/03ca9858-2356-4e79-8898-a4a1d78de501/validate_animation_time_sampled_surgical.py`
+mirrors the surgical-bound table below at the USD layer. Ten named
+cases + idempotence. All 11 pass on the 2026-06-26 baseline
+against pxr.Usd 0.25.5.
+
+| Case | Asserts |
+| --- | --- |
+| `Static_Xform_NoTimeSamples` | `/World/Sphere_Static.xformOp:translate` has 0 time samples; `IsAuthored() == True` (default-only authoring is still authoring). |
+| `Static_Camera_NoTimeSamples` | `/World/Cam_Static.focalLength` and `.clippingRange` and `.projection` all have 0 time samples; static focalLength value reads 30.0. |
+| `Static_Light_NoTimeSamples` | `/World/Light_Static.intensity` and `.inputs:color` have 0 time samples (the PhotometricLightWriter's strict-equality gate stays false when `animType == TimeSamples` but `timeConfig.IsAnimated() == false`). |
+| `Animated_Xform_TimeSamples` | `/World/Sphere_Animated.xformOp:translate` has 5 time samples; first = startTime (0.0), last = endTime (24.0); mid-frame value at t=12 evaluates to 2.0 (linear interp between (6, 1.0) and (12, 2.0)). |
+| `Animated_Camera_TimeSamples` | `/World/Cam_Animated.focalLength` has 3 time samples; mid-frame value at t=12 evaluates to 45.0; `.clippingRange` also carries time samples (the MAX-CAM-001 unconditional-author binding routes through the same scheduler). |
+| `Animated_Light_TimeSamples` | `/World/Light_Animated.intensity` and `.inputs:color` each carry 3 time samples; mid-frame intensity at t=12 evaluates to 5.0. |
+| `Camera_ProjectionStatic_EvenInAnimatedStage` | `/World/Cam_Animated.projection` has 0 time samples (Default-only) even though the camera's focalLength / clippingRange ARE time-sampled on the same prim. |
+| `Light_ColorTemperatureStatic_EvenInAnimatedStage` | `/World/Light_Animated.colorTemperature`, `.enableColorTemperature`, `.normalize` all have 0 time samples (MAX-LIT-002 bound preserved) even though the light's intensity / color ARE time-sampled. `colorTemperatureAttr` value reads 3200.0 (a static Kelvin clamp). |
+| `Light_IesFile_Static_EvenInAnimatedStage` | `/World/Light_Animated.shaping:ies:file` has 0 time samples (MAX-LIT-002 IES branch bound preserved); the `SdfAssetPath` resolves to the static profile path. |
+| `CrossWriter_Divergence` | All six previous animated/static partitions hold SIMULTANEOUSLY on the same stage AND the layer metadata `timeCodesPerSecond = 24, framesPerSecond = 24, startTimeCode = 0, endTimeCode = 24` is preserved. |
+| `Idempotence` | Re-running the validator over a freshly-built stage produces identical per-case outcomes (no hidden state). |
+
+**MaxScript regression.** `test_animation_time_sampled_export_audit_cross_writer`
+added to `src/Tests/Integration/export_animation_test.ms`,
+gated on Max 2025+ (`maxver[1] >= 26900` — the same gate as
+MAX-LIT-002 + MAX-MAT-007). Builds an animated Box +
+TargetCamera + free photometric DiskLight, exports the same scene
+twice (once with `StartFrame=0 / EndFrame=24` and once with
+`StartFrame=0 / EndFrame=0`), and asserts:
+
+* Animated Box's xformOp carries time samples; static Box's
+  xformOp has none.
+* Animated camera prim has at least one time-coded attribute;
+  static camera prim has none. Camera `projection` has 0 time
+  samples on the animated stage (NEVER-time-coded bound).
+* Animated photometric light's `inputs:intensity` carries >= 2
+  time samples; static light's intensity has none. Animated
+  light's `inputs:enableColorTemperature` has 0 time samples
+  (MAX-LIT-002 Kelvin-branch bound preserved on animated stages).
+
+The MaxScript test asserts the same bounds the Python validator
+covers, but through the actual `USDExporter.ExportFile` end-to-end
+path that exercises Max -> writer-registry -> per-writer C++ ->
+USDSceneBuilder -> AnimExportTask. A regression that flipped any
+of the gate booleans in the three writer paths would fail by
+named assertion in the MaxScript test on a Windows build host;
+the Python validator would catch the same regression at the USD
+layer on this Mac without needing the build to run.
+
+**Visual demonstration.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/03ca9858-2356-4e79-8898-a4a1d78de501/`
+carries the auditor's pair:
+
+* `render_karma_postfix.png` — Karma CPU render at frame 12 of
+  `anim_postfix.usda` (the postfix fixture: animated translate /
+  focalLength / intensity, evaluated at the animation midpoint).
+  Sphere is HIGH in frame (translate.y = 2.6), LARGE
+  (focalLength = 45mm), BRIGHTER (intensity = 1600), and casts a
+  long sharp dark shadow on the ground.
+* `render_unreal_reference.png` — Karma CPU render at frame 12
+  of `anim_still_broken.usda` (the still-broken fixture: the
+  same three attributes authored at `UsdTimeCode::Default()`
+  as static values). Sphere is LOW (on the ground at
+  translate.y = 1.0), SMALL (focalLength = 30mm), DIMMER
+  (intensity = 800), faint short shadow directly under.
+* `compare_side_by_side.png` — the auditor's at-a-glance
+  composite (postfix LEFT, still-broken RIGHT, thin white
+  gutter between).
+
+The three writer-path signals map to three coordinated, monotone,
+directional observables. From `build_side_by_side.py`'s pixel
+analysis:
+
+  * **Transform** (sphere image-y centroid): `delta y = -28.59 px`
+    (postfix sphere is 29 px HIGHER in frame; smaller y = higher
+    in screen-space).
+  * **Camera** (sphere body pixel count): `ratio = 1.403x`
+    (postfix sphere covers ~40% more pixels — longer focalLength
+    = tighter framing).
+  * **Light** (sphere body channel means): `dR_body = +1.78,
+    dG_body = +2.27, dB_body = +1.31` — sphere body brighter on
+    every channel, monotone.
+
+PNGs are SHA-256-distinct (`d9578dcd…` vs `40f3fc5f…`). Each of
+the three signals corresponds 1:1 to one of the three writer
+paths the audit locks in, so a partial regression that hit only
+one writer (e.g. only the transform path regressed onto
+UsdTimeCode::Default()) would surface as a SINGLE observable
+collapsing onto the still-broken value while the other two stay
+at the postfix value.
+
+**Auditor's checklist:**
+
+  1. The composite `compare_side_by_side.png` has the postfix on
+     the LEFT and the still-broken counterfactual on the RIGHT.
+  2. **TRANSFORM signal (sphere position):** the postfix sphere
+     sits visibly HIGHER in the frame than the still-broken
+     sphere. Postfix's sphere bottom rests ABOVE the ground
+     horizon; still-broken's sphere rests ON the ground.
+  3. **CAMERA signal (sphere size):** the postfix sphere occupies
+     visibly MORE pixels than the still-broken sphere (~40%
+     larger / tighter framing).
+  4. **LIGHT signal (sphere brightness):** the postfix sphere
+     body reads BRIGHTER on every channel (monotone positive
+     deltas on R, G, B body means; the deltas are modest because
+     the still-broken sphere is already near saturation on the
+     highlight side at 800 lumens).
+  5. **CAST SHADOW (auxiliary):** the postfix has a long sharp
+     dark cast shadow on the ground; the still-broken has only a
+     faint short shadow directly under.
+  6. **The PNG hashes** (`d9578dcd…` vs `40f3fc5f…`) MUST differ
+     between the two renders.
+
+A refactor that ever made any single one of those three signals
+collapse onto the still-broken value (sphere drops to the ground
+/ shrinks to still-broken size / dims to still-broken brightness)
+would mean either the time-sample authoring on the corresponding
+writer path has regressed (the bound MAX-ANIM-001 locks in has
+broken) or the fixture itself drifted between renders. Both
+surface here by named observable; the auditor does not need to
+recompute centroid coordinates or body-pixel counts to call a
+regression — the visual differences are large enough that
+side-by-side inspection of `compare_side_by_side.png` is enough.
+
+**No C++ logic change in this bite — purely additive observability
++ test + doc infrastructure.** Surgical-bounds comment blocks
+landed at four sites: `AnimExportTask::Execute` (central
+scheduler comment naming the substitution + the four refactor-
+counterfactuals (a)-(e)); `USDSceneBuilder.cpp` at the
+`AddTransformExportOp` chain (transform back-pointer to the
+central block); `CameraWriter.cpp` at the `exportTimeSamples`
+gate (camera back-pointer); `PhotometricLightWriter.cpp` at the
+`exportTimeSamples` gate (light back-pointer). The audit pins the
+existing three-writer-path bound before any "unify time-sampling"
+refactor lands.
+
+**Retirement condition.** The day a SEPARATE future MAX-ANIM-*
+bite genuinely needs to bridge any two of the three writer paths
+with its own captured corpus + its own MaxScript regression +
+its own doc entry, the unified helper supersedes the
+divergent-by-design gates. The expected first retirement
+candidate is the Max 2026+ `AnimationType::Curves` mode — once
+that lands binary-verified and a corpus of Curves-mode
+mistranslations surfaces (e.g. the Camera + Light additive vs
+strict-equality asymmetry produces undesirable behavior on
+production assets), a SEPARATE MAX-ANIM-002 bite would unify the
+gates AS DICTATED BY THE CORPUS. Until then, the three writer
+paths' static/animated partition is the documented, locked-in
+behaviour.
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -4865,3 +5156,38 @@ as a replacement for it.
   existing audit, NOT as a replacement for it. Until then, the
   seven-branch decision tree is the documented, locked-in
   behaviour.
+
+* 2026-06-26 — MAX-ANIM-001 animation / time-sampled export
+  fidelity audit. First MAX-ANIM entry to land in the fork.
+  Locks in the existing three-writer-path animation surgical-
+  coverage bound across `src/MaxUsd/Builders/USDSceneBuilder.cpp`
+  (Transform via `AddTransformExportOp`),
+  `src/translators/CameraWriter.cpp` (Camera focalLength /
+  clippingRange / aperture / fStop / focusDistance / DOF inputs),
+  and `src/translators/PhotometricLightWriter.cpp` (Light
+  intensity / inputs:color / per-UsdLux-geometry extent attrs).
+  The central `MaxUsd::AnimExportTask::Execute` substitution
+  `usdTime = animated ? UsdTimeCode(frame) : UsdTimeCode::Default()`
+  routes every per-op USD time code via
+  `timeConfig.IsAnimated() = startFrame != endFrame`. The three
+  writers each carry a DIFFERENT gate convention plus a per-
+  writer static-attribute partition that is never time-coded
+  regardless of the gate (camera `projection`; light
+  `enableColorTemperature` / `normalize` / `shaping:ies:file`
+  [MAX-LIT-002 IES branch bound] / `colorTemperatureAttr`
+  [MAX-LIT-002 Kelvin branch bound]). The audit adds surgical-
+  bounds comment blocks at four sites
+  (`AnimExportTask::Execute` central + Transform / Camera / Light
+  back-pointers), a MaxScript regression
+  (`test_animation_time_sampled_export_audit_cross_writer` in
+  `export_animation_test.ms`, gated on Max 2025+), a Python
+  validator (`validate_animation_time_sampled_surgical.py`, 10
+  named cases + idempotence, all PASS on 2026-06-26 baseline
+  against pxr.Usd 0.25.5), and a Karma CPU visual auditor pair
+  whose three coordinated monotone observables (sphere image-y
+  centroid -28.59 px, body-pixel count ratio 1.403x, body channel
+  means +1.78 / +2.27 / +1.31) map 1:1 to the three writer
+  paths. No C++ logic change. Retires when a separate future
+  MAX-ANIM-* genuinely needs to unify the gates as dictated by a
+  captured Curves-mode corpus.
+

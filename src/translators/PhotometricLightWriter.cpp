@@ -417,6 +417,28 @@ bool MaxUsdPhotometricLightWriter::Write(
     }
 
 #ifdef USD_CURVES_SUPPORTED
+    // [MAX-ANIM-001] photometric light animation time-sampled export
+    // bound (lock-in only, no logic change). The `== TimeSamples` gate
+    // is STRICTLY equality -- UNLIKE CameraWriter's additive
+    // `!= Curves` gate, photometric lights ONLY time-sample on the
+    // TimeSamples animation type. On Curves mode the lights serialize
+    // as splines ONLY -- there is no time-sample fallback. A refactor
+    // that copy-pasted the CameraWriter gate (`!= Curves`) would
+    // silently DUAL-author time-samples AND splines on photometric
+    // lights, bloating every animated-light export with redundant
+    // attribute data. Static-only attrs on the photometric light --
+    // `enableColorTemperature`, `normalize`, `shaping:ies:file`
+    // (MAX-LIT-002 IES branch bound), `colorTemperatureAttr`
+    // (MAX-LIT-002 Kelvin branch bound) -- are authored at
+    // `UsdTimeCode::Default()` ONCE per write, OUTSIDE the
+    // `if (exportTimeSamples)` blocks below. See the central
+    // [MAX-ANIM-001] block in
+    // `src/MaxUsd/Translators/AnimExportTask.cpp::Execute` and the
+    // validator cases `Animated_Light_TimeSamples` /
+    // `Light_ColorTemperatureStatic_EvenInAnimatedStage` /
+    // `Light_IesFile_Static_EvenInAnimatedStage` /
+    // `CrossWriter_Divergence` in
+    // `validate_animation_time_sampled_surgical.py`.
     const auto animationType = GetExportArgs().GetAnimationType();
     const bool exportTimeSamples
         = animationType == MaxUsd::USDSceneBuilderOptions::AnimationType::TimeSamples;

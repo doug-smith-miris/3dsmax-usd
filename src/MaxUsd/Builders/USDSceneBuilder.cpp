@@ -1290,6 +1290,28 @@ MaxUsd::PrimDefVectorPtr USDSceneBuilder::ProcessNode(
 
                 } else {
 
+                    // [MAX-ANIM-001] transform animation time-sampled
+                    // export bound (lock-in only, no logic change). The
+                    // gate below FORCES TimeSamples on two non-Curves
+                    // paths: (a) `nodeTarget` (lookat) -- the lookat
+                    // depends on the target's worldspace transform at
+                    // sample time, which is not resolvable from a
+                    // serialized TsSpline alone, so the curves path
+                    // cannot represent it; (b) `!isValidController` --
+                    // List / PRS without keys / Expose / Linkage
+                    // controllers cannot serialize as curves either.
+                    // A refactor that simplified the gate to a plain
+                    // `animType == TimeSamples` would silently drop
+                    // BOTH of those cases onto the Curves path, where
+                    // they ship empty `xformOp:transform` attrs on the
+                    // affected prims (no curve to serialize). See the
+                    // central [MAX-ANIM-001] block in
+                    // `src/MaxUsd/Translators/AnimExportTask.cpp::Execute`
+                    // and the validator cases
+                    // `Animated_Xform_TimeSamples` /
+                    // `Static_Xform_NoTimeSamples` /
+                    // `CrossWriter_Divergence` in
+                    // `validate_animation_time_sampled_surgical.py`.
                     bool exportCurves = false;
                     bool exportTimeSamples = false;
 #if PXR_VERSION > 2505
