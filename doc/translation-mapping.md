@@ -117,6 +117,75 @@ every other attribute identical. Karma renders of the prefix and postfix
 USDs are byte-identical (same SHA-256), confirming the fix is a visual
 no-op for the common case — exactly what the BSDF math predicts.
 
+**Surgical-preservation validator (added 2026-06-26).**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/81aea885-6ee9-4828-b05f-d1b237263d10/validate_specular_rotation_surgical.py`
+extends the original validator with explicit **negative** cases —
+shaders that LOOK similar to the leak but must NOT be stripped because
+the rotation IS observable (anisotropy on) or the bridge value is not
+the leak. 8 cases enumerate every line of the C++ gate:
+
+| Material in synthetic fixture | spec_rotation   | spec_anisotropy | strip? | bound exercised |
+| --- | --- | --- | --- | --- |
+| `LeakDefault`         | `0.25`          | (absent)        | yes  | (the bug, must strip) |
+| `LeakWithZeroAniso`   | `0.25`          | `0.0`           | yes  | aniso present-and-zero, still leak |
+| `IntentionalRotation` | `0.5`           | `0.0`           | no   | rotation value != 0.25 |
+| `BrushedSteel`        | `0.25`          | `0.85`          | no   | aniso non-zero -- rotation OBSERVABLE (**KEY GAP**) |
+| `ConnectedRotation`   | `0.25` + conn   | `0.0`           | no   | rotation connected (procedural) |
+| `ConnectedAniso`      | `0.25`          | `0.0` + conn    | no   | aniso connected -- runtime unknown |
+| `AlmostLeak`          | `0.125`         | (absent)        | no   | rotation static != 0.25 |
+| `NonStandardSurface`  | `0.25`          | `0.0`           | no   | id != standard_surface |
+
+Plus an idempotence check (a second pass over the post-normalized
+fixture strips zero inputs). All 8 cases + idempotence pass on the
+2026-06-26 baseline, locking in the surgical bound. A future regression
+that widened the strip gate — most likely a refactor that weakened the
+`_anisotropy_provably_zero` check, since it is the only "is the
+rotation observable?" predicate — would fail by named case rather than
+just "some attribute disappeared somewhere."
+
+The previously-uncovered surgical bound is `BrushedSteel`: a shader
+where `specular_rotation = 0.25` byte-for-byte matches the leak, but
+`specular_anisotropy = 0.85` means the rotation IS observable in the
+BSDF (a 90-degree turn of the anisotropic streak). The original
+`a377982` commit message specifically promised this negative test
+("Synthetic negative test (BrushedSteel with `specular_anisotropy=0.4`)
+confirms the fix is surgical and preserves intentional rotation"), but
+that synthetic test only existed during the original fix's authoring
+— it was never landed in the MaxScript suite. This case now exists
+in both the Python validator and the new MaxScript regression.
+
+**MaxScript regression (added 2026-06-26).**
+`src/Tests/Integration/mtlxShaderWriter_test.ms` now carries
+`test_export_material_preserves_intentional_specular_rotation`. It
+loads
+`src/Tests/Integration/data/intentional_specular_rotation_test/intentional_specular_rotation.mtlx`
+(a synthetic `standard_surface` with `specular_rotation = 0.25`,
+`specular_anisotropy = 0.85`, `specular_roughness = 0.18` — a
+brushed-steel-like material) via `MaterialXMaterial.importMaterial`,
+exports through `USDExporter`, and asserts the standard_surface's
+`specular_rotation` (0.25) and `specular_anisotropy` (0.85) attributes
+are present, authored, and carry the fixture's authored values
+verbatim. A failure means either the normalizer over-strips
+(C++ regression — the anisotropy-zero check has been weakened) or
+the MaxScript bridge layer drops user-authored rotation on
+`MaterialXMaterial` round-trip (a separate, deeper bug the test
+surfaces either way).
+
+**Visual demonstration of the surgical bound.** A single-sphere
+fixture carrying the brushed-steel shader is rendered twice in Karma:
+`render_karma_postfix.png` (the current fix — rotation preserved;
+the anisotropic highlight reads as **radial streaks emanating from
+the highlight centre**, the characteristic 90-degree-rotated streak
+silhouette) and `render_unreal_reference.png` (the "still-broken"
+reference where rotation has been over-stripped — the same
+anisotropic highlight reads as a **compact star at the highlight
+centre**, the un-rotated streak orientation). The two PNGs differ by
+SHA-256 and visibly so. The auditor's checklist: **the current fix's
+render shows radial streaks; if it ever becomes a compact star, the
+normalizer has started over-stripping intentional rotation on
+anisotropic shaders.** Composite at `compare_side_by_side.png` in the
+same arch-build dir.
+
 **Retirement condition.** If/when Autodesk fixes `MtlxIOUtil` in a future
 3ds Max release so that the bridge stops emitting the spurious 0.25, the
 normalization pass becomes inert (no node matches the trigger condition).
@@ -1609,6 +1678,31 @@ bite.
 
 * 2026-06-20 — Initial doc. MAX-MAT-001 specular_rotation default
   normalization landed.
+* 2026-06-26 — MAX-MAT-001 surgical-preservation reinforcement: add an
+  8-case Python validator
+  (`validate_specular_rotation_surgical.py`) covering each surgical
+  bound the C++ gate enforces — the leak pattern (`rotation = 0.25`
+  with aniso absent or aniso == 0), and the negative cases that must
+  preserve the input (rotation value != 0.25; rotation connected;
+  anisotropy connected; anisotropy statically non-zero; non-
+  `standard_surface` shader) — plus idempotence; add a MaxScript
+  regression (`test_export_material_preserves_intentional_specular_rotation`)
+  that loads a synthetic `.mtlx` carrying brushed-steel
+  `specular_rotation = 0.25`, `specular_anisotropy = 0.85`,
+  `specular_roughness = 0.18` and asserts both values survive the
+  round-trip + normalizer untouched — closing the previously-
+  uncovered "BrushedSteel" surgical bound the original `a377982`
+  commit message promised but the test suite never actually
+  exercised; add a surgical-bounds comment block to
+  `MtlxShaderWriter.cpp::_NormalizeStandardSurfaceSpecularRotation`
+  enumerating each negative case the gate must reject and pointing
+  back to the named regression test + Python validator for each; add
+  a visual auditor pair (`render_karma_postfix.png` radial streaks =
+  preserved; `render_unreal_reference.png` compact star = over-
+  stripped) to make the surgical bound visible at the pixel level.
+  No C++ logic change in this bite — the reinforcement is purely
+  additive test infrastructure that locks in the surgical guarantee
+  against future regressions.
 * 2026-06-20 — MAX-MAT-002 emission/emission_color default-pair
   normalization landed (strip `emission = 1.0` paired with
   `emission_color = (0, 0, 0)`).

@@ -358,6 +358,34 @@ void _NormalizeStandardSurfaceSubsurfaceRadiusDefault(const MaterialX::DocumentP
 // USD matches the nodedef default for the common (anisotropy == 0) case.
 // Inputs that are connected, non-zero, or carry a non-0.25 authored value are
 // left untouched.
+//
+// Surgical bounds (negative cases, ALL must leave the input untouched --
+// enforced by the regression suite via
+// src/Tests/Integration/mtlxShaderWriter_test.ms ::
+//     test_export_material_preserves_intentional_specular_rotation
+// plus the doc-linked Python validator
+// validate_specular_rotation_surgical.py):
+//   * specular_anisotropy is statically non-zero -- anisotropy is on, so
+//     the rotation IS observable in the BSDF. This is the
+//     brushed-steel-with-rotation case: rotation = 0.25 byte-for-byte
+//     matches the leak, but stripping it would silently rewrite the
+//     artist's authored streak orientation. KEY GAP the original
+//     a377982 commit promised but did not land coverage for.
+//   * specular_anisotropy is connected -- runtime value unknown,
+//     conservatively assume the lobe may be active and keep the rotation.
+//   * specular_rotation is connected -- carries a procedural rotation
+//     that this static gate cannot reason about.
+//   * specular_rotation is statically not 0.25 -- artist authored an
+//     explicit non-leak rotation, even when anisotropy happens to be off
+//     in the current document.
+//   * The shader is not a standard_surface -- out of scope for this pass.
+//
+// A future refactor that widens any of these gates (most likely the
+// anisotropy-zero check, since it is the only "is the rotation
+// observable?" predicate) would silently start eating artist-authored
+// rotation on anisotropic shaders. Both the .ms surgical test and the
+// Python validator name the specific bound they exercise, so a
+// regression in any branch fails with a useful, localised error.
 void _NormalizeStandardSurfaceSpecularRotation(const MaterialX::DocumentPtr& doc)
 {
     if (!doc) {

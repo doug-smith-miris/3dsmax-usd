@@ -306,6 +306,93 @@ struct mtlx_shader_writer_test
         )
     ),
 
+    -- MAX-MAT-001 surgical-preservation regression: the post-parse
+    -- normalization that strips the buggy specular_rotation = 0.25
+    -- MUST NOT touch shaders where specular_anisotropy is non-zero.
+    -- The rotation has a real BSDF effect (a 90-degree turn of the
+    -- anisotropic streak) the moment anisotropy is on, so the
+    -- normalizer's gate explicitly preserves the input in that case
+    -- even when the rotation value coincides with the leak's 0.25.
+    --
+    -- This test loads a synthetic MaterialX fixture
+    -- (data/intentional_specular_rotation_test/intentional_specular_rotation.mtlx)
+    -- carrying specular_rotation = 0.25, specular_anisotropy = 0.85,
+    -- specular_roughness = 0.18 -- a brushed-steel-like configuration
+    -- where the rotation IS observable. The rotation value matches the
+    -- leak byte-for-byte, but the anisotropy gate fails (non-zero), so
+    -- the input must reach the exported USD untouched.
+    --
+    -- A failure here means either:
+    --   1. The normalizer's _anisotropy_provably_zero check was widened
+    --      or removed (a code bug that would silently eat intentional
+    --      rotation on anisotropic shaders), or
+    --   2. The MaxScript bridge layer drops user-authored rotation /
+    --      anisotropy on MaterialXMaterial round-trip (a separate,
+    --      deeper bug that this test surfaces).
+    -- Either way the test fails noisily and points at the regression.
+    --
+    -- The original MAX-MAT-001 commit message promised exactly this
+    -- negative test ("Synthetic negative test (BrushedSteel with
+    -- specular_anisotropy=0.4) confirms the fix is surgical and
+    -- preserves intentional rotation"), but the synthetic test only
+    -- existed during authoring and was never landed in the suite. This
+    -- reinforcement closes that gap.
+    function test_export_material_preserves_intentional_specular_rotation = (
+        maxver = maxVersion()
+        -- MaterialXMaterial.importMaterial is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereIntentRot"
+        local mtl1 = MaterialXMaterial()
+        mtl1.name = "matIntentionalSpecularRotation"
+        local scriptDir = getFilenamePath (getThisScriptFilename())
+        local mtlxDoc = (scriptDir + @"data\intentional_specular_rotation_test\intentional_specular_rotation.mtlx")
+        mtl1.importMaterial mtlxDoc
+        sphere001.material = mtl1
+        mtl1.explode()
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testIntentionalSpecularRotation.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/IntentionalSpecularRotation/IntentionalSpecularRotation")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- The intentional anisotropy (0.85) is the surgical bound the
+        -- normalizer must respect: a non-zero anisotropy means the
+        -- rotation IS observable. The input must reach the USD
+        -- present, authored, and at the fixture's authored value.
+        local anisoInput = surfaceShader.GetInput "specular_anisotropy"
+        assert_true (anisoInput != undefined)
+        local anisoAttr = anisoInput.GetAttr()
+        assert_true (anisoAttr.HasAuthoredValue())
+        assert_equal (anisoInput.Get()) 0.85
+
+        -- The intentional rotation (0.25) coincides byte-for-byte with
+        -- the leak value. Because anisotropy is non-zero the
+        -- normalizer's gate fails on the aniso branch and the rotation
+        -- is left alone. The input must reach the USD present,
+        -- authored, and equal to 0.25. If a future regression widened
+        -- the strip gate to ignore anisotropy this assertion would
+        -- fail with the rotation either absent or rewritten to 0.0
+        -- (the nodedef default).
+        local rotInput = surfaceShader.GetInput "specular_rotation"
+        assert_true (rotInput != undefined)
+        local rotAttr = rotInput.GetAttr()
+        assert_true (rotAttr.HasAuthoredValue())
+        assert_equal (rotInput.Get()) 0.25
+    ),
+
     -- MAX-MAT-002 regression: PhysicalMaterial export must not carry the
     -- spurious emission = 1.0 paired with emission_color = (0, 0, 0) that
     -- 3ds Max's MtlxIOUtil bridge writes on every standard_surface. The
@@ -777,6 +864,7 @@ struct mtlx_shader_writer_test
         test_export_OpenPBR_material,
         test_export_material_leading_digit_name,
         test_export_physical_material_strips_buggy_specular_rotation,
+        test_export_material_preserves_intentional_specular_rotation,
         test_export_physical_material_strips_buggy_emission_default,
         test_export_material_preserves_intentional_emission,
         test_export_physical_material_strips_buggy_coat_defaults,
