@@ -308,6 +308,62 @@ becomes neutral grey, the normalizer has started over-stripping
 intentional artist emission.** Composite at
 `compare_side_by_side.png` in the same arch-build dir.
 
+**Tolerance-band validator (second reinforcement, added 2026-06-26).**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/b2c78da8-302e-4f3e-b935-2aec013b022e/validate_emission_normalize_tolerance_bounds.py`
+extends the surgical-bounds coverage with the **numeric edges** of the
+strip gate that the first reinforcement's loud, high-magnitude cases
+do not pin. The first reinforcement uses `IntentionalScalar = 0.5`
+(far outside the ε band) and `IntentionalColor = (0.8, 0.4, 0.1)`
+(magnitude ~0.9): both would still be preserved by a refactor that
+widened the scalar tolerance to 0.01 or replaced the per-component
+color check with a vector-magnitude check. This second-layer validator
+adds 5 cases + idempotence pinned at the band edges:
+
+| Material in synthetic fixture | emission     | emission_color           | strip? | bound exercised |
+| --- | --- | --- | --- | --- |
+| `LeakPairExact`              | `1.0`        | `(0, 0, 0)`              | yes  | (the bug, must strip — repeated as the in-band baseline) |
+| `SubEpsilonScalar`           | `1.0 + 1e-7` | `(0, 0, 0)`              | yes  | scalar within ε — tolerance must absorb float noise |
+| `NearLeakScalar`             | `1.0 + 1e-3` | `(0, 0, 0)`              | no   | scalar just outside ε — refactor that widens to 1e-2 would over-strip |
+| `SubEpsilonColor`            | `1.0`        | `(1e-7, 1e-7, 1e-7)`     | yes  | all 3 channels within ε — tolerance must absorb float noise |
+| `SingleChannelDarkColor`     | `1.0`        | `(0.05, 0, 0)`           | no   | per-component edge — refactor to magnitude check would over-strip |
+| `ConnectedEmission`          | `1.0 (conn)` | `(0, 0, 0)`              | no   | symmetric companion to first-reinforcement's ConnectedColor |
+
+All 6 cases + idempotence pass on the 2026-06-26 baseline, locking in
+the gate's exact ε = 1e-6 scalar tolerance and per-component (not
+magnitude) color discrimination.
+
+**MaxScript regression (second reinforcement, added 2026-06-26).**
+`src/Tests/Integration/mtlxShaderWriter_test.ms` now also carries
+`test_export_material_preserves_single_channel_dark_emission`. It
+loads
+`src/Tests/Integration/data/single_channel_dark_emission_test/single_channel_dark_emission.mtlx`
+(a synthetic `standard_surface` with `emission = 1.0` matching the
+leak scalar EXACTLY and `emission_color = (0.05, 0, 0)` -- one channel
+barely above the per-component epsilon) via
+`MaterialXMaterial.importMaterial`, exports through `USDExporter`, and
+asserts both inputs survive verbatim. This is the in-3ds-Max
+counterpart for the `SingleChannelDarkColor` Python case -- the only
+one of the five new bounds that is both visually observable (faint
+dark-red glow) and cleanly expressible as a static `.mtlx` fixture.
+The existing `test_export_material_preserves_intentional_emission`
+remains the loud, high-magnitude companion that exercises the same
+gate at a wide margin.
+
+**Visual demonstration of the tolerance bound (second reinforcement).**
+A single-sphere fixture carrying the
+single-channel-dark-emission shader is rendered twice in Karma in
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/b2c78da8-302e-4f3e-b935-2aec013b022e/`:
+`render_karma_postfix.png` (the current fix preserves the pair — the
+sphere carries a faint warm/pink cast from the dark-red emission) and
+`render_unreal_reference.png` (the magnitude-refactor over-strip
+scenario — neutral grey, no warm cast). The two PNGs differ by SHA-256.
+The auditor's checklist: **the current fix's render has a visible warm
+(pinkish-red) wash across the lit hemisphere; if it ever becomes
+clean neutral grey, the per-component color check has been replaced
+with a magnitude check and dark-channel artist emission is being
+silently stripped.** Composite at `compare_side_by_side.png` in the
+same arch-build dir.
+
 **Retirement condition.** Same as MAX-MAT-001: when Autodesk fixes
 `MtlxIOUtil` to stop emitting the spurious emission pair, the pass
 becomes inert. Safe to keep as a guard for older 3ds Max installs.
@@ -1727,6 +1783,27 @@ bite.
   in this bite — the reinforcement is purely additive test
   infrastructure that locks in the surgical guarantee against future
   regressions.
+* 2026-06-26 — MAX-MAT-002 tolerance-band reinforcement (second layer):
+  add a 6-case Python validator
+  (`validate_emission_normalize_tolerance_bounds.py`) pinning the
+  **numeric edges** of the C++ strip gate that the first reinforcement
+  did not exercise — `SubEpsilonScalar` (must strip, within ε),
+  `NearLeakScalar` (must preserve, just outside ε) on the scalar side
+  and `SubEpsilonColor` (must strip), `SingleChannelDarkColor` (must
+  preserve, per-component vs magnitude) on the color side, plus a
+  `ConnectedEmission` case as the symmetric companion of the first
+  reinforcement's `ConnectedColor`; add a MaxScript regression
+  (`test_export_material_preserves_single_channel_dark_emission`) that
+  loads a synthetic `.mtlx` carrying `emission = 1.0,
+  emission_color = (0.05, 0, 0)` and asserts both inputs survive the
+  per-component color gate untouched; extend the C++ surgical-bounds
+  comment block to enumerate the new numeric bounds and point at both
+  validators by name; add a visual auditor pair
+  (`render_karma_postfix.png` warm pinkish wash = preserved;
+  `render_unreal_reference.png` neutral grey = magnitude-refactor
+  over-strip) showing the per-component edge case at the pixel level.
+  No C++ logic change in this bite — purely additive test
+  infrastructure stacked on top of the 2026-06-23 reinforcement.
 * 2026-06-20 — MAX-MAT-003 mesh displayColor leak fixed (derive
   `primvars:displayColor` from the bound material's `GetDiffuse()`
   instead of the node's viewport wireframe color, falling back to the

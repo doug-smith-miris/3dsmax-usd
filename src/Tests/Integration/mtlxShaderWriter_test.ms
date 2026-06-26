@@ -554,6 +554,105 @@ struct mtlx_shader_writer_test
         assert_equal got (pyGf.Vec3f 1.0 0.3 0.0)
     ),
 
+    -- MAX-MAT-002 surgical-preservation regression (tolerance-band edge,
+    -- second reinforcement): the post-parse normalizer's color gate is
+    -- per-component (max-abs), NOT magnitude. A future refactor that
+    -- swapped the C++ check
+    --
+    --   if (std::fabs(emissionColor[0]) > 1e-6f
+    --       || std::fabs(emissionColor[1]) > 1e-6f
+    --       || std::fabs(emissionColor[2]) > 1e-6f) { continue; }
+    --
+    -- for a magnitude check (||c|| < eps) would still correctly preserve
+    -- the existing IntentionalEmission fixture's (1.0, 0.3, 0.0) -- its
+    -- magnitude is ~0.95 -- but would silently strip a dark-red glow
+    -- like (0.05, 0, 0): the magnitude is 0.05, far below any reasonable
+    -- magnitude threshold.
+    --
+    -- This test loads a synthetic MaterialX fixture
+    -- (data/single_channel_dark_emission_test/
+    --   single_channel_dark_emission.mtlx) carrying
+    -- emission = 1.0 (matches the leak scalar EXACTLY) and
+    -- emission_color = (0.05, 0, 0) (one channel just barely above the
+    -- per-component epsilon). The surgical bound: the C++ gate must
+    -- reject this pair on the per-component check of channel 0,
+    -- preserving both inputs verbatim.
+    --
+    -- The Python validator at
+    -- /Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+    -- b2c78da8-302e-4f3e-b935-2aec013b022e/
+    -- validate_emission_normalize_tolerance_bounds.py exercises the
+    -- same bound at the USD layer alongside 4 other tolerance-band
+    -- cases (SubEpsilonScalar, NearLeakScalar, SubEpsilonColor,
+    -- ConnectedEmission). This .ms test is the in-3ds-Max counterpart
+    -- for the SingleChannelDarkColor case -- the only one of the five
+    -- that is both visually observable (faint dark-red glow) and
+    -- cleanly expressible as a static .mtlx fixture.
+    --
+    -- A failure here means the per-component color gate has been
+    -- replaced with a magnitude check (or some other widening that no
+    -- longer treats a single small-but-nonzero channel as artist
+    -- authoring intent).
+    function test_export_material_preserves_single_channel_dark_emission = (
+        maxver = maxVersion()
+        -- MaterialXMaterial.importMaterial is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereDarkChan"
+        local mtl1 = MaterialXMaterial()
+        mtl1.name = "matSingleChannelDarkEmission"
+        local scriptDir = getFilenamePath (getThisScriptFilename())
+        local mtlxDoc = (scriptDir + @"data\single_channel_dark_emission_test\single_channel_dark_emission.mtlx")
+        mtl1.importMaterial mtlxDoc
+        sphere001.material = mtl1
+        mtl1.explode()
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testSingleChannelDarkEmission.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/SingleChannelDarkEmission/SingleChannelDarkEmission")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- The emission scalar (1.0) COINCIDES byte-for-byte with the
+        -- leak value. The pair is preserved only because the color
+        -- gate fails on the next check. If the gate ever widened to
+        -- magnitude (||c|| < eps) this would be the case that flips:
+        -- the scalar would still match and the magnitude 0.05 would
+        -- pass under any sensible magnitude threshold, so the strip
+        -- would fire and the emission would disappear from the
+        -- exported USD. Failure surfaces here as either "absent" or
+        -- "Get() returns 0".
+        local emInput = surfaceShader.GetInput "emission"
+        assert_true (emInput != undefined)
+        local emAttr = emInput.GetAttr()
+        assert_true (emAttr.HasAuthoredValue())
+        assert_equal (emInput.Get()) 1.0
+
+        -- The single non-zero channel (red = 0.05) is the per-component
+        -- bound the gate enforces. Channels 1 and 2 are exactly 0.0,
+        -- which alone would match the gate; the red channel's 0.05
+        -- value -- 50000x the C++ epsilon -- is what fails the gate
+        -- and preserves the pair. Assert the exact authored value
+        -- survives.
+        local emColorInput = surfaceShader.GetInput "emission_color"
+        assert_true (emColorInput != undefined)
+        local emColorAttr = emColorInput.GetAttr()
+        assert_true (emColorAttr.HasAuthoredValue())
+        local got = emColorInput.Get()
+        assert_equal got (pyGf.Vec3f 0.05 0.0 0.0)
+    ),
+
     -- MAX-MAT-004 regression: PhysicalMaterial export must not carry the
     -- spurious coat-block preset that 3ds Max's MtlxIOUtil bridge writes on
     -- every standard_surface, gated by coat = 0.0. The post-parse
@@ -867,6 +966,7 @@ struct mtlx_shader_writer_test
         test_export_material_preserves_intentional_specular_rotation,
         test_export_physical_material_strips_buggy_emission_default,
         test_export_material_preserves_intentional_emission,
+        test_export_material_preserves_single_channel_dark_emission,
         test_export_physical_material_strips_buggy_coat_defaults,
         test_export_physical_material_strips_buggy_subsurface_radius,
         test_export_physical_material_strips_spec_default_inputs,

@@ -155,8 +155,12 @@ bool _TryGetStaticColor3(
 // enforced by the regression suite via
 // src/Tests/Integration/mtlxShaderWriter_test.ms ::
 //     test_export_material_preserves_intentional_emission
-// plus the doc-linked Python validator
-// validate_emission_normalize_surgical.py):
+//     test_export_material_preserves_single_channel_dark_emission
+// plus the doc-linked Python validators
+// validate_emission_normalize_surgical.py (state-shape bounds) and
+// validate_emission_normalize_tolerance_bounds.py (numeric-band bounds)):
+//
+//   State-shape bounds (first reinforcement, caf9633):
 //   * emission is statically not 1.0 -- artist-authored scalar.
 //   * emission_color is statically not (0, 0, 0) -- artist-authored colour.
 //   * Either input is connected (carries a procedural value).
@@ -164,10 +168,26 @@ bool _TryGetStaticColor3(
 //     half on its own.
 //   * The shader is not a standard_surface (id != ND_standard_surface_*).
 //
+//   Numeric-band bounds (second reinforcement, this commit):
+//   * emission outside [1.0 - 1e-6, 1.0 + 1e-6] -- the tolerance is
+//     per-spec (`std::fabs(emissionValue - 1.0f) > 1e-6f`) and must not
+//     be widened "to be more forgiving with float noise". Cases at
+//     1.0 + 1e-3 (must preserve) and 1.0 + 1e-7 (must strip) pin both
+//     sides of the band.
+//   * emission_color check is per-component (max-abs), NOT magnitude --
+//     a single non-zero channel like (0.05, 0, 0) is artist intent for
+//     a dark-channel glow even though ||c|| is tiny. A magnitude-based
+//     refactor would silently over-strip these. Cases at (1e-7,)*3
+//     (must strip) and (0.05, 0, 0) (must preserve) pin both behaviours.
+//   * The connection check on emission (the FIRST input read) is the
+//     symmetric companion of the ConnectedColor case the first
+//     reinforcement already covers -- both halves of the static-input
+//     requirement are exercised.
+//
 // A future refactor that widens any of these gates would silently start
-// eating artist-authored emission. Both the .ms surgical test and the
-// Python validator name the specific bound they exercise, so a regression
-// in any branch fails with a useful, localised error.
+// eating artist-authored emission. Both the .ms surgical tests and the
+// two Python validators name the specific bound they exercise, so a
+// regression in any branch fails with a useful, localised error.
 void _NormalizeStandardSurfaceEmissionDefault(const MaterialX::DocumentPtr& doc)
 {
     if (!doc) {
