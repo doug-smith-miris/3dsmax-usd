@@ -1070,15 +1070,72 @@ void MeshConverter::EnsureFallbackStPrimvar(
     // UVW Map modifier in the scene. The warning emitted below tells them
     // exactly that.
     //
-    // Bounds (where the fallback conservatively does nothing):
-    //  - Channel 1's configured primvar name is empty -> user opted out of
-    //    channel-1 export, do not fight them.
-    //  - The mesh already has a primvar with that name -> `ApplyMaxMapChannels`
-    //    wrote real UV data, leave it alone.
-    //  - VertexCount() or FaceCount() is 0 -> nothing to project.
-    //  - Degenerate bounding box on both X and Y -> still emit `(0, 0)` for
-    //    every vertex so the renderer has a sampleable stream, but the UVs
-    //    are uninformative; the warning is still emitted.
+    // Surgical bounds (where the fallback conservatively does nothing OR
+    // pins the WriteBranch primvar shape). Each bound has a named
+    // negative-control case in the Python validator
+    //
+    //     /Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+    //         87f4d171-9547-432c-a7b1-df270f9aafd4/
+    //         validate_fallback_st_primvar_surgical.py
+    //
+    // and the most-common preserve-branch case has a MaxScript regression
+    //
+    //     test_fallback_st_primvar_preserves_authored_face_varying_uvs
+    //
+    // in src/Tests/Integration/export_geometry_test.ms. Together they
+    // pin the surgical contract this helper currently honours; a future
+    // refactor that widens any gate fails by named case.
+    //
+    //   * EmptyConfig (opt-out): channel 1's configured primvar name is
+    //     empty -> artist explicitly opted out of channel-1 export via
+    //     `SetChannelPrimvarConfig(1, Config(""))`; the helper returns
+    //     first with no primvar authored. Validator case
+    //     OptOutBranch_EmptyConfigName.
+    //   * PreserveBranch (opt-out): the mesh already has a primvar with
+    //     the configured name -> `ApplyMaxMapChannels` (or a prior pass)
+    //     wrote real artist UV data; the helper leaves it untouched and
+    //     returns. THIS IS THE HIGHEST-VALUE BOUND: a widening that
+    //     dropped the `HasPrimvar` check would overwrite real
+    //     artist-authored UVs with the bbox planar projection on every
+    //     export, silently warping textures across every parametric
+    //     primitive with `mapCoords=true` (Plane and any explicit-UV
+    //     mesh). Validator cases PreserveBranch_PlaneFaceVaryingAuthored
+    //     (faceVarying interpolation, the shape ApplyMaxMapChannels
+    //     writes for a real Max Plane) and PreserveBranch_SphereVertex-
+    //     Authored (vertex interpolation, the shape on a Sphere with
+    //     mapCoords=true) -- the two together pin that the helper
+    //     doesn't homogenise interpolation tokens on the preserved
+    //     primvar, and the MaxScript regression confirms the same bound
+    //     end-to-end on a real Max Plane export.
+    //   * DegenerateMesh (opt-out): VertexCount() or FaceCount() is 0
+    //     -> nothing to project, helper returns. A widening that dropped
+    //     this gate would attempt the bbox math on an empty `points`
+    //     array (potential crash) or author a zero-length primvar.
+    //     Validator cases OptOutBranch_ZeroVertices and OptOutBranch_
+    //     ZeroFaces (the OR-branch is exercised by both halves so a
+    //     refactor that flipped OR to AND surfaces by named case).
+    //   * DegenerateBbox (WriteBranch with divisor fallback): both X and
+    //     Y bbox extents are zero -> helper still emits one (0, 0) per
+    //     vertex (a sampleable but uninformative stream) and surfaces
+    //     the warning. A widening that skipped this case altogether
+    //     would leave the primvar unauthored on degenerate meshes (no
+    //     sampleable UVs at all). Validator case
+    //     WriteBranch_DegenerateBboxAllAxes.
+    //   * WriteBranch shape invariants (when the fallback fires): the
+    //     resulting primvar MUST satisfy ALL of (a) component type is
+    //     TexCoord2fArray (NOT Vec2fArray / Float2Array), (b)
+    //     interpolation is `vertex` (NOT faceVarying / constant /
+    //     uniform), (c) array length equals VertexCount(), (d) every
+    //     component is in [0, 1] (assuming non-degenerate bbox). A
+    //     refactor that changed any of these would route data through
+    //     a different USD typesystem branch downstream. Validator case
+    //     WriteBranch_BoxNoMapCoords pins the canonical (8, "vertex",
+    //     "TexCoord2fArray") shape on the simplest writable mesh; case
+    //     OptOutBranch_EmptyNameTakesPrecedenceOverPreserve pins the
+    //     gate ORDER (EmptyConfig fires before PreserveBranch even when
+    //     both would trigger -- a refactor that flipped the ordering
+    //     still returns "no fallback emitted" but via the WRONG branch,
+    //     caught by the branch-label assertion).
 
     const auto& channel1Config = options.GetChannelPrimvarConfig(1);
     const pxr::TfToken& stTokenName = channel1Config.GetPrimvarName();

@@ -1871,7 +1871,120 @@ source mesh (no UV channel in → no UV primvar out); for now the
 fallback is unconditional whenever channel 1 is configured to write,
 which is the catalog's "best practice" default.
 
-### Per-face matIds on a non-MultiMtl mesh → drop GeomSubsets, keep first matId as customData (MAX-GEO-002)
+**Surgical-preservation validator (added 2026-06-26).** The original
+fix landed with two happy-path tests
+(`fallback_uvs.py` post-processor in the PR's arch-build and the
+`Teapot/Sphere/Box/Cylinder/Torus` corpus check): both exercise the
+WriteBranch only — they confirm that `primvars:st` IS authored on a
+parametric primitive whose `mapCoords` is off. Neither exercises any
+of the four OPT-OUT bounds the helper carries (EmptyConfig /
+PreserveBranch / DegenerateMesh / DegenerateBbox), and neither pins
+the WriteBranch primvar-shape invariants (component type,
+interpolation token, array length, UV value range). A widening that:
+
+* dropped the `HasPrimvar(stTokenName)` gate would silently OVERWRITE
+  every artist-authored UV mapping with the bbox planar projection on
+  every export (the worst-class regression — any Plane with
+  `mapCoords=true`, any UVW Map modifier, any explicit channel-1
+  authoring loses its mapping);
+* dropped the `stTokenName.IsEmpty()` gate would emit `st` even when
+  the artist explicitly opted out via
+  `SetChannelPrimvarConfig(1, Config(""))`;
+* changed the WriteBranch's interpolation token from `vertex` to
+  `faceVarying` would inflate layer size by the face-vertex-count
+  factor (Box: 8 → 24, Sphere: 1106 → 2208+) AND change Hydra-delegate
+  texture-sampling behaviour;
+* changed the value type from `TexCoord2fArray` to `Vec2fArray` /
+  `Float2Array` would break the USD typesystem's UV-coord role
+  contract that `UsdUVTexture::inputs:st` and MaterialX
+  `image::texcoord` follow;
+
+— would all pass the original happy-path coverage. This reinforcement
+pins every surgical bound the helper currently honours so any of the
+above widenings fails by named case.
+
+Validator
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/87f4d171-9547-432c-a7b1-df270f9aafd4/validate_fallback_st_primvar_surgical.py`
+mirrors the C++ branch decision at the USD layer with 8 named cases +
+idempotence:
+
+| Case | Branch | Inputs (preauthored / channel name / mesh shape) | Expected (shape, branch) |
+| ---- | ------ | ------------------------------------------------ | ------------------------ |
+| `WriteBranch_BoxNoMapCoords` | write-fallback | no st, "st", 8-vertex / 6-quad box, bbox X∈[0,10] Y∈[0,10] | `(8, "vertex", "TexCoord2fArray")`, write-fallback |
+| `WriteBranch_DegenerateBboxAllAxes` | write-fallback | no st, "st", 4 collinear vertices (Z varies, X/Y fixed) | `(4, "vertex", "TexCoord2fArray")` all values `(0, 0)`, write-fallback (DegenerateBbox divisor-fallback path) |
+| `PreserveBranch_PlaneFaceVaryingAuthored` | preauthored-preserved | st = 4 entries faceVarying TexCoord2fArray, "st", 4-vertex Plane | `(4, "faceVarying", "TexCoord2fArray")` artist values survive byte-for-byte |
+| `PreserveBranch_SphereVertexAuthored` | preauthored-preserved | st = 6 entries vertex TexCoord2fArray (lat-lon), "st", 6-vertex Sphere | `(6, "vertex", "TexCoord2fArray")` artist values survive byte-for-byte (interpolation contrast with case 3 pins no homogenisation) |
+| `OptOutBranch_EmptyConfigName` | opt-out-empty-name | no st, channel-1 name = "", 8-vertex Box | no primvar emitted; gate returns first |
+| `OptOutBranch_ZeroVertices` | opt-out-degenerate | no st, "st", zero vertices | no primvar emitted; `VertexCount() == 0` early return |
+| `OptOutBranch_ZeroFaces` | opt-out-degenerate | no st, "st", 8 vertices but zero faces | no primvar emitted; `FaceCount() == 0` early return (OR branch other half) |
+| `OptOutBranch_EmptyNameTakesPrecedenceOverPreserve` | opt-out-empty-name | preauthored faceVarying st AND channel-1 name = "" | branch IS opt-out-empty-name, NOT preauthored-preserved (gate order: EmptyConfig fires before PreserveBranch even when both would trigger; a gate-order flip surfaces by branch-label mismatch) |
+
+All 8 cases + idempotence pass on the 2026-06-26 baseline against
+`pxr.UsdGeom 0.25.5`. The validator asserts the BRANCH label, the
+primvar SHAPE (length, interpolation, type), AND the UV-value range
+[0, 1] on write-fallback branches — so a regression that produces the
+right shape via the wrong branch (or the right branch via the wrong
+shape) still surfaces by name.
+
+MaxScript regression
+`test_fallback_st_primvar_preserves_authored_face_varying_uvs` in
+`src/Tests/Integration/export_geometry_test.ms` pins the highest-value
+preserve-branch case at the export level: a Plane primitive
+constructed with `mapCoords:true` (the default for a Plane), so
+`ApplyMaxMapChannels` writes channel 1 as faceVarying `primvars:st`
+with 4 corner entries. The fallback helper sees `HasPrimvar("st") ==
+true` and returns early; the artist's mapping survives. Asserts the
+exported primvar (a) IS authored (helper didn't drop it on a
+preserve-branch case), (b) length == 4 (the faceVarying-corner count
+for a 1-quad Plane), (c) interpolation == "faceVarying" (NOT "vertex"
+— the WriteBranch would emit "vertex" on a re-authoring widening),
+and (d) value type alias == `"texCoord2f[]"` (the TexCoord2fArray
+contract that `UsdUVTexture::inputs:st` follows). A regression that
+dropped the HasPrimvar gate would change the interpolation from
+faceVarying to vertex on the Plane fixture even though the length
+coincides (4 = 4), surfacing by named case.
+
+C++ surgical-bounds comment block in
+`MeshConverter::EnsureFallbackStPrimvar` (`src/MaxUsd/MeshConversion/
+MeshConverter.cpp:1073-1131`) extends the original 4-bound
+enumeration with named back-pointers to the validator case and the
+MaxScript regression, plus the WriteBranch shape invariants (type,
+interpolation, length, UV range).
+
+Visual auditor pair (`render_karma_postfix.png` + `render_unreal_
+reference.png` + `compare_side_by_side.png` in the run's arch-build
+directory): Storm renders of a sphere mesh whose `primvars:st`
+encodes the texture coordinates as displayColor `(u, v, 0.30)` for
+direct visualisation without a UsdPreviewSurface/UsdUVTexture chain.
+Postfix carries the proper spherical lat-lon mapping (the artist's
+authored UVs — preserve-branch fired); the sphere reads as a
+continuous lat-lon wrap (greens at the south pole, magenta across the
+equator, blue wrap on the edges; foreground mean R=171.60 / G=202.35
+/ B=189.09 over 255). Reference carries the same `primvars:st` but
+OVERWRITTEN by the bbox planar projection (the WriteBranch output
+the helper would write if the HasPrimvar gate ever dropped); the
+sphere reads as a top-down disc projection (bright yellow center,
+green edges, brighter overall; foreground mean R=220.64 / G=244.24 /
+B=189.09 over 255). Postfix is darker by **49.04 / 255** on the RED
+channel AND **41.90 / 255** on the GREEN channel; the BLUE channel is
+**byte-identical** between the two renders because both share the
+constant blue=0.30 displayColor contribution plus identical
+lighting/geometry — a strong sanity-check that the lighting/camera
+invariant has not drifted between the two stages. 460,765 nonzero
+foreground pixels (alpha-masked); SHA-256 distinct (`50d12aef...` vs
+`1fc6451f...`).
+
+Auditor's checklist: postfix sphere reads as a vertical lat-lon wrap
+(distinct horizontal bands of color top to bottom, edge-to-center
+sweep) AND reference reads as a top-down disc projection (radial
+yellow-center pattern, brighter overall) AND postfix mean RED is
+~49/255 darker than reference AND postfix mean GREEN is ~42/255
+darker AND postfix mean BLUE equals reference byte-for-byte AND the
+PNG hashes differ. A refactor that ever made the postfix and
+reference renders byte-identical (e.g. both reading as the top-down
+disc pattern) would mean the C++ helper has started overwriting
+artist-authored UVs and the surgical preserve-branch bound has
+broken.
 
 **Symptom.** `MaxUsd::MeshConverter::ApplyMaxMaterialIDs()` creates a
 `GeomSubset` per distinct face mat-ID in the `materialBind` family
@@ -3575,3 +3688,72 @@ artist-visible primvar-fallback output on every MultiMtl-bound export.
   -- purely additive observability + test + doc infrastructure
   that locks in the surgical contract before any "extend to
   per-face" refactor lands.
+* 2026-06-26 — MAX-GEO-004 fallback-st-primvar surgical-preservation
+  reinforcement: lock in the four surgical bounds of
+  `MeshConverter::EnsureFallbackStPrimvar` (EmptyConfig /
+  PreserveBranch / DegenerateMesh / DegenerateBbox) plus the
+  WriteBranch primvar-shape invariants (type, interpolation, length,
+  UV range) with named negative-control coverage. The original PR #3
+  shipped with happy-path tests only — every existing test exercises
+  the WriteBranch (parametric primitives with `mapCoords` off get
+  `primvars:st` authored), but no test exercises any of the four
+  opt-out bounds AND no test pins the WriteBranch primvar shape.
+  A widening that dropped the `HasPrimvar(stTokenName)` gate would
+  silently OVERWRITE every artist-authored UV mapping with the bbox
+  planar projection on every export — the worst-class regression.
+  Validator
+  `validate_fallback_st_primvar_surgical.py` mirrors the C++ branch
+  decision at the USD layer with 8 named cases + idempotence
+  (`WriteBranch_BoxNoMapCoords`,
+  `WriteBranch_DegenerateBboxAllAxes`,
+  `PreserveBranch_PlaneFaceVaryingAuthored`,
+  `PreserveBranch_SphereVertexAuthored`,
+  `OptOutBranch_EmptyConfigName`,
+  `OptOutBranch_ZeroVertices`,
+  `OptOutBranch_ZeroFaces`,
+  `OptOutBranch_EmptyNameTakesPrecedenceOverPreserve`). Asserts the
+  BRANCH label, the primvar SHAPE (length / interpolation / type),
+  and the UV-value range [0, 1] on write-fallback branches — so a
+  regression that produces the right shape via the wrong branch (or
+  vice versa) surfaces by name. MaxScript regression
+  `test_fallback_st_primvar_preserves_authored_face_varying_uvs`
+  added to `src/Tests/Integration/export_geometry_test.ms` exercises
+  the highest-value preserve-branch case on a real Max Plane
+  export: a Plane with `mapCoords:true` carries faceVarying
+  `primvars:st` after `ApplyMaxMapChannels` runs; the fallback
+  helper's `HasPrimvar` gate must keep its hands off. Asserts the
+  primvar is authored AND length == 4 AND interpolation ==
+  `"faceVarying"` (NOT `"vertex"` — the WriteBranch would emit
+  `vertex` on a re-authoring widening) AND value type alias ==
+  `"texCoord2f[]"`. C++ surgical-bounds comment block in
+  `EnsureFallbackStPrimvar` extends the original 4-bound enumeration
+  with named back-pointers to the validator case and MaxScript
+  regression for each bound, plus the WriteBranch shape invariants.
+  Visual auditor pair (`render_karma_postfix.png` Storm render of a
+  sphere with the proper spherical lat-lon UV mapping authored —
+  preserve-branch fired, artist UVs survive; sphere reads as a
+  continuous lat-lon wrap with vertical color sweep, foreground
+  mean R=171.60 / G=202.35 / B=189.09 over 255;
+  `render_unreal_reference.png` Storm render of the same sphere
+  with the same `primvars:st` OVERWRITTEN by the bbox planar
+  projection — the WriteBranch output the helper would write if
+  the `HasPrimvar` gate dropped; sphere reads as a top-down disc
+  projection with radial yellow-center pattern, brighter overall,
+  foreground mean R=220.64 / G=244.24 / B=189.09 over 255) makes
+  the preserve-branch bound visible at the pixel level. Postfix is
+  darker by ~49 / 255 on RED and ~42 / 255 on GREEN; BLUE is
+  byte-identical between the two (constant 0.30 displayColor
+  channel + identical lighting/geometry — strong sanity-check that
+  the lighting/camera invariant hasn't drifted). 460,765
+  alpha-masked sphere pixels; SHA-256 distinct (`50d12aef...` vs
+  `1fc6451f...`). `compare_side_by_side.png` is the auditor's
+  at-a-glance composite. Auditor's checklist: postfix sphere reads
+  as a vertical lat-lon wrap, reference reads as a top-down disc,
+  postfix mean R is ~49/255 darker, postfix mean G is ~42/255
+  darker, postfix mean B equals reference byte-for-byte, PNG hashes
+  differ — a refactor that ever made postfix indistinguishable
+  from reference would mean the C++ helper has started overwriting
+  artist-authored UVs and the surgical preserve-branch bound has
+  broken. No C++ logic change in this bite — purely additive
+  observability + test + doc infrastructure that locks in the
+  surgical contract.
