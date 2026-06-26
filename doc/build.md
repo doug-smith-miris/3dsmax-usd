@@ -1,5 +1,10 @@
 # Building
 
+> **Provisioning a new Windows + Visual Studio + 3ds Max SDK build host?**
+> See [`windows-build-host-runbook.md`](windows-build-host-runbook.md) for
+> the step-by-step host stand-up procedure that turns the matrices below
+> into an actionable provisioning sequence (MAX-OPS-002).
+
 ## Getting and Building the Code
 ### Download the source code
 
