@@ -112,11 +112,104 @@ struct export_geometry_test
         )
     ),
 
+    -- MAX-GEO-004 SURGICAL-PRESERVATION REINFORCEMENT: when the mesh
+    -- ALREADY has `primvars:st` (the artist authored real UVs via
+    -- `Generate Mapping Coords.` on the source primitive or a UVW Map
+    -- modifier), the fallback helper `EnsureFallbackStPrimvar` MUST NOT
+    -- touch the existing primvar. A widening that dropped the
+    -- `HasPrimvar(stTokenName)` gate would overwrite the artist's UV
+    -- mapping with the bbox planar projection -- silently warping any
+    -- texture-bearing material bound to the mesh on every export.
+    --
+    -- The Python validator
+    -- `validate_fallback_st_primvar_surgical.py` exercises 8 cases
+    -- across all four surgical bounds (EmptyConfig / PreserveBranch /
+    -- DegenerateMesh / DegenerateBbox) + the WriteBranch shape
+    -- invariants + idempotence; this MaxScript test pins the MOST
+    -- COMMON preserve-branch case (a Plane primitive, whose
+    -- `mapCoords` defaults to true, so `ApplyMaxMapChannels` writes a
+    -- faceVarying `primvars:st` that the fallback helper sees and
+    -- skips) at the export level so a regression that escapes the
+    -- Python mirror still fails inside Max.
+    --
+    -- The bound this test pins, in full:
+    --   * The exported mesh has `primvars:st` (helper did NOT skip
+    --     authoring entirely on a preserve-branch case).
+    --   * The primvar's component type is `TexCoord2fArray` (matches
+    --     the WriteBranch type AND the type ApplyMaxMapChannels
+    --     writes -- a widening that homogenised to Float2Array on
+    --     either path would surface here).
+    --   * The primvar's interpolation is `faceVarying` (the shape
+    --     `ApplyMaxMapChannels` writes for channel 1 on a Plane) --
+    --     NOT `vertex` (what the fallback's WriteBranch would write).
+    --     A widening that dropped the preserve gate and re-emitted
+    --     would change interpolation to `vertex` AND change the array
+    --     length from `numfaces * 4 = 4` to `numpoints = 4`. Length
+    --     coincides for a single-quad Plane but interpolation does
+    --     not -- this is the SHAPE assertion the bound rides on.
+    --   * The primvar's array length matches the source channel's
+    --     entry count (4 corners for a 1-quad Plane), which is the
+    --     `faceVarying` length, NOT necessarily the vertex count.
+    function test_fallback_st_primvar_preserves_authored_face_varying_uvs = (
+        testFilePath = output_prefix + "test_fallback_st_primvar_preserves_authored_face_varying_uvs.usd"
+        -- Plane primitive: `mapCoords` defaults to TRUE on a Plane
+        -- (one of the few parametric primitives where this is the
+        -- default), so `ApplyMaxMapChannels` writes channel 1 as
+        -- `primvars:st` with faceVarying interpolation. The
+        -- fallback helper sees HasPrimvar("st") == true and returns
+        -- early -- preserving the artist UVs verbatim.
+        local p = plane name:"planeWithMapCoords" length:5 width:5 \
+            lengthsegs:1 widthsegs:1 mapCoords:true
+        convertToPoly p
+
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = stage.GetPrimAtPath("/" + p.name)
+        assert_true (pyUsd.Prim.IsValid(prim)) message:"The Plane was not properly exported."
+        assert_true (prim.IsA(pyUsdGeom.Mesh)) message:"The Plane should have been exported as a UsdGeomMesh."
+
+        -- Helper to read the st primvar's shape from the exported file.
+        local primvarsAPI = pyUsdGeom.PrimvarsAPI(prim)
+        local stPrimvar = primvarsAPI.GetPrimvar("st")
+        assert_true (stPrimvar.IsDefined()) \
+            message:"Preserve-branch surgical bound: the Plane's primvars:st was DROPPED on export. A regression in EnsureFallbackStPrimvar's HasPrimvar gate or in ApplyMaxMapChannels' channel-1 authoring path is responsible. See MAX-GEO-004 in doc/translation-mapping.md."
+        -- Length invariant: faceVarying st on a 1-quad Plane has 4
+        -- entries (one per face-vertex corner). A regression that
+        -- re-emitted via the fallback would either match this length
+        -- (vertex on a 4-vertex Plane is also 4) OR change it
+        -- (vertex on a 9-vertex Plane is 9, faceVarying is 16) --
+        -- the length alone is not a sufficient discriminator for a
+        -- 1-quad Plane, but interpolation is.
+        local stValues = stPrimvar.Get()
+        assert_equal 4 stValues.count \
+            message:"Preserve-branch surgical bound: the Plane's primvars:st has unexpected length. Expected the original faceVarying-corner count (4), got the current count. A regression that re-emitted under WriteBranch (vertex interpolation, length = vertex count) on a Plane with > 1 segment would surface here too."
+        -- Interpolation invariant: `faceVarying`, NOT `vertex`. THIS
+        -- IS THE PRIMARY SURGICAL ASSERTION -- a widening that
+        -- dropped the HasPrimvar gate and re-emitted via the
+        -- WriteBranch would write interpolation=`vertex`, which a
+        -- 1-quad Plane's 4 face-vertex-corners coincidentally
+        -- matches by COUNT (4) but not by INTERPOLATION TOKEN.
+        local interpolation = stPrimvar.GetInterpolation()
+        assert_equal "faceVarying" interpolation \
+            message:"Preserve-branch surgical bound: the Plane's primvars:st interpolation is the wrong token. Expected \"faceVarying\" (what ApplyMaxMapChannels writes); a regression that dropped the EnsureFallbackStPrimvar HasPrimvar gate and re-emitted under WriteBranch would change it to \"vertex\"."
+        -- Type invariant: `TexCoord2fArray`, NOT `Vec2fArray` /
+        -- `Float2Array`. The MaterialX role on the TexCoord2f type
+        -- is what UsdUVTexture's `inputs:st` expects; a regression
+        -- that changed the type on either the preserve or write
+        -- branches would break the typesystem contract.
+        -- (Uses the same `GetTypeName() as string` pattern as
+        -- existing map_channel_export_test.ms assertions.)
+        assert_equal "texCoord2f[]" (stPrimvar.GetTypeName() as string) \
+            message:"Preserve-branch surgical bound: the Plane's primvars:st value type is the wrong type. Expected \"texCoord2f[]\" (the TexCoord2fArray alias); a regression that downgraded the type to Vec2fArray / Float2Array on either branch would surface here."
+    ),
+
     function teardown = (
     ),
 
     Tests = #(export_triobj_with_bad_edgevis_test,
-        export_all_geometric_types_test)
+        export_all_geometric_types_test,
+        test_fallback_st_primvar_preserves_authored_face_varying_uvs)
 )
 
 runUsdTestFixture export_geometry_test (getThisScriptFilename())

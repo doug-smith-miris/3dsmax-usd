@@ -54,19 +54,30 @@ std::string CreateSubsetName(Mtl* mtl, MtlID materialIndex)
     Mtl*      resolvedMtl = mtl ? mtl->ResolveWrapperMaterials(true) : nullptr;
     MultiMtl* multiMtl = dynamic_cast<MultiMtl*>(resolvedMtl);
     if (resolvedMtl == nullptr || multiMtl == nullptr) {
-        // _{materialIndex}_ if the mtl is null or not a multiMtl
-        name.append("_").append(std::to_string(maxScriptId)).append("_");
+        // MAX-GEO-003: the legacy pattern wrapped the integer matId in
+        // underscores (e.g. `_1_`, `_2_`), which is ugly, hard to grep, and
+        // diverges from the convention used elsewhere in the USD ecosystem.
+        // Use the `mat_{maxScriptId}` form (e.g. `mat_1`, `mat_2`) -- still a
+        // legal USD identifier (a leading letter, not a leading digit), but
+        // readable as "material slot N" and consistent with the naming used
+        // for the multi-material-with-slot-name path below.
+        name.append("mat_").append(std::to_string(maxScriptId));
     } else {
         // For multi material try to use the slot name.
         MSTR slotName;
         multiMtl->GetSubMtlName(materialIndex, slotName);
         name = slotName.ToCStr().data();
         if (name.empty()) {
-            // If the slot name is empty use _{maxScriptId}_{subMaterialName}
-            name.append("_").append(std::to_string(maxScriptId)).append("_");
+            // MAX-GEO-003: same rationale -- prefer `mat_{maxScriptId}_{subMtl}`
+            // over the legacy `_{maxScriptId}_{subMtl}` (which still emitted a
+            // leading underscore even when a sub-material name was available).
+            name.append("mat_").append(std::to_string(maxScriptId));
             Mtl* subMtl = resolvedMtl->GetSubMtl(materialIndex);
             if (subMtl) {
-                name.append(subMtl->GetName().ToCStr().data());
+                const std::string subMtlName = subMtl->GetName().ToCStr().data();
+                if (!subMtlName.empty()) {
+                    name.append("_").append(subMtlName);
+                }
             }
         }
     }
