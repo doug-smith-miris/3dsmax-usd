@@ -83,7 +83,7 @@ struct export_options_test
         assert_equal ((GetDir #temp) + "\\MaxUsdExport.log") uiExportOptions.LogPath message:"The LogPath property was not properly initialized."
         assert_equal #off uiExportOptions.LogLevel message:"The LogLevel property was not properly initialized."
         assert_false uiExportOptions.PreserveEdgeOrientation message:"The PreserveEdgeOrientation property was not properly initialized to default (false)."
-        assert_equal #asPrimvar uiExportOptions.Normals message:"Normals property was not properly initialized to defaults (#asPrimvar)."
+        assert_equal #both uiExportOptions.Normals message:"Normals property was not properly initialized to defaults (#both)."
         assert_equal #fromScene uiExportOptions.MeshFormat message:"MeshFormat property was not properly initialized to defaults (#fromScene)."
         assert_equal #current uiExportOptions.TimeMode message:"The TimeMode property was not properly initialized to defaults (#current)."
         assert_equal 0.0 uiExportOptions.StartFrame message:"The StartFrame property was not properly initialized to defaults (0.0)."
@@ -250,7 +250,7 @@ struct export_options_test
         assert_equal ((GetDir #temp) + "\\MaxUsdExport.log") uiExportOptions.LogPath message:"The LogPath property was not properly reset."
         assert_equal #off uiExportOptions.LogLevel message:"The LogLevel property was not properly reset."
         assert_false uiExportOptions.PreserveEdgeOrientation message:"The PreserveEdgeOrientation property was not properly reset to default (false)."
-        assert_equal #asPrimvar uiExportOptions.Normals message:"Normals property was not properly reset to defaults (#asPrimvar)."
+        assert_equal #both uiExportOptions.Normals message:"Normals property was not properly reset to defaults (#both)."
         assert_equal #fromScene uiExportOptions.MeshFormat message:"MeshFormat property was not properly reset to defaults (#fromScene)."
         assert_equal #current uiExportOptions.TimeMode message:"The TimeMode property was not properly reset to defaults (#current)."
         assert_equal 0.0 uiExportOptions.StartFrame message:"The StartFrame property was not properly reset to defaults (0.0)."
@@ -1084,7 +1084,7 @@ struct export_options_test
         assert_equal "none" ((cubeGeom.GetSubdivisionSchemeAttr()).Get()) message:"Should be using none subdiv scheme when exporting normals."
             
         -- Test exporting normals as attribute
-            
+
         exportPath = output_prefix + "attribute_normals.usda"
         exportOptions.Normals = #asAttribute
         UsdExporter.ExportFile exportPath exportOptions:exportOptions
@@ -1100,19 +1100,176 @@ struct export_options_test
         assert_defined ((cubeGeom.GetNormalsAttr()).Get()) message:"Should have exported normals to an attribute."
         -- Subdiv scheme should be None. As normals are explicit.
         assert_equal "none" ((cubeGeom.GetSubdivisionSchemeAttr()).Get())  message:"Should be using none subdiv scheme when exporting normals."
-            
+
+        -- MAX-GEO-001: Test exporting normals as both primvar AND schema attribute.
+
+        exportPath = output_prefix + "both_normals.usda"
+        exportOptions.Normals = #both
+        UsdExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+        local cubePrim = stage.GetPrimAtPath("/" + nodeName)
+        assert_true (pyUsd.Prim.IsValid(cubePrim)) message:"Box should have exported to a valid prim."
+        assert_true (cubePrim.IsA(pyUsdGeom.Mesh)) message:"Box should have exported to a valid UsdMesh"
+        -- Should have a normals primvar.
+        local primvarApi = pyUsdGeom.PrimvarsAPI(cubePrim)
+        assert_true (primvarApi.HasPrimvar("normals")) message:"Should have a normals primvar when using #both."
+        -- AND should also have the schema normals attribute populated.
+        local cubeGeom = pyUsdGeom.Mesh(cubePrim)
+        assert_defined ((cubeGeom.GetNormalsAttr()).Get()) message:"Should also have a schema normals attribute when using #both."
+        -- Subdiv scheme should be None. As normals are explicit.
+        assert_equal "none" ((cubeGeom.GetSubdivisionSchemeAttr()).Get()) message:"Should be using none subdiv scheme when exporting normals."
+
         -- Test that invalid normal modes are rejected.
         try (
             local exportOptions = USDExporter.CreateOptions()
             exportOptions.Normals = 10
         )
-        catch 
+        catch
         (
             exceptionThrown = true
         )
         assert_true exceptionThrown message:"Attempting to set an invalid NormalMode should have thrown an exception."
     ),
-    
+
+    function test_normals_both_mode_dual_carrier_parity = (
+        -- MAX-GEO-001 reinforcement: under NormalsMode::Both (the new
+        -- default) both primvars:normals AND UsdGeomMesh.normals are
+        -- authored from the same source data. The existing
+        -- test_normals_option asserts each carrier is PRESENT under
+        -- #both via assert_defined, but it does NOT exercise the
+        -- DUAL-CARRIER PARITY INVARIANTS the original 1ac2d1b commit
+        -- promised:
+        --
+        --   "Both carry the same interpolation token (constant /
+        --    vertex / faceVarying) so any consumer reading either
+        --    location sees the same logical normals."
+        --
+        -- A future regression that recomputed the schema layout
+        -- independently (e.g. hardcoded faceVarying "for safety" on
+        -- the schema branch, or fed the primvar's indexed=true layout
+        -- to the schema PopulateAttribute call) would silently produce
+        -- two carriers that DISAGREE on interpolation or shape. The
+        -- existing categorical test would still pass (both attributes
+        -- present) while a consumer reading the schema attribute would
+        -- see different normals than a consumer reading the primvar.
+        --
+        -- This test pins the parity at the MaxScript -> exported-USD
+        -- layer. The Python validator validate_dual_normals_surgical.py
+        -- (8 cases + idempotence) covers the same bound at the
+        -- USD-only layer with case-by-case coverage of every
+        -- (NormalsMode, interpolation) pair.
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.Normals = #both
+        exportOptions.RootPrimPath = "/"
+
+        -- Case 1: Sphere (vertex interpolation -- indexed primvar /
+        -- flattened schema attribute). The primvar carries one normal
+        -- per unique vertex with an :indices sidecar; the schema
+        -- attribute carries the resolved-vertex-count flattened form.
+        -- Both must report the SAME interpolation token.
+        local sphere = Sphere name:"parity_sphere" radius:10 segments:16
+        local sphereExportPath = output_prefix + "both_parity_sphere.usda"
+        UsdExporter.ExportFile sphereExportPath exportOptions:exportOptions
+
+        local stage = pyUsd.Stage.Open(sphereExportPath)
+        local spherePrim = stage.GetPrimAtPath("/parity_sphere")
+        assert_true (pyUsd.Prim.IsValid(spherePrim)) message:"Sphere should have exported to a valid prim."
+
+        local sphereMesh = pyUsdGeom.Mesh(spherePrim)
+        local spherePrimvarApi = pyUsdGeom.PrimvarsAPI(spherePrim)
+        assert_true (spherePrimvarApi.HasPrimvar("normals")) message:"Sphere #both: primvars:normals should be authored."
+        local sphereSchemaNormalsArr = (sphereMesh.GetNormalsAttr()).Get()
+        assert_defined sphereSchemaNormalsArr message:"Sphere #both: UsdGeomMesh.normals (schema attribute) should be authored."
+
+        -- Parity invariant 1: same interpolation token.
+        local spherePrimvar = spherePrimvarApi.GetPrimvar("normals")
+        local spherePrimvarInterp = spherePrimvar.GetInterpolation()
+        local sphereSchemaInterp = sphereMesh.GetNormalsInterpolation()
+        assert_equal spherePrimvarInterp sphereSchemaInterp \
+            message:("Sphere #both: primvar interpolation (" + spherePrimvarInterp + ") must match schema attribute interpolation (" + sphereSchemaInterp + ")")
+
+        -- Parity invariant 2: the schema attribute has no companion
+        -- :indices sidecar. UsdGeomMesh.normals is NOT a primvar; the
+        -- C++ schema branch forces indexed=false. A regression that
+        -- routed the primvar's indexed layout to the schema branch
+        -- would author normals:indices on the prim.
+        local sphereSchemaIndicesAttr = spherePrim.GetAttribute("normals:indices")
+        assert_false (sphereSchemaIndicesAttr.HasAuthoredValue()) \
+            message:"Sphere #both: UsdGeomMesh.normals must not have a normals:indices sidecar (the schema attribute is not a primvar)."
+
+        -- Parity invariant 3: the schema-side array length is the
+        -- FLATTENED form, not the indexed-unique form. For vertex
+        -- interpolation the resolved length equals points.length; for
+        -- faceVarying it equals sum(faceVertexCounts).
+        local sphereSchemaLen = sphereSchemaNormalsArr.count
+        local spherePointsArr = (sphereMesh.GetPointsAttr()).Get()
+        local sphereFaceVertCountsArr = (sphereMesh.GetFaceVertexCountsAttr()).Get()
+        local sphereFaceVertCount = 0
+        for c in sphereFaceVertCountsArr do sphereFaceVertCount += c
+        if sphereSchemaInterp == "vertex" then (
+            assert_equal spherePointsArr.count sphereSchemaLen \
+                message:("Sphere #both vertex: schema-attr length (" + sphereSchemaLen as string + ") must equal points count (" + spherePointsArr.count as string + "), the flattened form for vertex interpolation.")
+        ) else if sphereSchemaInterp == "faceVarying" then (
+            assert_equal sphereFaceVertCount sphereSchemaLen \
+                message:("Sphere #both faceVarying: schema-attr length (" + sphereSchemaLen as string + ") must equal face-vertex count (" + sphereFaceVertCount as string + ").")
+        ) else if sphereSchemaInterp == "constant" then (
+            assert_equal 1 sphereSchemaLen \
+                message:("Sphere #both constant: schema-attr length must be 1, got " + sphereSchemaLen as string + ".")
+        )
+
+        -- Case 2: Box (faceVarying interpolation -- discontinuous
+        -- normals at hard edges). The faceVarying branch is the
+        -- alternate parity-invariant path: schema length must equal
+        -- the face-vertex count, NOT the unique-normals count the
+        -- indexed primvar carries.
+        delete sphere
+        local box = Box name:"parity_box" width:10 length:10 height:10
+        local boxExportPath = output_prefix + "both_parity_box.usda"
+        UsdExporter.ExportFile boxExportPath exportOptions:exportOptions
+
+        local stage = pyUsd.Stage.Open(boxExportPath)
+        local boxPrim = stage.GetPrimAtPath("/parity_box")
+        assert_true (pyUsd.Prim.IsValid(boxPrim)) message:"Box should have exported to a valid prim."
+
+        local boxMesh = pyUsdGeom.Mesh(boxPrim)
+        local boxPrimvarApi = pyUsdGeom.PrimvarsAPI(boxPrim)
+        assert_true (boxPrimvarApi.HasPrimvar("normals")) message:"Box #both: primvars:normals should be authored."
+        local boxSchemaNormalsArr = (boxMesh.GetNormalsAttr()).Get()
+        assert_defined boxSchemaNormalsArr message:"Box #both: UsdGeomMesh.normals (schema attribute) should be authored."
+
+        local boxPrimvar = boxPrimvarApi.GetPrimvar("normals")
+        local boxPrimvarInterp = boxPrimvar.GetInterpolation()
+        local boxSchemaInterp = boxMesh.GetNormalsInterpolation()
+        assert_equal boxPrimvarInterp boxSchemaInterp \
+            message:("Box #both: primvar interpolation (" + boxPrimvarInterp + ") must match schema attribute interpolation (" + boxSchemaInterp + ")")
+
+        local boxSchemaIndicesAttr = boxPrim.GetAttribute("normals:indices")
+        assert_false (boxSchemaIndicesAttr.HasAuthoredValue()) \
+            message:"Box #both: UsdGeomMesh.normals must not have a normals:indices sidecar."
+
+        -- Parity-3 for the box: under faceVarying the schema length
+        -- equals the face-vertex count (sum of faceVertexCounts).
+        local boxSchemaLen = boxSchemaNormalsArr.count
+        local boxFaceVertCountsArr = (boxMesh.GetFaceVertexCountsAttr()).Get()
+        local boxFaceVertCount = 0
+        for c in boxFaceVertCountsArr do boxFaceVertCount += c
+        local boxPointsArr = (boxMesh.GetPointsAttr()).Get()
+        if boxSchemaInterp == "vertex" then (
+            assert_equal boxPointsArr.count boxSchemaLen \
+                message:("Box #both vertex: schema-attr length (" + boxSchemaLen as string + ") must equal points count (" + boxPointsArr.count as string + ").")
+        ) else if boxSchemaInterp == "faceVarying" then (
+            assert_equal boxFaceVertCount boxSchemaLen \
+                message:("Box #both faceVarying: schema-attr length (" + boxSchemaLen as string + ") must equal face-vertex count (" + boxFaceVertCount as string + ").")
+        ) else if boxSchemaInterp == "constant" then (
+            assert_equal 1 boxSchemaLen \
+                message:("Box #both constant: schema-attr length must be 1, got " + boxSchemaLen as string + ".")
+        )
+
+        delete box
+    ),
+
     function test_mesh_format_option = (
         
         -- Local utility functions.
@@ -1979,6 +2136,7 @@ struct export_options_test
         test_no_file_extension,
         test_file_extension_uppercase,
         test_normals_option,
+        test_normals_both_mode_dual_carrier_parity,
         test_export_at_time,
         test_root_prim_path_option,
         test_export_hidden_objects_option,
