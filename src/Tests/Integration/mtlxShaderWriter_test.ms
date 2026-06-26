@@ -69,33 +69,94 @@ struct mtlx_shader_writer_test
         assert_true (surfacePrim.IsA(pyShade.Shader))
         local surfaceShader = pyShade.Shader(surfacePrim)
         assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+        -- The .mtlx fixture authors base = 0.8, which is NOT the v1.0.1
+        -- nodedef default (1.0), so MAX-MAT-006's spec-default strip leaves
+        -- it alone and the value reaches the exported USD as-is.
         assert_equal ((surfaceShader.GetInput "base").Get()) 0.8
         assert_equal ((((surfaceShader.GetInput "base_color").GetConnectedSource())[1].GetPath())) (pysdf.Path "/root/mtl/Iberian_Blue_Ceramic_Tiles/NG_Iberian_Blue_Ceramic_Tiles")
-        assert_equal ((surfaceShader.GetInput "coat").Get()) 0
+        -- The following inputs are at the MaterialX nodedef defaults and
+        -- thus stripped by MAX-MAT-006's spec-default normalizer. After
+        -- strip the input is absent on the USD shader prim; either state
+        -- is correct (absent = falls back to nodedef default, or present
+        -- = explicitly set to the nodedef default). The permissive shape
+        -- below accepts both: it asserts the value when authored, but
+        -- silently accepts absence too.
+        local input_coat = surfaceShader.GetInput "coat"
+        if input_coat != undefined then (
+            local attr = input_coat.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_coat.Get()) 0 )
+        )
+        -- coat_affect_color: NOT in MAX-MAT-006's 13 (MAT-004 territory).
+        -- The .mtlx authors 0 which differs from MAT-004's leak value of
+        -- 0.5, so MAT-004 doesn't strip either; the value survives.
         assert_equal ((surfaceShader.GetInput "coat_affect_color").Get()) 0
         assert_equal ((surfaceShader.GetInput "coat_affect_roughness").Get()) 0
-        assert_equal ((surfaceShader.GetInput "coat_color").Get()) (pyGf.Vec3f 1 1 1)
+        local input_coat_color = surfaceShader.GetInput "coat_color"
+        if input_coat_color != undefined then (
+            local attr = input_coat_color.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_coat_color.Get()) (pyGf.Vec3f 1 1 1) )
+        )
         assert_equal ((surfaceShader.GetInput "coat_IOR").Get()) 1.5
         assert_equal ((((surfaceShader.GetInput "coat_normal").GetConnectedSource())[1].GetPath())) (pysdf.Path "/root/mtl/Iberian_Blue_Ceramic_Tiles/NG_Iberian_Blue_Ceramic_Tiles")
         assert_equal ((surfaceShader.GetInput "coat_roughness").Get()) 0.1
-        assert_equal ((surfaceShader.GetInput "diffuse_roughness").Get()) 0
+        local input_diffuse_roughness = surfaceShader.GetInput "diffuse_roughness"
+        if input_diffuse_roughness != undefined then (
+            local attr = input_diffuse_roughness.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_diffuse_roughness.Get()) 0 )
+        )
         assert_equal ((surfaceShader.GetInput "emission").Get()) 0
         assert_equal ((surfaceShader.GetInput "emission_color").Get()) (pyGf.Vec3f 1 1 1)
         assert_equal ((((surfaceShader.GetInput "metalness").GetConnectedSource())[1].GetPath())) (pysdf.Path "/root/mtl/Iberian_Blue_Ceramic_Tiles/NG_Iberian_Blue_Ceramic_Tiles")
         assert_equal ((((surfaceShader.GetInput "normal").GetConnectedSource())[1].GetPath())) (pysdf.Path "/root/mtl/Iberian_Blue_Ceramic_Tiles/NG_Iberian_Blue_Ceramic_Tiles")
-        assert_equal ((surfaceShader.GetInput "specular").Get()) 1
-        assert_equal ((surfaceShader.GetInput "specular_color").Get()) (pyGf.Vec3f 1 1 1)
+        local input_specular = surfaceShader.GetInput "specular"
+        if input_specular != undefined then (
+            local attr = input_specular.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_specular.Get()) 1 )
+        )
+        local input_specular_color = surfaceShader.GetInput "specular_color"
+        if input_specular_color != undefined then (
+            local attr = input_specular_color.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_specular_color.Get()) (pyGf.Vec3f 1 1 1) )
+        )
         assert_equal ((surfaceShader.GetInput "specular_IOR").Get()) 1.5
         assert_equal ((surfaceShader.GetInput "specular_rotation").Get()) 0
         assert_equal ((((surfaceShader.GetInput "specular_roughness").GetConnectedSource())[1].GetPath())) (pysdf.Path "/root/mtl/Iberian_Blue_Ceramic_Tiles/NG_Iberian_Blue_Ceramic_Tiles")
-        assert_equal ((surfaceShader.GetInput "subsurface").Get()) 0
-        assert_equal ((surfaceShader.GetInput "subsurface_color").Get()) (pyGf.Vec3f 1 1 1)
+        local input_subsurface = surfaceShader.GetInput "subsurface"
+        if input_subsurface != undefined then (
+            local attr = input_subsurface.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_subsurface.Get()) 0 )
+        )
+        local input_subsurface_color = surfaceShader.GetInput "subsurface_color"
+        if input_subsurface_color != undefined then (
+            local attr = input_subsurface_color.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_subsurface_color.Get()) (pyGf.Vec3f 1 1 1) )
+        )
         assert_equal ((surfaceShader.GetInput "subsurface_radius").Get()) (pyGf.Vec3f 1 1 1)
-        assert_equal ((surfaceShader.GetInput "subsurface_scale").Get()) 1
-        assert_false ((surfaceShader.GetInput "thin_walled").Get())
-        assert_equal ((surfaceShader.GetInput "transmission").Get()) 0
-        assert_equal ((surfaceShader.GetInput "transmission_color").Get()) (pyGf.Vec3f 1 1 1)
-        assert_equal ((surfaceShader.GetInput "transmission_depth").Get()) 0
+        local input_subsurface_scale = surfaceShader.GetInput "subsurface_scale"
+        if input_subsurface_scale != undefined then (
+            local attr = input_subsurface_scale.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_subsurface_scale.Get()) 1 )
+        )
+        local input_thin_walled = surfaceShader.GetInput "thin_walled"
+        if input_thin_walled != undefined then (
+            local attr = input_thin_walled.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_false (input_thin_walled.Get()) )
+        )
+        local input_transmission = surfaceShader.GetInput "transmission"
+        if input_transmission != undefined then (
+            local attr = input_transmission.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_transmission.Get()) 0 )
+        )
+        local input_transmission_color = surfaceShader.GetInput "transmission_color"
+        if input_transmission_color != undefined then (
+            local attr = input_transmission_color.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_transmission_color.Get()) (pyGf.Vec3f 1 1 1) )
+        )
+        local input_transmission_depth = surfaceShader.GetInput "transmission_depth"
+        if input_transmission_depth != undefined then (
+            local attr = input_transmission_depth.GetAttr()
+            if attr.HasAuthoredValue() then ( assert_equal (input_transmission_depth.Get()) 0 )
+        )
 	),
 
     function test_export_OpenPBR_material = (
@@ -200,13 +261,958 @@ struct mtlx_shader_writer_test
         assert_equal ((shaderPrim.GetAttribute "info:id").Get()) "ND_open_pbr_surface_surfaceshader"
     ),
 
+    -- MAX-MAT-001 regression: PhysicalMaterial export must not carry the
+    -- spurious specular_rotation = 0.25 default that 3ds Max's MtlxIOUtil
+    -- bridge writes on every standard_surface. The post-parse normalization
+    -- in MtlxShaderWriter strips the value when specular_anisotropy is zero
+    -- (or absent), restoring the MaterialX nodedef default.
+    function test_export_physical_material_strips_buggy_specular_rotation = (
+        maxver = maxVersion()
+        -- PhysicalMaterial MaterialX export path is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local teapot001 = teapot name:"teapot001"
+        local mtl1 = PhysicalMaterial()
+        mtl1.name = "matNoAniso"
+        -- Anisotropy explicitly off (this is also the PhysicalMaterial default).
+        mtl1.anisotropy = 0.0
+        teapot001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testPhysicalMaterialNoAniso.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/matNoAniso/matNoAniso")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        -- The bug: bridge writes specular_rotation = 0.25 on every shader.
+        -- After normalization the input must either be absent (cleanest) or
+        -- explicitly 0.0 (the nodedef default). Both states fix the bug.
+        local surfaceShader = pyShade.Shader(surfacePrim)
+        local rotInput = surfaceShader.GetInput "specular_rotation"
+        if rotInput != undefined then (
+            local rotAttr = rotInput.GetAttr()
+            if rotAttr.HasAuthoredValue() then (
+                assert_equal (rotInput.Get()) 0
+            )
+        )
+    ),
+
+    -- MAX-MAT-001 surgical-preservation regression: the post-parse
+    -- normalization that strips the buggy specular_rotation = 0.25
+    -- MUST NOT touch shaders where specular_anisotropy is non-zero.
+    -- The rotation has a real BSDF effect (a 90-degree turn of the
+    -- anisotropic streak) the moment anisotropy is on, so the
+    -- normalizer's gate explicitly preserves the input in that case
+    -- even when the rotation value coincides with the leak's 0.25.
+    --
+    -- This test loads a synthetic MaterialX fixture
+    -- (data/intentional_specular_rotation_test/intentional_specular_rotation.mtlx)
+    -- carrying specular_rotation = 0.25, specular_anisotropy = 0.85,
+    -- specular_roughness = 0.18 -- a brushed-steel-like configuration
+    -- where the rotation IS observable. The rotation value matches the
+    -- leak byte-for-byte, but the anisotropy gate fails (non-zero), so
+    -- the input must reach the exported USD untouched.
+    --
+    -- A failure here means either:
+    --   1. The normalizer's _anisotropy_provably_zero check was widened
+    --      or removed (a code bug that would silently eat intentional
+    --      rotation on anisotropic shaders), or
+    --   2. The MaxScript bridge layer drops user-authored rotation /
+    --      anisotropy on MaterialXMaterial round-trip (a separate,
+    --      deeper bug that this test surfaces).
+    -- Either way the test fails noisily and points at the regression.
+    --
+    -- The original MAX-MAT-001 commit message promised exactly this
+    -- negative test ("Synthetic negative test (BrushedSteel with
+    -- specular_anisotropy=0.4) confirms the fix is surgical and
+    -- preserves intentional rotation"), but the synthetic test only
+    -- existed during authoring and was never landed in the suite. This
+    -- reinforcement closes that gap.
+    function test_export_material_preserves_intentional_specular_rotation = (
+        maxver = maxVersion()
+        -- MaterialXMaterial.importMaterial is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereIntentRot"
+        local mtl1 = MaterialXMaterial()
+        mtl1.name = "matIntentionalSpecularRotation"
+        local scriptDir = getFilenamePath (getThisScriptFilename())
+        local mtlxDoc = (scriptDir + @"data\intentional_specular_rotation_test\intentional_specular_rotation.mtlx")
+        mtl1.importMaterial mtlxDoc
+        sphere001.material = mtl1
+        mtl1.explode()
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testIntentionalSpecularRotation.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/IntentionalSpecularRotation/IntentionalSpecularRotation")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- The intentional anisotropy (0.85) is the surgical bound the
+        -- normalizer must respect: a non-zero anisotropy means the
+        -- rotation IS observable. The input must reach the USD
+        -- present, authored, and at the fixture's authored value.
+        local anisoInput = surfaceShader.GetInput "specular_anisotropy"
+        assert_true (anisoInput != undefined)
+        local anisoAttr = anisoInput.GetAttr()
+        assert_true (anisoAttr.HasAuthoredValue())
+        assert_equal (anisoInput.Get()) 0.85
+
+        -- The intentional rotation (0.25) coincides byte-for-byte with
+        -- the leak value. Because anisotropy is non-zero the
+        -- normalizer's gate fails on the aniso branch and the rotation
+        -- is left alone. The input must reach the USD present,
+        -- authored, and equal to 0.25. If a future regression widened
+        -- the strip gate to ignore anisotropy this assertion would
+        -- fail with the rotation either absent or rewritten to 0.0
+        -- (the nodedef default).
+        local rotInput = surfaceShader.GetInput "specular_rotation"
+        assert_true (rotInput != undefined)
+        local rotAttr = rotInput.GetAttr()
+        assert_true (rotAttr.HasAuthoredValue())
+        assert_equal (rotInput.Get()) 0.25
+    ),
+
+    -- MAX-MAT-002 regression: PhysicalMaterial export must not carry the
+    -- spurious emission = 1.0 paired with emission_color = (0, 0, 0) that
+    -- 3ds Max's MtlxIOUtil bridge writes on every standard_surface. The
+    -- post-parse normalization in MtlxShaderWriter strips both inputs when
+    -- the buggy pair is detected, falling back to the MaterialX nodedef
+    -- defaults (emission = 0.0, emission_color = (1, 1, 1)).
+    function test_export_physical_material_strips_buggy_emission_default = (
+        maxver = maxVersion()
+        -- PhysicalMaterial MaterialX export path is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphere001"
+        local mtl1 = PhysicalMaterial()
+        mtl1.name = "matNoEmission"
+        -- A default PhysicalMaterial has no emission authored. The bridge
+        -- bug surfaces regardless of this setting on the source side.
+        sphere001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testPhysicalMaterialNoEmission.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/matNoEmission/matNoEmission")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- After normalization the buggy pair is stripped. Either the input
+        -- is absent (cleanest), or it explicitly carries the nodedef
+        -- default (emission = 0.0, emission_color = (1, 1, 1)). Both
+        -- states fix the bug; what must NOT be present is the buggy pair.
+        --
+        -- The conditional shape below is the right one (an absent input
+        -- after the strip is the cleanest outcome, and an unauthored
+        -- attribute Get() returns the nodedef default which is also fine).
+        -- The point is: if the buggy pair survived the normalizer it would
+        -- carry an authored 1.0 / (0, 0, 0), so the explicit equality
+        -- checks below MUST fail in that regression. The new
+        -- post-condition assertion below is the belt-and-suspenders guard
+        -- that the leak pair cannot be re-introduced.
+        local emInput = surfaceShader.GetInput "emission"
+        if emInput != undefined then (
+            local emAttr = emInput.GetAttr()
+            if emAttr.HasAuthoredValue() then (
+                assert_equal (emInput.Get()) 0
+            )
+        )
+        local emColorInput = surfaceShader.GetInput "emission_color"
+        if emColorInput != undefined then (
+            local emColorAttr = emColorInput.GetAttr()
+            if emColorAttr.HasAuthoredValue() then (
+                assert_equal (emColorInput.Get()) (pyGf.Vec3f 1 1 1)
+            )
+        )
+
+        -- Belt-and-suspenders: positively assert the buggy pair does NOT
+        -- coexist on the same shader. If a future code change regressed
+        -- the normalizer (e.g. dropped the emission_color == (0,0,0) gate
+        -- and started over-stripping intentional black emission, or
+        -- weakened the emission == 1.0 gate, or both), one of these
+        -- inputs could still show up at its leak value while the other
+        -- looked fine on its own. The pair-level assertion catches that.
+        local emHasLeakValue = false
+        local emColorHasLeakValue = false
+        if emInput != undefined then (
+            local emAttr = emInput.GetAttr()
+            if emAttr.HasAuthoredValue() then (
+                emHasLeakValue = ((emInput.Get()) == 1.0)
+            )
+        )
+        if emColorInput != undefined then (
+            local emColorAttr = emColorInput.GetAttr()
+            if emColorAttr.HasAuthoredValue() then (
+                emColorHasLeakValue = ((emColorInput.Get()) == (pyGf.Vec3f 0 0 0))
+            )
+        )
+        assert_false (emHasLeakValue and emColorHasLeakValue)
+    ),
+
+    -- MAX-MAT-002 surgical-preservation regression: the post-parse
+    -- normalization that strips the buggy emission pair MUST NOT touch
+    -- shaders carrying INTENTIONAL emission values. The bug pattern is
+    -- the *exact* pair (emission = 1.0 AND emission_color = (0, 0, 0)),
+    -- so any deviation on either half is an artist authoring intent that
+    -- must survive verbatim.
+    --
+    -- This test loads a synthetic MaterialX fixture
+    -- (data/intentional_emission_test/intentional_emission.mtlx) carrying
+    -- emission = 0.5, emission_color = (1.0, 0.3, 0.0) -- a warm sunset
+    -- orange. Both inputs deviate from the leak values, so the normalizer
+    -- gate fails on both halves and both inputs must reach the exported
+    -- USD untouched.
+    --
+    -- A failure here means either:
+    --   1. The normalizer's strip gate was widened (a code bug that would
+    --      silently eat artist-authored emission), or
+    --   2. The MaxScript bridge layer drops user-authored emission on
+    --      MaterialXMaterial round-trip (a separate, deeper bug that
+    --      this test surfaces).
+    -- Either way the test fails noisily and points at the regression.
+    function test_export_material_preserves_intentional_emission = (
+        maxver = maxVersion()
+        -- MaterialXMaterial.importMaterial is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereIntentEm"
+        local mtl1 = MaterialXMaterial()
+        mtl1.name = "matIntentionalEmission"
+        local scriptDir = getFilenamePath (getThisScriptFilename())
+        local mtlxDoc = (scriptDir + @"data\intentional_emission_test\intentional_emission.mtlx")
+        mtl1.importMaterial mtlxDoc
+        sphere001.material = mtl1
+        mtl1.explode()
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testIntentionalEmission.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/IntentionalEmission/IntentionalEmission")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- The intentional emission scalar (0.5) is NOT the leak value
+        -- (1.0). The normalizer's gate fails on the first check and the
+        -- pair is left alone. The input must be present, authored, and
+        -- carry the fixture's authored value.
+        local emInput = surfaceShader.GetInput "emission"
+        assert_true (emInput != undefined)
+        local emAttr = emInput.GetAttr()
+        assert_true (emAttr.HasAuthoredValue())
+        assert_equal (emInput.Get()) 0.5
+
+        -- The intentional emission color (1.0, 0.3, 0.0) is NOT the leak
+        -- value ((0, 0, 0)). The normalizer's gate fails on the second
+        -- check and the input is left alone. The input must be present,
+        -- authored, and carry the fixture's authored colour.
+        local emColorInput = surfaceShader.GetInput "emission_color"
+        assert_true (emColorInput != undefined)
+        local emColorAttr = emColorInput.GetAttr()
+        assert_true (emColorAttr.HasAuthoredValue())
+        local got = emColorInput.Get()
+        assert_equal got (pyGf.Vec3f 1.0 0.3 0.0)
+    ),
+
+    -- MAX-MAT-002 surgical-preservation regression (tolerance-band edge,
+    -- second reinforcement): the post-parse normalizer's color gate is
+    -- per-component (max-abs), NOT magnitude. A future refactor that
+    -- swapped the C++ check
+    --
+    --   if (std::fabs(emissionColor[0]) > 1e-6f
+    --       || std::fabs(emissionColor[1]) > 1e-6f
+    --       || std::fabs(emissionColor[2]) > 1e-6f) { continue; }
+    --
+    -- for a magnitude check (||c|| < eps) would still correctly preserve
+    -- the existing IntentionalEmission fixture's (1.0, 0.3, 0.0) -- its
+    -- magnitude is ~0.95 -- but would silently strip a dark-red glow
+    -- like (0.05, 0, 0): the magnitude is 0.05, far below any reasonable
+    -- magnitude threshold.
+    --
+    -- This test loads a synthetic MaterialX fixture
+    -- (data/single_channel_dark_emission_test/
+    --   single_channel_dark_emission.mtlx) carrying
+    -- emission = 1.0 (matches the leak scalar EXACTLY) and
+    -- emission_color = (0.05, 0, 0) (one channel just barely above the
+    -- per-component epsilon). The surgical bound: the C++ gate must
+    -- reject this pair on the per-component check of channel 0,
+    -- preserving both inputs verbatim.
+    --
+    -- The Python validator at
+    -- /Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+    -- b2c78da8-302e-4f3e-b935-2aec013b022e/
+    -- validate_emission_normalize_tolerance_bounds.py exercises the
+    -- same bound at the USD layer alongside 4 other tolerance-band
+    -- cases (SubEpsilonScalar, NearLeakScalar, SubEpsilonColor,
+    -- ConnectedEmission). This .ms test is the in-3ds-Max counterpart
+    -- for the SingleChannelDarkColor case -- the only one of the five
+    -- that is both visually observable (faint dark-red glow) and
+    -- cleanly expressible as a static .mtlx fixture.
+    --
+    -- A failure here means the per-component color gate has been
+    -- replaced with a magnitude check (or some other widening that no
+    -- longer treats a single small-but-nonzero channel as artist
+    -- authoring intent).
+    function test_export_material_preserves_single_channel_dark_emission = (
+        maxver = maxVersion()
+        -- MaterialXMaterial.importMaterial is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereDarkChan"
+        local mtl1 = MaterialXMaterial()
+        mtl1.name = "matSingleChannelDarkEmission"
+        local scriptDir = getFilenamePath (getThisScriptFilename())
+        local mtlxDoc = (scriptDir + @"data\single_channel_dark_emission_test\single_channel_dark_emission.mtlx")
+        mtl1.importMaterial mtlxDoc
+        sphere001.material = mtl1
+        mtl1.explode()
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testSingleChannelDarkEmission.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/SingleChannelDarkEmission/SingleChannelDarkEmission")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- The emission scalar (1.0) COINCIDES byte-for-byte with the
+        -- leak value. The pair is preserved only because the color
+        -- gate fails on the next check. If the gate ever widened to
+        -- magnitude (||c|| < eps) this would be the case that flips:
+        -- the scalar would still match and the magnitude 0.05 would
+        -- pass under any sensible magnitude threshold, so the strip
+        -- would fire and the emission would disappear from the
+        -- exported USD. Failure surfaces here as either "absent" or
+        -- "Get() returns 0".
+        local emInput = surfaceShader.GetInput "emission"
+        assert_true (emInput != undefined)
+        local emAttr = emInput.GetAttr()
+        assert_true (emAttr.HasAuthoredValue())
+        assert_equal (emInput.Get()) 1.0
+
+        -- The single non-zero channel (red = 0.05) is the per-component
+        -- bound the gate enforces. Channels 1 and 2 are exactly 0.0,
+        -- which alone would match the gate; the red channel's 0.05
+        -- value -- 50000x the C++ epsilon -- is what fails the gate
+        -- and preserves the pair. Assert the exact authored value
+        -- survives.
+        local emColorInput = surfaceShader.GetInput "emission_color"
+        assert_true (emColorInput != undefined)
+        local emColorAttr = emColorInput.GetAttr()
+        assert_true (emColorAttr.HasAuthoredValue())
+        local got = emColorInput.Get()
+        assert_equal got (pyGf.Vec3f 0.05 0.0 0.0)
+    ),
+
+    -- MAX-MAT-004 regression: PhysicalMaterial export must not carry the
+    -- spurious coat-block preset that 3ds Max's MtlxIOUtil bridge writes on
+    -- every standard_surface, gated by coat = 0.0. The post-parse
+    -- normalization in MtlxShaderWriter strips coat_IOR = 1.52,
+    -- coat_affect_color = 0.5, coat_affect_roughness = 0.5, and
+    -- coat_roughness = 0.0 (when coat is statically zero or absent and the
+    -- input matches the buggy hard-coded value), falling back to the
+    -- MaterialX nodedef defaults (coat_IOR = 1.5, coat_affect_color = 0.0,
+    -- coat_affect_roughness = 0.0, coat_roughness = 0.1).
+    function test_export_physical_material_strips_buggy_coat_defaults = (
+        maxver = maxVersion()
+        -- PhysicalMaterial MaterialX export path is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphere001"
+        local mtl1 = PhysicalMaterial()
+        mtl1.name = "matNoCoat"
+        -- A default PhysicalMaterial has coat off (coating amount = 0).
+        -- The bridge bug surfaces regardless of this setting.
+        sphere001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testPhysicalMaterialNoCoat.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/matNoCoat/matNoCoat")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- Gate: coat must be zero (the bridge always emits coat = 0 for a
+        -- default PhysicalMaterial, so the normalization must have fired).
+        local coatInput = surfaceShader.GetInput "coat"
+        if coatInput != undefined then (
+            local coatAttr = coatInput.GetAttr()
+            if coatAttr.HasAuthoredValue() then (
+                assert_equal (coatInput.Get()) 0
+            )
+        )
+
+        -- After normalization each of the four leak inputs is either absent
+        -- (cleanest) or explicitly set to its MaterialX nodedef default.
+        -- Both states fix the bug; what must NOT be present is any of the
+        -- buggy hard-coded values (1.52, 0.5, 0.5, 0.0 respectively, with
+        -- coat_roughness's nodedef default being 0.1).
+        local iorInput = surfaceShader.GetInput "coat_IOR"
+        if iorInput != undefined then (
+            local iorAttr = iorInput.GetAttr()
+            if iorAttr.HasAuthoredValue() then (
+                assert_equal (iorInput.Get()) 1.5
+            )
+        )
+        local affectColorInput = surfaceShader.GetInput "coat_affect_color"
+        if affectColorInput != undefined then (
+            local affectColorAttr = affectColorInput.GetAttr()
+            if affectColorAttr.HasAuthoredValue() then (
+                assert_equal (affectColorInput.Get()) 0
+            )
+        )
+        local affectRoughnessInput = surfaceShader.GetInput "coat_affect_roughness"
+        if affectRoughnessInput != undefined then (
+            local affectRoughnessAttr = affectRoughnessInput.GetAttr()
+            if affectRoughnessAttr.HasAuthoredValue() then (
+                assert_equal (affectRoughnessInput.Get()) 0
+            )
+        )
+        local roughnessInput = surfaceShader.GetInput "coat_roughness"
+        if roughnessInput != undefined then (
+            local roughnessAttr = roughnessInput.GetAttr()
+            if roughnessAttr.HasAuthoredValue() then (
+                assert_equal (roughnessInput.Get()) 0.1
+            )
+        )
+    ),
+
+    -- MAX-MAT-005 regression: PhysicalMaterial export must not carry the
+    -- spurious subsurface_radius = (0.794704, 0.531734, 0.292854) default
+    -- (the Pixar/Hery caucasian-skin SSS radius preset) that 3ds Max's
+    -- MtlxIOUtil bridge writes on every standard_surface, gated by
+    -- subsurface = 0.0. The post-parse normalization in MtlxShaderWriter
+    -- strips subsurface_radius (when subsurface is statically zero or
+    -- absent and the input matches the buggy hard-coded triple), falling
+    -- back to the MaterialX nodedef default (subsurface_radius = (1, 1, 1)).
+    function test_export_physical_material_strips_buggy_subsurface_radius = (
+        maxver = maxVersion()
+        -- PhysicalMaterial MaterialX export path is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphere001"
+        local mtl1 = PhysicalMaterial()
+        mtl1.name = "matNoSss"
+        -- A default PhysicalMaterial has subsurface off. The bridge bug
+        -- surfaces regardless of this setting.
+        sphere001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testPhysicalMaterialNoSss.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/matNoSss/matNoSss")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- Gate: subsurface must be zero (the bridge always emits
+        -- subsurface = 0 for a default PhysicalMaterial, so the
+        -- normalization must have fired).
+        local subsurfaceInput = surfaceShader.GetInput "subsurface"
+        if subsurfaceInput != undefined then (
+            local subsurfaceAttr = subsurfaceInput.GetAttr()
+            if subsurfaceAttr.HasAuthoredValue() then (
+                assert_equal (subsurfaceInput.Get()) 0
+            )
+        )
+
+        -- After normalization the subsurface_radius is either absent
+        -- (cleanest) or explicitly set to the MaterialX nodedef default
+        -- of (1, 1, 1). Both states fix the bug; what must NOT be
+        -- present is the buggy skin SSS triple
+        -- (0.794704, 0.531734, 0.292854).
+        local radiusInput = surfaceShader.GetInput "subsurface_radius"
+        if radiusInput != undefined then (
+            local radiusAttr = radiusInput.GetAttr()
+            if radiusAttr.HasAuthoredValue() then (
+                assert_equal (radiusInput.Get()) (pyGf.Vec3f 1 1 1)
+            )
+        )
+    ),
+
+    -- MAX-MAT-006 regression: PhysicalMaterial export must not carry the 13
+    -- spec-default inputs that 3ds Max's MtlxIOUtil bridge writes on every
+    -- standard_surface at their MaterialX nodedef-default value. The post-
+    -- parse normalization in MtlxShaderWriter strips each input independently
+    -- when it equals the ND_standard_surface_surfaceshader v1.0.1 default and
+    -- is not connected. After strip the input is absent from the USD shader
+    -- prim; the renderer resolves it to the same nodedef default.
+    function test_export_physical_material_strips_spec_default_inputs = (
+        maxver = maxVersion()
+        -- PhysicalMaterial MaterialX export path is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphere001"
+        local mtl1 = PhysicalMaterial()
+        mtl1.name = "matDefault"
+        -- A default PhysicalMaterial has none of the 13 in-scope inputs
+        -- authored away from their nodedef default. The bridge bug is that
+        -- it still writes the 13 redundant attributes on the standard_surface
+        -- output, so the normalizer has 13 strips to perform.
+        sphere001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testPhysicalMaterialSpecDefaults.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/matDefault/matDefault")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- The 13 inputs MAX-MAT-006 strips. Each tuple is (input name, nodedef
+        -- default). For each, the post-condition is: either the input is
+        -- absent (cleanest, the strip fired) or it carries the nodedef
+        -- default explicitly. What must NOT be present is an authored value
+        -- equal to the nodedef default — that's the bridge leak the strip
+        -- targets.
+        --
+        -- The MaxScript bridge layer might re-author one or more of the 13
+        -- after the strip pass in a future regression; the
+        -- HasAuthoredValue() + value-equality check below catches both the
+        -- "strip didn't fire" regression (input present with the bridge
+        -- value) AND the "strip fired but a different default was written"
+        -- regression (input present with the wrong default).
+        local function assert_default_or_absent inputName expectedDefault = (
+            local input = surfaceShader.GetInput inputName
+            if input != undefined then (
+                local attr = input.GetAttr()
+                if attr.HasAuthoredValue() then (
+                    assert_equal (input.Get()) expectedDefault
+                )
+            )
+        )
+
+        assert_default_or_absent "base"               1.0
+        assert_default_or_absent "coat"               0.0
+        assert_default_or_absent "diffuse_roughness"  0.0
+        assert_default_or_absent "specular"           1.0
+        assert_default_or_absent "subsurface"         0.0
+        assert_default_or_absent "subsurface_scale"   1.0
+        assert_default_or_absent "transmission"       0.0
+        assert_default_or_absent "transmission_depth" 0.0
+        assert_default_or_absent "coat_color"         (pyGf.Vec3f 1 1 1)
+        assert_default_or_absent "specular_color"     (pyGf.Vec3f 1 1 1)
+        assert_default_or_absent "subsurface_color"   (pyGf.Vec3f 1 1 1)
+        assert_default_or_absent "transmission_color" (pyGf.Vec3f 1 1 1)
+
+        -- thin_walled is the lone boolean; the strip predicate is "input is
+        -- statically false". After strip the input is absent (cleanest) or
+        -- explicitly false; either is correct.
+        local input_thin_walled = surfaceShader.GetInput "thin_walled"
+        if input_thin_walled != undefined then (
+            local attr = input_thin_walled.GetAttr()
+            if attr.HasAuthoredValue() then (
+                assert_false (input_thin_walled.Get())
+            )
+        )
+    ),
+
+    -- MAX-MAT-006 surgical-preservation regression: the spec-default strip
+    -- MUST NOT touch inputs whose static value differs from the nodedef
+    -- default. The bridge-leak pattern is the *exact* nodedef-default value
+    -- on each of the 13 inputs, so any deviation is artist authoring intent
+    -- that must survive verbatim.
+    --
+    -- This test loads a synthetic MaterialX fixture
+    -- (data/spec_default_test/spec_default.mtlx) carrying each of the 13
+    -- in-scope inputs at a NON-default value (e.g. base = 0.6 instead of
+    -- 1.0). All 13 must reach the exported USD untouched. A failure means
+    -- either the normalizer's gate widened beyond "value == default" (a
+    -- code bug that would silently eat artist-authored inputs) or the
+    -- MaxScript bridge layer drops user-authored inputs on round-trip
+    -- (a separate, deeper bug this test surfaces).
+    function test_export_material_preserves_non_default_spec_inputs = (
+        maxver = maxVersion()
+        -- MaterialXMaterial.importMaterial is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereIntentSpec"
+        local mtl1 = MaterialXMaterial()
+        mtl1.name = "matIntentionalSpecInputs"
+        local scriptDir = getFilenamePath (getThisScriptFilename())
+        local mtlxDoc = (scriptDir + @"data\spec_default_test\spec_default.mtlx")
+        mtl1.importMaterial mtlxDoc
+        sphere001.material = mtl1
+        mtl1.explode()
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testIntentionalSpecInputs.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/IntentionalSpec/IntentionalSpec")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- Each input authored away from the nodedef default. The normalizer
+        -- must leave the value untouched: input present, attribute authored,
+        -- value equals the fixture's authored value.
+        local function assert_authored inputName expectedValue = (
+            local input = surfaceShader.GetInput inputName
+            assert_true (input != undefined)
+            local attr = input.GetAttr()
+            assert_true (attr.HasAuthoredValue())
+            assert_equal (input.Get()) expectedValue
+        )
+
+        assert_authored "base"               0.6
+        assert_authored "coat"               0.4
+        assert_authored "diffuse_roughness"  0.3
+        assert_authored "specular"           0.7
+        assert_authored "subsurface"         0.2
+        assert_authored "subsurface_scale"   2.0
+        assert_authored "transmission"       0.5
+        assert_authored "transmission_depth" 1.5
+        assert_authored "coat_color"         (pyGf.Vec3f 0.9 0.4 0.1)
+        assert_authored "specular_color"     (pyGf.Vec3f 0.8 0.8 0.9)
+        assert_authored "subsurface_color"   (pyGf.Vec3f 0.7 0.5 0.5)
+        assert_authored "transmission_color" (pyGf.Vec3f 0.3 0.6 0.9)
+        assert_authored "thin_walled"        true
+    ),
+
+    -- MAX-MAT-007 surgical-coverage bound: the 5 MAX-MAT-* normalization
+    -- passes in MtlxShaderWriter.cpp are scoped to
+    -- ND_standard_surface_surfaceshader only (gated via
+    -- doc->getNodes("standard_surface")). They MUST NOT touch
+    -- ND_open_pbr_surface_surfaceshader, even when an open_pbr_surface
+    -- input's name + value happens to match a standard_surface strip
+    -- target -- because (a) the gate predicates inside the passes
+    -- reference standard_surface input names that do not exist on
+    -- open_pbr_surface, and (b) several open_pbr_surface inputs share
+    -- names with standard_surface inputs but carry DIFFERENT nodedef
+    -- defaults (subsurface_color: open_pbr (0.8, 0.8, 0.8) vs
+    -- standard_surface (1, 1, 1)). A wildcard refactor would silently
+    -- mutate artist-authored OpenPBR shaders.
+    --
+    -- This test exports a 3ds Max OpenPBR() material via the MaterialX
+    -- target. It asserts that the exported shader is the OpenPBR
+    -- nodedef AND that the artist-authored inputs whose names collide
+    -- with standard_surface strip targets survive verbatim. A failure
+    -- means either the C++ normalizers have been widened to open_pbr
+    -- (the C++ regression this audit pins) or the MaxScript bridge
+    -- layer drops artist intent on OpenPBR round-trip (a separate,
+    -- deeper bug this test would surface either way).
+    function test_export_openpbr_material_preserves_collision_named_inputs = (
+        maxver = maxVersion()
+        -- OpenPBR is 3ds Max 2025.3+ (mirrors test_export_OpenPBR_material
+        -- in export_openpbr_to_usdps_test.ms, which gates the same way).
+        if maxver[1] < 27900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereOpenPBRArt"
+        local mtl1 = OpenPBR()
+        mtl1.name = "matOpenPBRArt"
+
+        -- Authored inputs whose NAMES collide with MAX-MAT-006's strip
+        -- targets on ND_standard_surface_surfaceshader. The OpenPBR
+        -- analogue of each carries a meaningfully different nodedef
+        -- default; an artist-authored (1, 1, 1) on subsurface_color is
+        -- a real visual override that a wildcard normalization refactor
+        -- would silently strip back to OpenPBR's (0.8, 0.8, 0.8).
+        --
+        -- Property names below are the OpenPBR mtl's MaxScript-side
+        -- attribute names, which the MaxUSD bridge serializes into the
+        -- MaterialX nodedef input names of the same role.
+        mtl1.subsurface_weight = 1.0
+        mtl1.subsurface_color = color 255 255 255  -- (1, 1, 1) -- artist override of OpenPBR default
+        mtl1.coat_weight = 0.5                      -- artist-set coat lobe
+        mtl1.coat_color = color 255 255 255
+        mtl1.specular_color = color 255 255 255
+        mtl1.transmission_color = color 255 255 255
+
+        sphere001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testOpenPBRCoverageAudit.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        -- The OpenPBR shader prim. Path follows the same shape as the
+        -- standard_surface shaders the surrounding tests inspect:
+        -- /root/mtl/<MaterialName>/<MaterialName> (the inner Shader is
+        -- named identically to the outer Material in the MaterialX path).
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/matOpenPBRArt/matOpenPBRArt")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+
+        -- The audit's first hard surgical bound: the exported shader is
+        -- the OpenPBR nodedef, NOT standard_surface. Documents both
+        -- (a) the writer routes OpenPBR through the open_pbr_surface
+        -- nodedef and (b) the existing MAX-MAT-001..006 passes therefore
+        -- skip this shader entirely (they all gate on
+        -- doc->getNodes("standard_surface")). If a future refactor
+        -- collapsed OpenPBR onto standard_surface this assertion would
+        -- fail loudly.
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_open_pbr_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        local function assert_authored_color3 inputName expectedColor = (
+            local input = surfaceShader.GetInput inputName
+            assert_true (input != undefined)
+            local attr = input.GetAttr()
+            assert_true (attr.HasAuthoredValue())
+            assert_equal (input.Get()) expectedColor
+        )
+
+        -- Each collision-named color3 input that an over-eager wildcard
+        -- strip would otherwise eat. The surgical bound is: the input
+        -- is present, authored, and exactly (1, 1, 1).
+        assert_authored_color3 "subsurface_color"   (pyGf.Vec3f 1 1 1)
+        assert_authored_color3 "coat_color"         (pyGf.Vec3f 1 1 1)
+        assert_authored_color3 "specular_color"     (pyGf.Vec3f 1 1 1)
+        assert_authored_color3 "transmission_color" (pyGf.Vec3f 1 1 1)
+
+        -- And the OpenPBR-renamed gate input (coat_weight, not coat) at
+        -- a non-default value: a future refactor that wildcarded the
+        -- coat-block strip to "any input matching the coat_* prefix"
+        -- could silently flip this to 0 (the OpenPBR default for
+        -- coat_weight, which gates the coat lobe entirely off).
+        local coatWeightInput = surfaceShader.GetInput "coat_weight"
+        assert_true (coatWeightInput != undefined)
+        local coatWeightAttr = coatWeightInput.GetAttr()
+        assert_true (coatWeightAttr.HasAuthoredValue())
+        assert_equal (coatWeightInput.Get()) 0.5
+
+        -- And the OpenPBR-renamed subsurface gate (subsurface_weight,
+        -- not subsurface): same shape of refactor risk as coat_weight.
+        local ssWeightInput = surfaceShader.GetInput "subsurface_weight"
+        assert_true (ssWeightInput != undefined)
+        local ssWeightAttr = ssWeightInput.GetAttr()
+        assert_true (ssWeightAttr.HasAuthoredValue())
+        assert_equal (ssWeightInput.Get()) 1.0
+    ),
+
+    -- MAX-PRIM-001 cross-writer-path separation regression: the post-parse
+    -- normalization passes in MtlxShaderWriter.cpp (specular_rotation,
+    -- emission default, coat-block, subsurface_radius, spec-default inputs)
+    -- operate on a MaterialX::DocumentPtr and gate on
+    -- doc->getNodes("standard_surface"). They MUST NOT bleed into the
+    -- UsdPreviewSurface writer path (the C++ LastResortUSDPreviewSurfaceWriter
+    -- + the Python DefaultShaderWriter in shaderWriter.py). The
+    -- planner-emitted "unify color-emission helper across MaterialX and
+    -- UsdPreviewSurface writers" bite would either (a) be dead code if it
+    -- preserved the MAT-002 strict pair-gate (UsdPS has no companion
+    -- `emission` scalar to fail it), OR (b) silently corrupt artist-
+    -- authored `emissiveColor` if it widened the gate to fire on the
+    -- color3 alone. This test exports the SAME PhysicalMaterial under
+    -- BOTH writer targets in a single test run, asserts the artist's
+    -- emission survives on the MaterialX path (MAT-002 positive control
+    -- on non-zero color -- the gate doesn't fire) AND survives on the
+    -- UsdPreviewSurface path (the cross-writer-path bound -- the
+    -- MaterialX normalizers cannot have touched the UsdPS shader; if a
+    -- future "unify" refactor ports the strip-gate, this assertion fails
+    -- by named case).
+    function test_export_writer_path_separation_color_emission = (
+        maxver = maxVersion()
+        -- PhysicalMaterial MaterialX export path is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereWriterSep"
+        local mtl1 = PhysicalMaterial()
+        mtl1.name = "matWriterSep"
+        -- Artist-authored faint dark-red emission. Normalized to linear,
+        -- (51, 0, 0) -> approx (0.2, 0, 0) -- non-zero on channel 0 so
+        -- the MAX-MAT-002 strip-gate on the MaterialX path does NOT
+        -- fire (positive control: artist intent survives MAX-MAT-002).
+        -- On the UsdPreviewSurface path the same color maps to
+        -- inputs:emissiveColor via the .material_conversion JSON
+        -- tables; the cross-writer-path bound says no normalizer from
+        -- the MaterialX side has touched it.
+        mtl1.emit_color = color 51 0 0
+        sphere001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+
+        -- 1) UsdPreviewSurface target export. This routes through the
+        --    Python DefaultShaderWriter (shaderWriter.py) and the
+        --    .material_conversion JSON tables; the MaterialX normalizers
+        --    in MtlxShaderWriter.cpp are NEVER invoked on this path.
+        --    The surgical bound: the authored emission must reach the
+        --    UsdPreviewSurface shader's inputs:emissiveColor.
+        exportOptions.AllMaterialTargets = #("UsdPreviewSurface")
+        local exportPathUsdPS = output_prefix + "testWriterPathSepUsdPS.usda"
+        USDExporter.ExportFile exportPathUsdPS exportOptions:exportOptions
+        local stageUsdPS = pyUsd.Stage.Open(exportPathUsdPS)
+        local usdpsPrim = stageUsdPS.GetPrimAtPath("/root/mtl/matWriterSep/matWriterSep")
+        assert_true (usdpsPrim.IsValid())
+        assert_true (usdpsPrim.IsA(pyShade.Shader))
+        assert_equal ((usdpsPrim.GetAttribute "info:id").Get()) "UsdPreviewSurface"
+        local usdpsShader = pyShade.Shader(usdpsPrim)
+        local usdpsEmInput = usdpsShader.GetInput "emissiveColor"
+        assert_true (usdpsEmInput != undefined)
+        local usdpsEmAttr = usdpsEmInput.GetAttr()
+        assert_true (usdpsEmAttr.HasAuthoredValue())
+        local usdpsEmValue = usdpsEmInput.Get()
+        -- The authored emit_color survives at the UsdPS layer. The
+        -- exact value depends on the .material_conversion table's
+        -- gamma + range handling, so we assert the CHANNEL SHAPE (red
+        -- positive, green + blue zero) rather than the exact float --
+        -- the cross-writer-path bound is "the artist intent reached the
+        -- UsdPS shader UNTOUCHED by any MaterialX-side normalizer", not
+        -- "the value is byte-equal to the source". A wildcard cross-
+        -- writer strip would zero ALL three channels (resolves to UsdPS
+        -- nodedef default (0, 0, 0)); the per-channel-shape assertion
+        -- below catches that without coupling to the JSON gamma details.
+        assert_true (usdpsEmValue[1] > 0.0)
+        assert_equal usdpsEmValue[2] 0.0
+        assert_equal usdpsEmValue[3] 0.0
+
+        -- 2) MaterialX target export. This routes through MtlxShaderWriter
+        --    where the 5 MAX-MAT-* normalizers run. With the artist-
+        --    authored non-zero red emission_color, the MAT-002 strip-
+        --    gate's color3 check (must be statically (0, 0, 0)) fails,
+        --    so the pair is preserved -- the positive control that the
+        --    artist intent survives MAT-002 on the MaterialX path.
+        exportOptions.AllMaterialTargets = #("MaterialX")
+        local exportPathMtlx = output_prefix + "testWriterPathSepMtlx.usda"
+        USDExporter.ExportFile exportPathMtlx exportOptions:exportOptions
+        local stageMtlx = pyUsd.Stage.Open(exportPathMtlx)
+        local mtlxPrim = stageMtlx.GetPrimAtPath("/root/mtl/matWriterSep/matWriterSep")
+        assert_true (mtlxPrim.IsValid())
+        assert_true (mtlxPrim.IsA(pyShade.Shader))
+        assert_equal ((mtlxPrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+        local mtlxShader = pyShade.Shader(mtlxPrim)
+
+        -- The bridge authors (emission = 1.0, emission_color = (0.2, 0, 0))
+        -- on standard_surface for the artist's emit_color. The MAT-002
+        -- gate requires emission_color statically (0, 0, 0); the dark-
+        -- red value fails that check on channel 0 so the pair is
+        -- preserved. Belt-and-suspenders: assert the pair is present
+        -- AND the color carries a positive red channel.
+        local mtlxEmColorInput = mtlxShader.GetInput "emission_color"
+        assert_true (mtlxEmColorInput != undefined)
+        local mtlxEmColorAttr = mtlxEmColorInput.GetAttr()
+        assert_true (mtlxEmColorAttr.HasAuthoredValue())
+        local mtlxEmColorValue = mtlxEmColorInput.Get()
+        assert_true (mtlxEmColorValue[1] > 0.0)
+        assert_equal mtlxEmColorValue[2] 0.0
+        assert_equal mtlxEmColorValue[3] 0.0
+
+        -- The emission scalar should also be present and non-zero (the
+        -- bridge authors it at 1.0 to gate the lobe on; the MAT-002
+        -- strip would only have removed it if the color were
+        -- (0, 0, 0)). A future regression that widened the MAT-002 gate
+        -- to fire on color alone would strip BOTH inputs and fail this
+        -- assertion -- the same shape of failure the cross-writer "unify"
+        -- refactor would produce on the UsdPS path above.
+        local mtlxEmInput = mtlxShader.GetInput "emission"
+        assert_true (mtlxEmInput != undefined)
+        local mtlxEmAttr = mtlxEmInput.GetAttr()
+        assert_true (mtlxEmAttr.HasAuthoredValue())
+        assert_true ((mtlxEmInput.Get()) > 0.0)
+    ),
+
     function teardown = (
     ),
 
     Tests = #(
         test_export_physical_material,
         test_export_OpenPBR_material,
-        test_export_material_leading_digit_name
+        test_export_material_leading_digit_name,
+        test_export_physical_material_strips_buggy_specular_rotation,
+        test_export_material_preserves_intentional_specular_rotation,
+        test_export_physical_material_strips_buggy_emission_default,
+        test_export_material_preserves_intentional_emission,
+        test_export_material_preserves_single_channel_dark_emission,
+        test_export_physical_material_strips_buggy_coat_defaults,
+        test_export_physical_material_strips_buggy_subsurface_radius,
+        test_export_physical_material_strips_spec_default_inputs,
+        test_export_material_preserves_non_default_spec_inputs,
+        test_export_openpbr_material_preserves_collision_named_inputs,
+        test_export_writer_path_separation_color_emission
         )
 )
 

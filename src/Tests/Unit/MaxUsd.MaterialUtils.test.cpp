@@ -24,28 +24,32 @@ using namespace MaxUsd;
 
 TEST(MaterialUtilsTest, CreateSubsetName)
 {
-	// null material should return _{materialId}_
-	EXPECT_EQ(MaterialUtils::CreateSubsetName(nullptr, 0), "_1_");
-	EXPECT_EQ(MaterialUtils::CreateSubsetName(nullptr, 5), "_6_");
-	EXPECT_EQ(MaterialUtils::CreateSubsetName(nullptr, 10), "_11_");
+	// MAX-GEO-003: null material should return mat_{maxScriptId}
+	// (replaces the legacy underscore-wrapped `_{N}_` pattern).
+	EXPECT_EQ(MaterialUtils::CreateSubsetName(nullptr, 0), "mat_1");
+	EXPECT_EQ(MaterialUtils::CreateSubsetName(nullptr, 5), "mat_6");
+	EXPECT_EQ(MaterialUtils::CreateSubsetName(nullptr, 10), "mat_11");
 
-	// single material should return _{materialId}_
+	// MAX-GEO-003: single (non-Multi) material should return mat_{maxScriptId}
+	// -- same fallback as the null case.
 	MSTR mtlName = L"some material name";
 	std::string stringMtlName = mtlName.ToCStr().data();
 	MockStdMat mockMtl;
 	Mtl* mtl = static_cast<Mtl*>(&mockMtl);
 	mtl->SetName(mtlName);
-	EXPECT_EQ(MaterialUtils::CreateSubsetName(mtl, 0), "_1_");
-	EXPECT_EQ(MaterialUtils::CreateSubsetName(mtl, 5), "_6_");
-	EXPECT_EQ(MaterialUtils::CreateSubsetName(mtl, 10), "_11_");
+	EXPECT_EQ(MaterialUtils::CreateSubsetName(mtl, 0), "mat_1");
+	EXPECT_EQ(MaterialUtils::CreateSubsetName(mtl, 5), "mat_6");
+	EXPECT_EQ(MaterialUtils::CreateSubsetName(mtl, 10), "mat_11");
 
-	// multi material without slot name return _{materialId}_{subMaterialName}
+	// MAX-GEO-003: multi material without slot name returns
+	// mat_{maxScriptId}_{subMaterialName} (replaces the legacy
+	// `_{N}_{subMaterialName}` which still emitted a leading underscore).
 	MockMultiMtl* mockMultiMtl = new MockMultiMtl();
 	Mtl* multiMtl = static_cast<Mtl*>(mockMultiMtl);
 	mockMultiMtl->AddMtl(mtl, 2, nullptr);
-	EXPECT_EQ(MaterialUtils::CreateSubsetName(mockMultiMtl, 2), "_3_some_material_name");
+	EXPECT_EQ(MaterialUtils::CreateSubsetName(mockMultiMtl, 2), "mat_3_some_material_name");
 
-	// multi material with slot name should return the name
+	// multi material with slot name should return the name (unchanged behavior).
 	std::wstring slotName = L"material slot name";
 	mockMultiMtl->AddMtl(mtl, 3, slotName.c_str());
 	EXPECT_EQ(MaterialUtils::CreateSubsetName(mockMultiMtl, 3), "material_slot_name");
