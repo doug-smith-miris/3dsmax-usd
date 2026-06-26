@@ -44,6 +44,93 @@ MaxUsdPhotometricLightWriter::MaxUsdPhotometricLightWriter(
 {
 }
 
+// MAX-LIT-001 surgical bounds (writer-registry bottom bound for lights;
+// the gate below is the ONLY general-purpose light writer in the plugin,
+// so every non-LIGHTSCAPE_LIGHT_CLASS light that reaches this CanExport
+// returns ContextSupport::Unsupported and -- because no other registered
+// PrimWriter claims a LightObject node -- falls through
+// MaxUsdPrimWriterRegistry::FindWriter to nullptr, which is the silent
+// drop: NO UsdLux* prim is authored, NO error fires, NO warning fires).
+// Enforced by the regression suite via
+// src/Tests/Integration/export_light_test.ms ::
+//     photometric_light_writer_legacy_dropout_audit_test
+//                 (Omnilight + Skylight in scene alongside a Free_Point
+//                  photometric positive control -> exported stage has
+//                  the UsdLuxDiskLight for the photometric AND NO prims
+//                  at the legacy lights' paths; the positive control
+//                  pins that the gate still fires for in-scope lights,
+//                  while the two negative cases pin the bottom bound)
+// plus the doc-linked Python validator
+// validate_legacy_lights_dropout_surgical.py (8 cases + idempotence,
+// mirrors the writer-registry decision over a synthetic per-light-class
+// fixture):
+//
+//   * exportArgs.GetTranslateLights() == false: every light, including
+//     in-scope photometrics, returns Unsupported. The "no lights at all"
+//     short-circuit is honoured BEFORE the class-id gate so a user who
+//     disables light export sees the same nullptr from FindWriter for
+//     every light type; this is intentional and is NOT the silent-drop
+//     defect. Pinned by the photometric_light_general_attributes_export
+//     happy-path test, which fails if the option is broken.
+//
+//   * LIGHTSCAPE_LIGHT_CLASS subclass (Free_Point / Free_Sphere /
+//     Free_Disc / Free_Linear / Free_Cylinder / Free_Area + every
+//     _Target sibling): returns ContextSupport::Fallback. Authored as
+//     the right UsdLux* per the conversion grid in
+//     PhotometricLightWriter::GetPrimType. This is the IN-SCOPE branch
+//     MAX-LIT-002 audited end-to-end (IES file path + Kelvin/filter
+//     dichotomy). Pinned by every photometric_*_attributes_export_test
+//     in export_light_test.ms.
+//
+//   * NOT a LIGHTSCAPE_LIGHT_CLASS subclass, IS a LightObject subclass
+//     (Omnilight = OMNI_LIGHT_CLASS_ID; Skylight = SKYLIGHT_CLASS_ID;
+//     legacy Spot = SPOT_LIGHT_CLASS_ID + Free_Spot/Target_Spot;
+//     legacy Directional = DIR_LIGHT_CLASS_ID + Free_Direct/Target_Direct;
+//     mr_Sky / mr_Sun / Daylight = third-party / legacy DCC-side
+//     environment lights NOT photometric): returns Unsupported. With
+//     no other registered PrimWriter that claims a LightObject node,
+//     FindWriter returns nullptr -> NO UsdLux* prim is authored -> the
+//     light is silently dropped from the exported stage. The cataloged
+//     MAX-LIT-001 baseline defect (see
+//     /Users/d.smith/.../knowledge/usd-export-issues-catalog.md MAX-LIT-001
+//     "Legacy standard lights do not export to UsdLux"). This audit
+//     does NOT fix the silent drop -- it pins the bound so any future
+//     PR that widens this gate to claim legacy LightObjects (e.g. via
+//     a wildcard "fall back to a SphereLight for every LightObject"
+//     widening) lands its widening with a corresponding decision-table
+//     update + per-class attribute-translation + visual auditor pair,
+//     rather than silently authoring spurious UsdLuxSphereLight prims
+//     with default 1.0 intensity at every legacy-light position.
+//     Pinned by the photometric_light_writer_legacy_dropout_audit_test
+//     above.
+//
+//   * NOT a LightObject subclass at all (any non-light node that
+//     happens to reach this CanExport because TF_FOR_ALL iterates the
+//     full registry per node): returns Unsupported. The
+//     IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS) check is safe to call on a
+//     non-light Object because the Object base class implements it.
+//     This is the trivial-rejection case, not the silent-drop defect.
+//
+// Why the wildcard widening would be wrong: the planner's MAX-LIT-001
+// rationale ("Legacy Skylight + Omnilight silently dropped from USD
+// export (lighting fidelity)") might be read as "extend
+// PhotometricLightWriter::CanExport to ContextSupport::Fallback for
+// every LightObject and stamp out SphereLight / DistantLight per class".
+// That widening would (a) author every Omnilight as a default-intensity
+// UsdLuxSphereLight at the Omnilight's transform, producing a brand-new
+// light pool the source scene never asked for if the Omnilight was
+// turned OFF / set to multiplier=0 / set to a non-default attenuation
+// / set to a non-default color, all of which it would silently lose;
+// (b) author every Skylight as a default UsdLuxDomeLight at unit
+// intensity, swamping the scene with dome lighting that the source
+// Skylight (a hemispherical environment integrator with its own
+// rayCount / castShadows / sky color / map dependency) didn't actually
+// produce; (c) author every legacy Spot/Free_Direct as a UsdLuxDiskLight
+// without the hotspot / falloff / spotlight attenuation Max applies.
+// The right per-class translation is a SEPARATE bite per legacy class
+// with its own attribute mapping + its own MaxScript regression + its
+// own doc entry; this audit pins the bottom bound so those follow-on
+// bites are visible as widenings rather than landing silently.
 MaxUsdPrimWriter::ContextSupport MaxUsdPhotometricLightWriter::CanExport(
     INode*                                node,
     const MaxUsd::USDSceneBuilderOptions& exportArgs)

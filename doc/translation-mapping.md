@@ -77,6 +77,7 @@ Status legend:
 | 3ds Max OpenPBR material (`OpenPBR()`, Max 2025.3+) exported via the MaterialX target | `ND_open_pbr_surface_surfaceshader` shader prim (MaterialX 1.39 OpenPBR Surface v1.1) -- NOT touched by any of the five MAX-MAT-001/002/004/005/006 normalization passes. The passes are gated `doc->getNodes("standard_surface")` and skip the OpenPBR shader entirely | audit (lock-in of existing surgical-coverage bound, no C++ logic change) | `ND_standard_surface_surfaceshader` (the audit pins the surgical bound where the passes STOP) | `MtlxShaderWriter::Write` is invoked on an OpenPBR-bound material. Surgical bounds: (a) every existing MAX-MAT-* pass iterates `doc->getNodes("standard_surface")`, returning an empty list when the shader's MaterialX node category is `open_pbr_surface`; (b) name-collision-named inputs (`coat_color`, `subsurface_color`, `specular_color`, `transmission_color` -- all color3, plus `subsurface_radius` which on open_pbr_surface is type=`float` rather than `color3` as on standard_surface) survive verbatim, including artist-authored `subsurface_color = (1, 1, 1)` which would visually shift to the OpenPBR default `(0.8, 0.8, 0.8)` if the passes were widened; (c) renamed gate inputs (`coat_weight` -> standard_surface `coat`; `subsurface_weight` -> `subsurface`; `transmission_weight` -> `transmission`; `coat_ior` -> `coat_IOR`; `specular_ior` -> `specular_IOR`; `emission_luminance` -> `emission`; `specular_roughness_anisotropy` -> `specular_anisotropy`) are likewise untouched; (d) idempotence -- a second run of the pass chain on the same exported doc does nothing more than the first | MAX-MAT-007 | 2026-06-26 |
 | Color / emission helper code in the MaterialX writer (`MtlxShaderWriter.cpp` post-parse normalization passes) vs the UsdPreviewSurface writer (C++ `LastResortUSDPreviewSurfaceWriter.cpp` + Python `DefaultShaderWriter` in `shaderWriter.py`) | NO shared helper, by design. The 5 MaterialX-side passes (specular_rotation, emission default, coat-block, subsurface_radius, spec-default inputs) operate on a `MaterialX::DocumentPtr` and gate on `doc->getNodes("standard_surface")`. The UsdPreviewSurface writer path operates either directly on a `Mtl*` (LastResort C++) or via the `.material_conversion` JSON tables (Python DefaultShaderWriter) -- it has no MaterialX document, no emission-strip helpers, and no shared abstraction with the MaterialX writer | audit (lock-in of existing cross-writer-path bound, no C++ logic change) | `ND_standard_surface_surfaceshader` only (the audit pins the surgical bound between the MaterialX writer's normalizer chain and the UsdPreviewSurface writer path) | `MtlxShaderWriter::Write` runs the chain of normalizers. Surgical bounds: (a) the chain operates on the in-memory MaterialX doc returned by `MtlxIOUtil.ExportMtlxString` and writes nothing to UsdShade until AFTER the chain completes; (b) the UsdPreviewSurface writer entry points (`LastResortUSDPreviewSurfaceWriter::Write` and the Python `DefaultShaderWriter.Write`) do not invoke, import, or share state with the MaterialX normalizers; (c) input vocabularies diverge on every concept the planner's "color-emission helper" could cover -- emissiveColor (UsdPS, color3f default (0,0,0)) vs emission + emission_color (MaterialX, scalar default 0.0 gating color3 default (1,1,1)); diffuseColor (UsdPS, color3f default (0.18,0.18,0.18)) vs base + base_color (MaterialX, scalar default 0.8 gating color3 default (0.8,0.8,0.8)); specularColor (UsdPS) + useSpecularWorkflow toggle vs specular + specular_color (MaterialX); plus topology-collisions (UsdPS opacity is float, MaterialX opacity is color3) and UsdPS-only inputs with no MaterialX analogue (useSpecularWorkflow, direct normal3f normal input); (d) idempotence -- re-running the 5 normalizers does not change behaviour on either side | MAX-PRIM-001 | 2026-06-26 |
 | MultiMtl-bound mesh whose faces carry multiple matIds (`materialIdToFacesMap.size() > 1`) | `UsdGeomMesh.primvars:displayColor` -- the MAX-MAT-003 displayColor block writes a SINGLE-element constant primvar derived from `boundMtl->GetDiffuse()` (which on a MultiMtl returns sub-material 0's diffuse via the default `mtlNum = 0`). The block does NOT consult `materialIdToFacesMap` and does NOT broadcast `boundMtl->GetDiffuse(matId)` per face | audit (lock-in of existing MAX-MAT-003 surgical-coverage bound, no C++ logic change) | (mesh primvar; not a shader nodedef -- the audit pins the surgical bound where the MAX-MAT-003 gate STOPS for MultiMtl-bound meshes) | `MeshConverter::ConvertToUSDMesh` is invoked on a mesh whose `node->GetMtl()` is a MultiMtl AND `materialIdToFacesMap.size() > 1`. Surgical bounds: (a) the displayColor block's `boundMtl->GetDiffuse()` call defaults `mtlNum = 0` and returns sub-mtl 0's diffuse, regardless of how many matIds the mesh carries; (b) the resulting `primvars:displayColor` is a SINGLE-element array with `interpolation = constant` -- the C++ block does not consume `materialIdToFacesMap` even though `ApplyMaxMaterialIDs` (called immediately before the block) does use it to author per-face GeomSubsets in the `materialBind` family (MAX-GEO-002); (c) a wildcard "extend MAX-MAT-003 to per-face for MultiMtl bindings" widening would consume the same `materialIdToFacesMap` to broadcast `boundMtl->GetDiffuse(matId)` per face, authoring `interpolation = uniform` and `len = materialIdToFacesMap.size()` -- the value at `displayColor[0]` would still be sub-mtl 0's diffuse, so every existing displayColor[0] / branch-label / IsAuthored assertion would pass; only the array-length and interpolation invariants catch this widening; (d) the IsAuthored() short-circuit and the wire-color fallback branches are unchanged on the MultiMtl path -- the bound applies only to the `mtl-diffuse` branch when the bound material is a MultiMtl | MAX-MAT-008 | 2026-06-26 |
+| 3ds Max legacy light classes that inherit `LightObject` but NOT `LightscapeLight` (`Omnilight` = `OMNI_LIGHT_CLASS_ID`; `Skylight` = `SKYLIGHT_CLASS_ID`; legacy `Target_Spot` / `Free_Spot` = `SPOT_LIGHT_CLASS_ID`; legacy `Target_Direct` / `Free_Direct` = `DIR_LIGHT_CLASS_ID`; mr_Sky, Daylight environment lights, etc.) | NO `UsdLux*` prim authored -- the writer-registry's only general-purpose light writer (`PhotometricLightWriter`) gates on `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)`, returns `ContextSupport::Unsupported` for every non-LightscapeLight, and `MaxUsdPrimWriterRegistry::FindWriter` returns nullptr (no other registered writer claims a `LightObject`). The light is silently dropped from the exported stage: no prim, no error, no warning | audit (lock-in of existing writer-registry surgical-coverage bound, no C++ logic change) | (UsdLux schema; not a shader nodedef -- the audit pins the writer-registry's bottom bound for lights) | `PhotometricLightWriter::CanExport` is invoked AND `!exportArgs.GetTranslateLights() || !object->IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)`. Surgical bounds: (a) the LIGHTSCAPE_LIGHT_CLASS branch returns `ContextSupport::Fallback` so in-scope photometric / physical lights are authored as the correct `UsdLuxDiskLight` / `UsdLuxRectLight` / `UsdLuxSphereLight` / `UsdLuxCylinderLight` per `GetPrimType` -- the positive control proves this still fires; (b) every non-LightscapeLight LightObject (legacy Omnilight, Skylight, Spot, Direct, etc.) returns Unsupported AND no other registered writer claims the LightObject category -- silent drop. A wildcard widening that returned `Fallback` for every LightObject and stamped out default UsdLuxSphereLight / UsdLuxDomeLight without per-class attribute translation would author spurious extra lights at every legacy light position (e.g. an Omnilight that was turned OFF / set to multiplier 0 / set to a non-default attenuation/color in Max would silently appear as a unit-intensity SphereLight in USD); (c) the `exportArgs.GetTranslateLights()` short-circuit fires BEFORE the class-id gate -- a user who disables light export sees the same nullptr for every light type, including in-scope photometrics; (d) `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)` is safely callable on non-light Objects (returns false) so the gate is well-behaved across all node types | MAX-LIT-001 | 2026-06-26 |
 
 ## Notes per expression
 
@@ -2471,6 +2472,252 @@ by `stageScale` — but that's a separate workflow change with UI and
 binding implications, deliberately out of scope for this observability
 bite.
 
+### Legacy `LightObject` lights (Omnilight / Skylight / legacy Spot / legacy Direct / mr_Sky / Daylight) → silently dropped at writer-registry  (audit, `PhotometricLightWriter::CanExport` STOPS HERE)  (MAX-LIT-001)
+
+**Symptom (covered before the audit, but uncovered by the suite).**
+3ds Max exposes two parallel families of light classes:
+
+* **Photometric / Physical lights** (the "Lightscape" family): physically
+  -based lights with intensity in candela / lumens, IES file support,
+  Kelvin temperature, six shape variants — Free_Point / Sphere / Disc /
+  Linear / Cylinder / Area — and a `_Target` sibling for each.
+* **Legacy standard lights** (the "Standard" family): the pre-Photometric
+  light set Max has carried since the earliest releases — Omnilight
+  (omnidirectional point light, `OMNI_LIGHT_CLASS_ID`), Skylight
+  (hemispherical environment integrator, `SKYLIGHT_CLASS_ID`), legacy
+  Spot (`Target_Spot` / `Free_Spot`, `SPOT_LIGHT_CLASS_ID`), legacy
+  Directional (`Target_Direct` / `Free_Direct`, `DIR_LIGHT_CLASS_ID`),
+  plus assorted third-party / DCC-side environment lights (mr_Sky,
+  Daylight, etc.).
+
+`MaxUsd_Translators/plugInfo.json` registers exactly two general-purpose
+light-relevant `PrimWriter`s — `PhotometricLightWriter` and
+`SunPositionerWriter`. The other base writers (`StageWriter`,
+`SkeletonWriter`, `SkinMorpherWriter`, `MeshWriter`, `CameraWriter`,
+`ShapeWriter`, `HelperWriter`) reject any `LightObject` node outright
+in their `CanExport` (they `dynamic_cast` to their own class). So for
+any light not claimed by `PhotometricLightWriter`, the writer-registry
+returns nullptr from `MaxUsdPrimWriterRegistry::FindWriter` and the
+node is silently dropped: no `UsdLux*` prim is authored, no error
+fires, no warning fires.
+
+`PhotometricLightWriter::CanExport` (`src/translators/PhotometricLightWriter.cpp`,
+post-MAX-LIT-001 comment block) gates on the LIGHTSCAPE_LIGHT_CLASS
+boundary:
+
+```cpp
+MaxUsdPrimWriter::ContextSupport MaxUsdPhotometricLightWriter::CanExport(
+    INode*                                node,
+    const MaxUsd::USDSceneBuilderOptions& exportArgs)
+{
+    if (!exportArgs.GetTranslateLights()) {
+        return ContextSupport::Unsupported;
+    }
+    const auto object = node->EvalWorldState(exportArgs.GetResolvedTimeConfig().GetStartTime()).obj;
+    return object->IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS) ? ContextSupport::Fallback
+                                                        : ContextSupport::Unsupported;
+}
+```
+
+This audit pins the SECOND branch — the silent-drop case — as the
+writer-registry's documented bottom bound for lights. The Photometric
+positive-control branch was already audited end-to-end as
+[[MAX-LIT-002]] (IES file path + Kelvin/filter dichotomy); the bottom
+bound below is what MAX-LIT-001 locks in.
+
+**Why this audit pins it.** The existing happy-path suite
+(`export_light_test.ms`) covers every Photometric light type +
+distribution combination but NEVER:
+
+* asserts that a legacy `Omnilight()` in the source Max scene fails
+  to produce a UsdLux prim,
+* asserts that a legacy `Skylight()` in the source Max scene fails
+  to produce a UsdLux prim,
+* asserts that the writer-registry rejection at the
+  LIGHTSCAPE_LIGHT_CLASS boundary still leaves the in-scope photometric
+  light authored (the positive control),
+* asserts that the `exportArgs.GetTranslateLights()` short-circuit
+  fires BEFORE the class-id gate (so a user who disables light export
+  sees the same nullptr-from-FindWriter behavior for every light type).
+
+The cataloged baseline at
+`/Users/d.smith/.../knowledge/usd-export-issues-catalog.md` (entry
+MAX-LIT-001, "Legacy standard lights do not export to UsdLux", severity
+High) names this as a known partial-loss defect. The fix itself — a
+proper per-class translation (Omnilight → SphereLight with intensity /
+attenuation / color / shadow attribute mapping; Skylight → DomeLight
+with sky color / map binding / ray-count mapping; legacy Spot → DiskLight
+with hotspot / falloff cone-angle mapping; legacy Direct → DistantLight)
+— is a separate per-class bite. THIS audit ships ONLY the lock-in: pin
+the bottom bound so any future "extend `PhotometricLightWriter::CanExport`
+to accept LightObject" wildcard widening lands its widening with a
+corresponding decision-table update + per-attribute translation, rather
+than silently authoring spurious default-intensity `UsdLuxSphereLight`
++ `UsdLuxDomeLight` prims at every legacy-light position.
+
+A regression that:
+
+* Returned `ContextSupport::Fallback` for every `LightObject` (e.g.
+  `return object->IsSubClassOf(LightObject) ? Fallback : Unsupported`)
+  AND let the default `GetPrimType` branch fall through to
+  `UsdLuxSphereLight` for the unmapped case — would silently produce
+  a unit-intensity SphereLight at every Omnilight position in every
+  legacy scene. An Omnilight that was turned OFF / set to multiplier
+  0 / set to a non-default attenuation / set to a non-default color
+  in Max would all silently appear as a default unit-intensity
+  white SphereLight in USD.
+* Removed the `exportArgs.GetTranslateLights()` short-circuit (or
+  re-ordered it AFTER the class-id check) — would still drop legacy
+  lights but would silently change the meaning of
+  `exportOptions.Lights = false` for in-scope photometrics.
+* Added a "fallback default writer" for unknown LightObjects in the
+  `PrimWriterRegistry::FindWriter` nullptr branch — would silently
+  start authoring some UsdLux prim for every legacy light, with no
+  signal to the artist that the appearance has diverged from the
+  source scene.
+
+…would pass every existing test in `export_light_test.ms` because no
+test ever inspects a stage exported from a scene containing legacy
+LightObject lights.
+
+**Bounds (where the gate conservatively does nothing):**
+
+* `exportArgs.GetTranslateLights() == false` — every light, including
+  in-scope photometrics, returns `Unsupported` and FindWriter returns
+  nullptr. The "no lights at all" short-circuit is honoured BEFORE the
+  class-id gate so a user who disables light export sees the same
+  nullptr from FindWriter for every light type. This is intentional
+  and is NOT the silent-drop defect this audit pins.
+* `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS) == true` — returns
+  `ContextSupport::Fallback`. Authored as the right UsdLux*  per the
+  PhotometricLightWriter conversion grid (the in-scope branch
+  [[MAX-LIT-002]] audited end-to-end).
+* `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS) == false` AND
+  `IsSubClassOf(LightObject) == true` — every legacy light class.
+  Returns `Unsupported` and (since no other writer claims a LightObject)
+  the writer-registry silently drops the node. This is the surgical
+  bound this audit pins.
+* `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS) == false` AND
+  `IsSubClassOf(LightObject) == false` — any non-light node that
+  happens to reach this CanExport (e.g. a Mesh, a Camera). Returns
+  `Unsupported`. The trivial-rejection case; another writer (MeshWriter,
+  CameraWriter, etc.) is expected to claim. Not the silent-drop defect.
+
+**Why the wildcard widening would be wrong.** The catalog MAX-LIT-001
+rationale ("Legacy Skylight + Omnilight silently dropped from USD
+export (lighting fidelity)") might be read as "extend
+`PhotometricLightWriter::CanExport` to claim every LightObject". That
+widening would author:
+
+* Every Omnilight as a default-intensity `UsdLuxSphereLight` at the
+  Omnilight's transform — producing a brand-new light pool the source
+  scene never asked for if the Omnilight was turned OFF, set to
+  multiplier 0, set to a non-default attenuation, or set to a
+  non-default color. All of which it would silently lose.
+* Every Skylight as a unit-intensity `UsdLuxDomeLight` — swamping the
+  scene with dome lighting that the source Skylight (a hemispherical
+  environment integrator with its own rayCount / castShadows / sky
+  color / map dependency) didn't actually produce.
+* Every legacy Spot/Free_Direct as a `UsdLuxDiskLight` without the
+  hotspot / falloff / spotlight attenuation Max applies — producing
+  a wider, brighter spot than the source.
+
+The right per-class translation is a SEPARATE bite per legacy class
+with its own attribute mapping + its own MaxScript regression + its
+own doc entry. This audit pins the bottom bound so those follow-on
+bites are visible as widenings rather than landing silently — once a
+proper Omnilight writer lands, the corresponding line in the audit's
+case table flips from "silent drop" to "claimed by OmnilightWriter,
+attributes translated per its own surgical bounds".
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/e380e9cc-a1c5-4b85-ac37-f234554dd28d/validate_legacy_lights_dropout_surgical.py`
+mirrors the writer-registry decision at the USD layer over a synthetic
+per-light-class fixture. 8 cases + idempotence + a positive-control
+sanity pass + a TranslateLights-off short-circuit pass:
+
+| Case | Max class taxonomy | TranslateLights | CanExport returns | FindWriter result | UsdLux prim authored? |
+| --- | --- | --- | --- | --- | --- |
+| `PhotometricFreePointInScope` | LightscapeLight2 subclass | true | Fallback | PhotometricLightWriter | UsdLuxDiskLight |
+| `PhotometricCylinderTargetInScope` | LightscapeLight2 subclass | true | Fallback | PhotometricLightWriter | UsdLuxCylinderLight |
+| `LegacyOmnilight` | LightObject, NOT LightscapeLight | true | Unsupported | nullptr (silent drop) | — |
+| `LegacySkylight` | LightObject, NOT LightscapeLight | true | Unsupported | nullptr (silent drop) | — |
+| `LegacyTargetSpot` | LightObject, NOT LightscapeLight | true | Unsupported | nullptr (silent drop) | — |
+| `LegacyTargetDirectional` | LightObject, NOT LightscapeLight | true | Unsupported | nullptr (silent drop) | — |
+| `PhotometricFreePointWithLightsOff` | LightscapeLight2 subclass | false | Unsupported (short-circuit) | nullptr | — |
+| `NonLightObject` | GeomObject (not a light at all) | true | Unsupported | OtherWriterPresumed (MeshWriter etc.) | (placeholder Xform) |
+
+Plus the idempotence check (re-authoring the same fixture produces an
+identical prim-path set), the positive-vs-negative sanity check (≥2
+UsdLux prims survive AND none of the legacy names carry UsdLux prims),
+and the TranslateLights-off short-circuit pass (all 7 light cases drop).
+All 25 assertions pass on the 2026-06-26 baseline against pxr.Usd
+0.25.5, locking in the writer-registry's bottom bound. A future
+regression that widened the gate would fail by named case rather than
+just "some light disappeared somewhere".
+
+**MaxScript regression.**
+`src/Tests/Integration/export_light_test.ms` now carries
+`photometric_light_writer_legacy_dropout_audit_test`. It constructs a
+scene with three lights — a `free_light()` of type `#Free_Point` (the
+LIGHTSCAPE_LIGHT_CLASS positive control), an `omniLight()` (the legacy
+Omnilight negative case), and a `Skylight()` (the legacy Skylight
+negative case) — exports through `USDExporter` with `Lights = true`,
+and asserts the photometric DiskLight IS authored at its expected path
+while NEITHER legacy light has a prim at its expected path. A final
+`Lights = false` re-export pins the option-gate-fires-first short-circuit.
+
+**Visual demonstration of the surgical bound.** A neutral probe
+fixture — a matte-grey sphere on a matte-grey ground plane lit by ONE
+photometric Free_Point (a warm-tungsten `UsdLuxDiskLight`) on the LEFT
+— is rendered twice in Karma CPU:
+
+* `render_karma_postfix.png` — the CURRENT correct behavior. ONLY the
+  photometric DiskLight is authored. The sphere reads warm on its
+  LEFT hemisphere from the in-scope photometric pool; the RIGHT
+  hemisphere is visibly DARKER (the source Omnilight that sat there
+  was silently dropped); a long soft shadow extends from the sphere
+  to the RIGHT across the ground plane. Foreground mean intensity
+  R=104.80 / G=99.32 / B=93.27 / 255.
+* `render_unreal_reference.png` — the wildcard widening counterfactual.
+  Same scene PLUS a spurious cool-blue `UsdLuxSphereLight` on the
+  right (the widening of `Omnilight()`) PLUS a `UsdLuxDomeLight` wash
+  (the widening of `Skylight()`). The sphere reads bright on BOTH
+  hemispheres; the right-side shadow is much fainter; the overall
+  scene is brighter and cooler from the dome contribution.
+  Foreground mean intensity R=152.96 / G=152.15 / B=150.59 / 255.
+
+Delta (postfix − reference): **R = −48.17, G = −52.83, B = −57.33 / 255**
+— postfix is uniformly darker by ~48-57/255 across every channel, with
+the largest swing on BLUE because the wildcard counterfactual lights
+are explicitly cool-blue. 50.04% of pixels in the frame have a
+non-zero per-pixel Manhattan delta (mean delta 79.17 / 765). PNGs are
+SHA-256-distinct (`0ffbcc80c0d66c1b…` vs `46b889329234dbb4…`).
+`compare_side_by_side.png` is the auditor's at-a-glance composite.
+
+The auditor's checklist: **postfix has only the warm pool on the LEFT
+with a visibly dark RIGHT hemisphere AND a long soft right-side
+shadow; still-broken has uniform brightness across the sphere AND a
+faint-to-absent right-side shadow AND the mean foreground intensities
+trend UP on every channel with the largest swing on BLUE.** A
+refactor that ever made postfix bright on the right side or made the
+right-side shadow disappear would mean the writer-registry has started
+authoring spurious UsdLux prims for legacy LightObjects and the
+silent-drop contract has broken.
+
+**Retirement condition.** This audit retires the day a proper per-class
+legacy-light writer lands (e.g. a `MaxUsdLegacyOmnilightWriter`
+registered in `plugInfo.json` that returns `ContextSupport::Fallback`
+for `OMNI_LIGHT_CLASS_ID` and authors a `UsdLuxSphereLight` with
+intensity / attenuation / color / shadow mapping translated from the
+source `OmniLight`). At that point the `LegacyOmnilight` row in the
+case table flips from "silent drop" to "claimed by
+LegacyOmnilightWriter, attributes translated per MAX-LIT-003 surgical
+bounds" (or whichever MAX-LIT-* ID lands the writer), and a new audit
+ships with the per-attribute lock-in. Until those per-class writers
+land, the silent drop is the documented, locked-in behaviour and this
+audit prevents it from being silently widened.
+
 ### Photometric / Physical light `.webFile` → UsdLuxShapingAPI.shaping:ies:file  (MAX-LIT-002, IES branch)
 
 **Symptom (covered before the audit, but uncovered by the suite).**
@@ -3757,3 +4004,113 @@ artist-visible primvar-fallback output on every MultiMtl-bound export.
   broken. No C++ logic change in this bite — purely additive
   observability + test + doc infrastructure that locks in the
   surgical contract.
+* 2026-06-26 — MAX-LIT-001 legacy `LightObject` writer-registry
+  bottom-bound audit: introduce the MAX-LIT-001 entry to the mapping
+  doc, locking in the silent-drop bound that
+  `PhotometricLightWriter::CanExport` enforces for every
+  non-`LIGHTSCAPE_LIGHT_CLASS` light. The plugin registers exactly
+  two general-purpose light-relevant `PrimWriter`s — `PhotometricLightWriter`
+  (which gates on the LightscapeLight2 class hierarchy) and
+  `SunPositionerWriter` (narrowly handles only `SunPositioner`). Every
+  other base writer rejects `LightObject` nodes outright via their own
+  `dynamic_cast`. So for any source-Max light that is a `LightObject`
+  but NOT a `LightscapeLight` — the legacy `Omnilight`
+  (`OMNI_LIGHT_CLASS_ID`), `Skylight` (`SKYLIGHT_CLASS_ID`), legacy
+  `Target_Spot` / `Free_Spot` (`SPOT_LIGHT_CLASS_ID`), legacy
+  `Target_Direct` / `Free_Direct` (`DIR_LIGHT_CLASS_ID`), plus
+  third-party / DCC-side environment lights like mr_Sky and Daylight —
+  the writer-registry returns nullptr from
+  `MaxUsdPrimWriterRegistry::FindWriter` and the light is silently
+  dropped: NO `UsdLux*` prim is authored, NO error fires, NO warning
+  fires. The catalog entry at
+  `/Users/d.smith/.../knowledge/usd-export-issues-catalog.md` MAX-LIT-001
+  names this as a known partial-loss defect with severity High; the
+  planner auto-emitted this bite without a captured corpus of per-class
+  attribute leaks (rationale "Legacy Skylight + Omnilight silently
+  dropped from USD export (lighting fidelity)"). **Why the wildcard
+  widening would be wrong**: the literal reading would be a one-line
+  widening of `PhotometricLightWriter::CanExport` to return
+  `ContextSupport::Fallback` for every `LightObject` (e.g.
+  `return object->IsSubClassOf(LightObject) ? Fallback : Unsupported`).
+  That widening would author every Omnilight as a default-intensity
+  `UsdLuxSphereLight` at the Omnilight's transform — producing a
+  brand-new light pool the source scene never asked for if the
+  Omnilight was turned OFF, set to multiplier 0, set to a non-default
+  attenuation, or set to a non-default color, all of which it would
+  silently lose; every Skylight as a unit-intensity `UsdLuxDomeLight`,
+  swamping the scene with dome lighting that the source Skylight (a
+  hemispherical environment integrator with its own rayCount /
+  castShadows / sky color / map dependency) didn't actually produce;
+  every legacy `Spot` / `Free_Direct` as a `UsdLuxDiskLight` without
+  the hotspot / falloff / spotlight attenuation Max applies. The
+  right per-class translation is a SEPARATE bite per legacy class
+  with its own attribute mapping + its own MaxScript regression + its
+  own doc entry. This audit ships only the lock-in: pin the bottom
+  bound so any future widening lands its widening visibly (as a
+  decision-table update + per-class attribute audit) rather than
+  silently authoring spurious default-intensity prims. Surgical-bounds
+  comment block added above `PhotometricLightWriter::CanExport`
+  enumerating the four branches the gate currently handles (lights-off
+  short-circuit, in-scope LightscapeLight, legacy LightObject silent
+  drop, non-light Object) plus the wildcard-widening counterfactual
+  table. New MaxScript regression
+  `photometric_light_writer_legacy_dropout_audit_test` added to
+  `src/Tests/Integration/export_light_test.ms`: builds a scene with a
+  `free_light()` of type `#Free_Point` (the LIGHTSCAPE_LIGHT_CLASS
+  positive control), an `omniLight()` (the legacy Omnilight negative
+  case), and a `Skylight()` (the legacy Skylight negative case),
+  exports through `USDExporter` with `Lights = true`, and asserts the
+  photometric DiskLight IS authored at its expected path AND neither
+  legacy light has a prim at its expected path. A final
+  `Lights = false` re-export pins the option-gate-fires-first
+  short-circuit. Python validator
+  `validate_legacy_lights_dropout_surgical.py` (25 assertions: 15
+  shape assertions across 8 named cases + 1 idempotence + 2
+  positive-vs-negative sanity + 7 TranslateLights-off short-circuit
+  checks) mirrors the writer-registry decision at the USD layer over
+  a synthetic per-light-class fixture. The case table pins
+  `PhotometricFreePointInScope` and `PhotometricCylinderTargetInScope`
+  as LIGHTSCAPE_LIGHT_CLASS positive controls (both produce the
+  expected UsdLux* prim), then `LegacyOmnilight`, `LegacySkylight`,
+  `LegacyTargetSpot`, `LegacyTargetDirectional` as the four silent-
+  drop cases, then `PhotometricFreePointWithLightsOff` as the
+  TranslateLights short-circuit, then `NonLightObject` as the
+  not-a-light trivial-rejection case. All 25 assertions pass on the
+  2026-06-26 baseline against pxr.Usd 0.25.5. Visual auditor pair: a
+  neutral probe (matte-grey sphere + ground plane + one warm-tungsten
+  photometric `UsdLuxDiskLight` on the LEFT) renders twice in Karma
+  CPU. `render_karma_postfix.png` carries ONLY the in-scope
+  photometric pool; the sphere's RIGHT hemisphere reads visibly
+  DARKER (the source Omnilight that sat there was silently dropped)
+  and a long soft shadow extends from the sphere to the RIGHT
+  across the ground plane (foreground mean R=104.80 / G=99.32 /
+  B=93.27 / 255). `render_unreal_reference.png` is the wildcard
+  widening counterfactual: the same scene PLUS a spurious cool-blue
+  `UsdLuxSphereLight` on the right (the widening of `Omnilight()`)
+  PLUS a `UsdLuxDomeLight` wash (the widening of `Skylight()`). The
+  sphere now reads bright on BOTH hemispheres; the right-side
+  shadow is much fainter; the overall scene is brighter and cooler
+  from the dome contribution (foreground mean R=152.96 / G=152.15 /
+  B=150.59 / 255). Postfix is uniformly DARKER on every channel:
+  R = −48.17 / 255, G = −52.83 / 255, B = −57.33 / 255, with the
+  largest swing on BLUE because the wildcard counterfactual lights
+  are explicitly cool-blue. 50.04% of pixels have a non-zero
+  per-pixel Manhattan delta (mean delta 79.17 / 765). PNGs are
+  SHA-256-distinct (`0ffbcc80c0d66c1b…` vs `46b889329234dbb4…`).
+  `compare_side_by_side.png` is the auditor's at-a-glance composite.
+  Auditor's checklist: **postfix has only the warm pool on the LEFT
+  with a visibly dark RIGHT hemisphere AND a long soft right-side
+  shadow; still-broken has uniform brightness across the sphere AND
+  a faint-to-absent right-side shadow AND the mean foreground
+  intensities trend UP on every channel with the largest swing on
+  BLUE**. A refactor that ever made the postfix bright on the right
+  or made the right-side shadow disappear would mean the writer-
+  registry has started authoring spurious UsdLux prims for legacy
+  LightObjects and the silent-drop contract has broken. No C++ logic
+  change in this bite — purely additive observability + test + doc
+  infrastructure that locks in the writer-registry's bottom bound
+  before any widening refactor lands. Retires the day a proper
+  per-class legacy-light writer lands (a `MaxUsdLegacyOmnilightWriter`,
+  a `MaxUsdLegacySkylightWriter`, etc.) with its own attribute-
+  translation audit; until then, the silent drop is the documented,
+  locked-in behaviour.

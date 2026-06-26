@@ -288,6 +288,108 @@ struct export_light_test
         deleteFile iesPath
     ),
 
+    -- MAX-LIT-001 writer-registry bottom-bound audit: pin the silent-drop
+    -- behavior the PhotometricLightWriter::CanExport gate enforces for every
+    -- non-LIGHTSCAPE_LIGHT_CLASS light (Omnilight, Skylight, legacy Spot,
+    -- legacy Directional, mr_Sky/Daylight, etc.). The audit's value is making
+    -- the bottom bound observable so a future "extend PhotometricLightWriter
+    -- to legacy lights" widening lands with a per-class attribute-translation
+    -- + decision-table update rather than silently authoring spurious
+    -- default-intensity UsdLuxSphereLight / UsdLuxDomeLight prims for every
+    -- legacy light position. See PhotometricLightWriter.cpp ::
+    -- CanExport (post-MAX-LIT-001 comment block) for the surgical bounds
+    -- enumeration.
+    --
+    -- The positive control (the Free_Point Photometric light) pins that
+    -- the gate still fires for in-scope lights -- a refactor that
+    -- destabilised the LIGHTSCAPE_LIGHT_CLASS branch surfaces here
+    -- alongside the negative cases.
+    function photometric_light_writer_legacy_dropout_audit_test = (
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.RootPrimPath = "/"
+        exportOptions.Lights = true
+
+        -- Positive control: a Photometric Free_Point light. The
+        -- LIGHTSCAPE_LIGHT_CLASS branch returns ContextSupport::Fallback
+        -- so this light is authored as the correct UsdLux* per the
+        -- PhotometricLightWriter::GetPrimType conversion grid.
+        local photometricLight = free_light()
+        photometricLight.name = "PhotometricPositiveControl"
+        photometricLight.type = #Free_Point
+        photometricLight.distribution = 2 -- uniform hemispherical/diffuse
+
+        -- Negative case A: legacy Omnilight (OMNI_LIGHT_CLASS_ID;
+        -- inherits LightObject but NOT LightscapeLight). The
+        -- !IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS) branch returns
+        -- ContextSupport::Unsupported; no other registered PrimWriter
+        -- claims a LightObject; MaxUsdPrimWriterRegistry::FindWriter
+        -- returns nullptr; the light is silently dropped from the
+        -- exported stage.
+        local legacyOmni = omniLight()
+        legacyOmni.name = "LegacyOmniNegativeCase"
+        legacyOmni.pos = [200, 0, 100]
+        legacyOmni.multiplier = 1.0
+        legacyOmni.rgb = color 255 255 255
+
+        -- Negative case B: legacy Skylight (the "Standard > Skylight"
+        -- class, SKYLIGHT_CLASS_ID; also LightObject-not-LightscapeLight).
+        -- Same writer-registry decision path -> silent drop.
+        local legacySky = Skylight()
+        legacySky.name = "LegacySkylightNegativeCase"
+        legacySky.pos = [-200, 0, 100]
+
+        local exportPath = output_prefix + "test_legacy_lights_dropout_audit_export.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        -- Surgical bound 1 (positive control): the LIGHTSCAPE_LIGHT_CLASS
+        -- branch fires; the photometric light IS authored as a UsdLux
+        -- prim. A regression that broke the IsSubClassOf check (e.g.
+        -- inverted the ternary, or returned Unsupported unconditionally)
+        -- would fail this assertion alongside the negative cases.
+        local photometricPath = "/" + photometricLight.name
+        local photometricPrim = pyUsd.Prim.GetPrimAtPath stage photometricPath
+        assert_true (photometricPrim.IsValid()) \
+            message:(photometricLight.name + " is the positive control: a Free_Point Photometric light MUST be authored as a UsdLux* prim (the LIGHTSCAPE_LIGHT_CLASS gate fires for in-scope lights). If this assertion fails, the writer-registry gate has regressed for in-scope lights, not just for legacy lights.")
+        local photometricLight_usd = pyUsdLux.BoundableLightBase.Get stage photometricPath
+        assert_true (photometricLight_usd.GetIntensityAttr().IsValid()) \
+            message:(photometricLight.name + " positive control should expose UsdLux BoundableLightBase intensity attribute.")
+
+        -- Surgical bound 2 (negative case A): the legacy Omnilight is
+        -- silently dropped. NO prim at its path. A wildcard "extend to
+        -- LightObject" widening would author a UsdLuxSphereLight prim
+        -- here -- this assertion is what catches that widening by
+        -- named case.
+        local legacyOmniPath = "/" + legacyOmni.name
+        local legacyOmniPrim = pyUsd.Prim.GetPrimAtPath stage legacyOmniPath
+        assert_false (legacyOmniPrim.IsValid()) \
+            message:(legacyOmni.name + " is a negative case: a legacy Omnilight (LightObject not LightscapeLight) MUST be silently dropped under the current MAX-LIT-001 baseline. If this assertion fails, either (a) a writer has been added that claims legacy LightObjects -- which requires a corresponding doc entry + decision-table update + per-attribute audit, NOT just a wildcard widening of the existing photometric gate; or (b) the writer-registry has gained a default fallback that silently authors spurious UsdLux prims for unmapped nodes -- which would break the round-trip semantics across every node type, not just lights.")
+
+        -- Surgical bound 3 (negative case B): the legacy Skylight is
+        -- also silently dropped. Same writer-registry decision path.
+        local legacySkyPath = "/" + legacySky.name
+        local legacySkyPrim = pyUsd.Prim.GetPrimAtPath stage legacySkyPath
+        assert_false (legacySkyPrim.IsValid()) \
+            message:(legacySky.name + " is a negative case: a legacy Skylight (LightObject not LightscapeLight) MUST be silently dropped under the current MAX-LIT-001 baseline. If this assertion fails, see the legacy Omnilight failure message for the two ways the writer-registry could have shifted.")
+
+        -- Surgical bound 4 (option still works on this branch): the
+        -- TranslateLights short-circuit suppresses ALL light export,
+        -- including the photometric. Same export call with
+        -- exportOptions.Lights = false MUST drop the photometric
+        -- positive control too -- this pins that the option gate fires
+        -- BEFORE the class-id gate, and that the legacy-drop is NOT
+        -- caused by an upstream option-state difference.
+        exportOptions.Lights = false
+        local exportPathNoLights = output_prefix + "test_legacy_lights_dropout_audit_no_lights_export.usda"
+        USDExporter.ExportFile exportPathNoLights exportOptions:exportOptions
+        local stageNoLights = pyUsd.Stage.Open(exportPathNoLights)
+        local photometricPrimNoLights = pyUsd.Prim.GetPrimAtPath stageNoLights photometricPath
+        assert_false (photometricPrimNoLights.IsValid()) \
+            message:(photometricLight.name + " with exportOptions.Lights = false MUST also be dropped (the TranslateLights short-circuit fires before the class-id gate). If the photometric survives a Lights=false export, the option gate has regressed and the legacy-drop assertions above are no longer a clean MAX-LIT-001 baseline.")
+    ),
+
     -- MAX-LIT-002 surgical-preservation regression: pin both branches of
     -- the useKelvin dichotomy in PhotometricLightWriter::Write (lines
     -- 481-535 of PhotometricLightWriter.cpp, post-MAX-LIT-002 comment
@@ -1605,6 +1707,7 @@ struct export_light_test
     Tests = #(
         photometric_light_general_attributes_export_test,
         photometric_light_on_off_export_test,
+        photometric_light_writer_legacy_dropout_audit_test,
         photometric_light_ies_file_export_test,
         photometric_light_kelvin_filter_color_round_trip_test,
         photometric_point_light_attributes_export_test,
