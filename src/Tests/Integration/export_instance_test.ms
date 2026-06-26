@@ -24,6 +24,7 @@ pyUsd = python.import("pxr.Usd")
 pyUsdGeom = python.import("pxr.UsdGeom")
 pyGf = python.import("pxr.Gf")
 pySdf = python.import("pxr.Sdf")
+pyShade = python.import("pxr.UsdShade")
 
 output_prefix = pathConfig.appendPath (getDir #temp) "/EXPORT_INSTANCE_TEST_"
 deleteTestFiles(output_prefix + "*.*")
@@ -822,6 +823,140 @@ struct export_instance_test
         assert_true (instanceBoxPrim.IsInstance())message:"instanceBoxPrim prim should be an instance."
     ),
     
+    -- MAX-MAT-010 surgical-coverage regression (material-instance /
+    -- Multi-Mtl override-structure fidelity audit, 2026-06-26).
+    --
+    -- Pins the KEY branch of the four-branch decision tree in
+    -- `ShadingUtils.cpp::_AddInstancePrimsToMaterialMap`:
+    -- Branch D -- different materials on two USD instances, the
+    -- divergent instance carries a MultiMtl WITH `materialBind`-family
+    -- GeomSubsets on the prototype's child. `BreakInstancingAndCopySubset`
+    -- runs and three things must land on the USD layer:
+    --   (i)  the divergent instance has `SetInstanceable(false)` so
+    --        per-instance opinions can take effect at composition time;
+    --   (ii) the prototype's subsets are COPIED onto an override-child
+    --        mesh prim under the divergent instance, with
+    --        `customData[3dsmax:matId]` preserved across the copy;
+    --   (iii) the override-child's subsets carry the DIVERGENT MultiMtl's
+    --        sub-material bindings (not the prototype's).
+    --
+    -- The existing instancing-tests (`test_copy_types`,
+    -- `test_export_two_instances_by_selection`, etc.) confirm that two
+    -- instances of a same-material Box stay instanced
+    -- (Branch A of the decision tree). The existing material-ID tests
+    -- (`test_export_material_id`) confirm that a single MultiMtl-bound
+    -- mesh authors GeomSubsets correctly (the per-face binding shape).
+    -- Neither one exercises the per-instance MultiMtl override case
+    -- where the divergent instance's MultiMtl differs from the
+    -- prototype's: a regression that dropped `BreakInstancingAndCopySubset`
+    -- (e.g., a refactor that "unified" the four branches onto Branch A's
+    -- "keep instancing" shape) would still pass every existing test
+    -- because the SAME-MULTIMTL-on-both-instances case never hits
+    -- BreakInstancingAndCopySubset to begin with. This test pins the
+    -- previously-uncovered DIVERGENT case.
+    --
+    -- A future regression that switched the C++ to silently preserve
+    -- instancing on the divergent instance would fail by named case
+    -- (assert_false on `box2Prim.IsInstanceable()` would invert into
+    -- an assert_true failure; the override mesh + copied subsets would
+    -- not be authored; the divergent MultiMtl's bindings would silently
+    -- LOSE to the prototype's). See the C++ surgical-bounds comment
+    -- block above `_AddInstancePrimsToMaterialMap` for the full
+    -- Branches A/B/C/D enumeration and validator case mapping.
+    function test_material_instance_override_fidelity_audit = (
+        local exportPath = output_prefix + "test_material_instance_override_fidelity_audit.usda"
+
+        -- Build two Boxes sharing one Object (USD instancing on
+        -- export), each carrying a DIFFERENT MultiMtl with the SAME
+        -- two-matId partition. Prototype-side bindings: red + blue
+        -- via `box1`'s MultiMtl. Per-instance override on `box2`:
+        -- green + yellow via a separate MultiMtl.
+
+        -- Box 1 -- the non-divergent (prototype-side) instance.
+        local box1 = Box name:"box1" pos:[0, 0, 0] width:10 length:10 height:10
+        convertToPoly box1
+        polyOp.setFaceMatId box1 #{1, 2, 3} 1
+        polyOp.setFaceMatId box1 #{4, 5, 6} 2
+
+        local multiMtlA = multiSubMaterial numsubs:2 name:"multiA_red_blue"
+        multiMtlA.numSubs = 2
+        local matRed = Standard name:"matRed"
+        matRed.diffuse = Color 255 0 0
+        multiMtlA.materialList[1] = matRed
+        local matBlue = Standard name:"matBlue"
+        matBlue.diffuse = Color 0 0 255
+        multiMtlA.materialList[2] = matBlue
+        box1.material = multiMtlA
+
+        -- Box 2 -- the divergent instance carrying a DIFFERENT MultiMtl.
+        -- `create_clone <node> #instance` shares the Object so the USD
+        -- exporter authors an inheritance arc + `IsInstance() == True`
+        -- on box2 by default. The per-node `.material` assignment then
+        -- diverges from box1's MultiMtl, triggering Branch D of the
+        -- decision tree in `_AddInstancePrimsToMaterialMap`.
+        local box2 = create_clone box1 #instance "box2"
+        local multiMtlB = multiSubMaterial numsubs:2 name:"multiB_green_yellow"
+        multiMtlB.numSubs = 2
+        local matGreen = Standard name:"matGreen"
+        matGreen.diffuse = Color 0 255 0
+        multiMtlB.materialList[1] = matGreen
+        local matYellow = Standard name:"matYellow"
+        matYellow.diffuse = Color 255 255 0
+        multiMtlB.materialList[2] = matYellow
+        box2.material = multiMtlB
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.RootPrimPath = "/"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        -- Surgical bound 1 (Branch A control): box1 keeps instancing.
+        -- A regression that turned this assertion the other way would
+        -- mean the C++ has started always-breaking instancing across
+        -- every divergent-material case, regressing not just Branch D
+        -- but Branches B and C too.
+        local box1Prim = stage.GetPrimAtPath("/box1")
+        assert_true (box1Prim.IsInstanceable()) message:"box1 is the Branch A control: its material matches the prototype-side binding so USD instancing must be PRESERVED. If this assertion fails the writer has started always-breaking instancing on divergent-material cases, regressing the entire Branches A/B/C/D decision tree onto a single 'always break' wildcard shape."
+
+        -- Surgical bound 2 (Branch D's KEY bound): box2 has
+        -- SetInstanceable(false). A regression that dropped this would
+        -- silently propagate the prototype's red+blue bindings onto
+        -- box2 at composition time, losing the per-instance green+yellow
+        -- override entirely. This is the data-loss vector the audit
+        -- pins; every other Branch D assertion is downstream of this.
+        local box2Prim = stage.GetPrimAtPath("/box2")
+        assert_false (box2Prim.IsInstanceable()) message:"box2 is the Branch D KEY surgical bound: a divergent-MultiMtl-with-subsets instance MUST have `SetInstanceable(false)` so the override-child mesh's bindings take effect. If this assertion fails the C++ has dropped `BreakInstancingAndCopySubset` and per-instance MultiMtl overrides are being silently LOST on every export."
+
+        -- Surgical bound 3: the override-child mesh prim exists under
+        -- box2 (the `BreakInstancingAndCopySubset`-authored override
+        -- prim that hosts the copied subsets).
+        local box2Children = box2Prim.GetAllChildren()
+        local overrideMeshPrim = undefined
+        for child in box2Children do (
+            if (child.IsA pyUsdGeom.Mesh) then (
+                overrideMeshPrim = child
+                exit
+            )
+        )
+        assert_true (overrideMeshPrim != undefined) message:"box2 must carry an override-child Mesh prim hosting the copied subsets. Without it the per-instance bindings have no path to anchor to and the override is lost. `BreakInstancingAndCopySubset` (defined in ShadingUtils.cpp) authors this child prim as part of the Branch D sequence."
+
+        -- Surgical bound 4: the override-child mesh carries the COPIED
+        -- subsets in the materialBind family, with matId customData
+        -- preserved. A regression that dropped the customData copy
+        -- would silently break per-matId lookups for downstream tools
+        -- consuming the override-side bindings.
+        local bindingAPI = pyShade.MaterialBindingAPI(overrideMeshPrim)
+        local copiedSubsets = bindingAPI.GetMaterialBindSubsets()
+        assert_equal 2 copiedSubsets.count message:"box2's override-child mesh must carry TWO copied materialBind subsets (one per matId in the divergent MultiMtl's partition). Got a different count -- the subset-copy step in `BreakInstancingAndCopySubset` has regressed."
+        for i = 1 to 2 do (
+            local subPrim = copiedSubsets[i].GetPrim()
+            local matId = subPrim.GetCustomDataByKey "3dsmax:matId"
+            assert_true (matId == 1 OR matId == 2) message:("Copied subset must carry `customData[3dsmax:matId]` preserved across the BreakInstancingAndCopySubset copy. Got matId=" + (matId as string) + " on subset " + (i as string) + " of /box2's override-child mesh.")
+        )
+    ),
+
     -- Test that the class prim instances inherity from is properly setup.
     function test_instancing_inherit_class_prim = (
         teapot1 = Teapot name:"teapot1"
@@ -863,6 +998,7 @@ struct export_instance_test
         test_export_instance_reuse_parent_prim_should_have_correct_split_transforms,
         test_export_instance_not_reuse_parent_on_metadata_conflict,
         test_export_single_max_instance_does_not_create_usd_instance,
+        test_material_instance_override_fidelity_audit,
         test_instancing_inherit_class_prim
         )
 )
