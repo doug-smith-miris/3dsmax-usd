@@ -239,6 +239,80 @@ int USDIOController::Export(const fs::path& filePath, const USDSceneBuilderOptio
     }
 
     if (isUSDZExport) {
+        // ------------------------------------------------------------
+        // MAX-PKG-001 -- USDZ packaging path surgical bounds
+        //
+        // The current implementation packages by first authoring an
+        // intermediate ".usd" into Max's #temp dir and then calling
+        // `MaxUsd::UsdToolsUtils::RunUsdZip` -- which spawns
+        // `cmd.exe /c RunUsdZip.bat`, which spawns
+        // `powershell.exe -file RunUsdTool.ps1 UsdZip ...`, which spawns
+        // `python.exe UsdToolWrapper.py UsdZip ...`, which finally calls
+        // the Pixar `usdzip` python tool. Four nested processes; the
+        // PowerShell layer needs a non-`Restricted` ExecutionPolicy and a
+        // 3ds Max install entry under `HKLM:\SOFTWARE\Autodesk\3dsMax\*`,
+        // both of which can be missing under headless CI / VDI / locked-
+        // down workstations and silently break USDZ export.
+        //
+        // The proposed in-process replacement (MAX-PKG-001 follow-on bite)
+        // calls `pxr::UsdUtilsCreateNewUsdzPackage(SdfAssetPath(...),
+        // outUsdzPath)` directly from this function. The Python validator
+        // `validate_usdz_packaging_fidelity.py` in the run's arch-build
+        // directory exercises the equivalence at the USD layer with 9
+        // cases covering every surgical bound the swap must preserve.
+        //
+        // Surgical bounds the in-process replacement MUST preserve
+        // (each pinned by one named case in the Python validator):
+        //
+        //   * SimpleNoAssets       no-asset stages package to a 1-member
+        //                          .usdz (root layer only)
+        //   * WithImageDep         external image assets are bundled
+        //                          alongside the root layer; the texture
+        //                          `file` input is rewritten to a
+        //                          relative path inside the .usdz
+        //   * ARKitSingleLayer     `CreateNewARKitUsdzPackage` flattens
+        //                          sublayers; non-ARKit
+        //                          `CreateNewUsdzPackage` preserves them
+        //   * SublayerComposition  the ARKit-vs-default distinction is
+        //                          observable in the zip member listing
+        //   * UnicodeAssetName     unicode asset filenames survive the
+        //                          packaging round-trip (the existing
+        //                          `IsValidWindowsPath` regex + cmd/
+        //                          powershell handoff cannot)
+        //   * MissingAssetRefuses  the in-process API raises
+        //                          `Tf.ErrorException` on a missing
+        //                          asset -- STRICTER than the legacy
+        //                          `usdzip` (which silently produces a
+        //                          .usdz with a dangling reference).
+        //                          The call site MUST detect the failure
+        //                          and `fs::remove_all` the orphan
+        //                          partial .usdz, mirroring the existing
+        //                          temp-dir `remove_all` on the success
+        //                          branch
+        //   * AlreadyZippedInput   `CreateNewUsdzPackage(.usdz, .usdz)`
+        //                          recursively repackages -- so this
+        //                          call site MUST pass the temp `.usd`
+        //                          it just authored, NEVER the user-
+        //                          supplied `.usdz` target path
+        //   * UsdzMemberOrder      the FIRST zip member is the root
+        //                          layer (downstream readers position-
+        //                          index)
+        //   * Idempotence          two consecutive packaging runs
+        //                          produce content-identical zips
+        //                          (modulo timestamps)
+        //
+        // While this comment lives in the codebase the actual code below
+        // still routes through `RunUsdZip` on Windows; the in-process
+        // swap is a separate follow-on bite that will replace the
+        // `RunUsdZip` call with the in-process API call once a Windows
+        // build host is available to verify the swap. The surgical
+        // bounds + the validator + the visual auditor pair are landed
+        // NOW so the swap commit only needs to wire the call.
+        //
+        // See `doc/translation-mapping.md` (`MAX-PKG-001`) for the full
+        // audit write-up.
+        // ------------------------------------------------------------
+
         // first export stage to .usd in #temp folder, then convert to usdz.
         stageExportExtension = "usd";
 

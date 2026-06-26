@@ -73,6 +73,7 @@ Status legend:
 | 3ds Max system unit (Customize > Units Setup > System Unit Setup) | `UsdStage` `metersPerUnit` layer metadata | observability hint | (stage layer metadata; not a shader nodedef) | `USDSceneBuilder::BuildStage` is creating a new stage AND `GetSystemUnitScale(UNITS_METERS)` rounded to `digits10` is NOT exactly 1.0. The metersPerUnit value is still authored faithfully (USD-correct); a `MaxUsd::Log::Warn` is emitted naming the value, the implied 1-unit-to-meter factor, the downstream consumers that assume meters (Karma at 1:1, ARKit / Quick Look, Miris asset ingest, glTF), and both workarounds (set Max units to meters before export; or post-scale + rewrite metersPerUnit). The bound: a scene already in meters (`stageScale == 1.0`) stays silent | MAX-UNIT-001 | 2026-06-26 |
 | 3ds Max Photometric / Physical light `.webFile` (when `distribution == WEB_DIST`) | `UsdLuxShapingAPI.shaping:ies:file` (an `SdfAssetPath` carrying the resolved-full-file-path of the .ies profile) | direct pairing | (light shaping API attribute; not a shader nodedef) | `PhotometricLightWriter::Write` is invoked, `distribution == WEB_DIST` AND `asset.GetId() != kInvalidId`. Two surgical bounds: (a) distribution != WEB_DIST -> NOT authored even if `.webFile` is set on source (gate fires on distribution first); (b) WEB_DIST AND asset id == kInvalidId -> NOT authored (no spurious empty path). Known TODO at `PhotometricLightWriter.cpp:277`: the path is absolute on the source machine; pack-and-go USDZ + IES bundle is not yet supported | MAX-LIT-002 | 2026-06-26 |
 | 3ds Max Photometric / Physical light Kelvin + RGB filter color (Light > Color > Kelvin toggle, kelvin spinner, filter swatch, RGB swatch) | `UsdLux.enableColorTemperatureAttr` + `colorTemperatureAttr` + `inputs:color` -- dichotomous: `useKelvin = true` writes the blackbody temperature + filter-only color; `useKelvin = false` writes the lightColor x filterColor combined product with the blackbody enable off | direct pairing | (UsdLux base-light schema; not a shader nodedef) | `PhotometricLightWriter::Write` is invoked, always (the dichotomy fires per-light per-export). Surgical bounds: (a) useKelvin -> enable=true + ct=clamped-K + color=filter (NOT lightColor combined; would double-tint the renderer's blackbody integrand); (b) !useKelvin -> enable=false + NO ct authored + color=lightColor*filter (intentionally lossy on round-trip); (c) out-of-range K -> clamped to [1000, 10000] with a one-shot Log::Warn that preserves the original value in the message | MAX-LIT-002 | 2026-06-26 |
+| 3ds Max export of any stage to a path with extension `.usdz` (UI Save As… "USDZ", MaxScript `exportFile foo.usdz`, `3dsmaxbatch ... -export foo.usdz`) | Single .usdz zip archive containing the root layer + every external asset (textures, sublayer references) reachable from the stage. ARKit-strict mode flattens sublayers and bundles one .usdc root | observability + audit (lock-in for proposed in-process packaging swap) | (zip archive structure; not a shader nodedef or USD prim schema) | `USDIOController::Export` (and `USDSceneController::Export`) sees `stageExportExtension == ".usdz"`. Today: routes through `MaxUsd::UsdToolsUtils::RunUsdZip` which spawns `cmd.exe -> powershell.exe -> python.exe -> usdzip` (four nested processes; PowerShell `Restricted` ExecutionPolicy / missing `HKLM:\SOFTWARE\Autodesk\3dsMax\*` registry entries / `CreateProcess + SW_HIDE` under a service account all break it silently). Proposed (MAX-PKG-001 follow-on): replace with `pxr::UsdUtilsCreateNewUsdzPackage(SdfAssetPath(tempUsd), filePath)` called in-process from the same function. The audit pins nine surgical bounds the in-process replacement preserves -- see Notes per expression for the full case list | MAX-PKG-001 | 2026-06-26 |
 
 ## Notes per expression
 
@@ -2148,6 +2149,136 @@ round-trip on the `!useKelvin` branch (e.g. author
 USD spec does not currently offer one). Until then, the combined
 product is the right call.
 
+### USDZ packaging path: cmd->powershell->python->usdzip shim → in-process `pxr::UsdUtilsCreateNewUsdzPackage` (MAX-PKG-001)
+
+**Symptom.** When the user (or a `3dsmaxbatch` headless caller) exports a
+USD stage to a `.usdz` extension, the writer hits the `isUSDZExport == true`
+branch in `USDIOController::Export` (and the parallel branch in
+`USDSceneController::Export`), authors an intermediate `.usd` into Max's
+`#temp` dir, and then calls `MaxUsd::UsdToolsUtils::RunUsdZip` to convert.
+`RunUsdZip` is a four-process shim:
+
+```
+3dsmax.exe -> cmd.exe /c RunUsdZip.bat
+           -> powershell.exe -executionpolicy RemoteSigned -file RunUsdTool.ps1 UsdZip ...
+           -> python.exe UsdToolWrapper.py UsdZip ...
+           -> usdzip (Pixar python tool, runpy-loaded)
+```
+
+The shim works on a fresh interactive 3ds Max install on a vanilla developer
+workstation. It silently fails on several headless / locked-down contexts
+that the test suite never exercises:
+
+* **PowerShell ExecutionPolicy.** `RunUsdTool.ps1` is invoked with
+  `-executionpolicy RemoteSigned`, which fails on machines where the local
+  ExecutionPolicy is `Restricted` (a common managed-IT default for
+  service accounts and locked-down VDI / Citrix images).
+* **Registry probe.** `RunUsdTool.ps1` resolves the bundled
+  `python.exe` by reading
+  `HKLM:\SOFTWARE\Autodesk\3dsMax\<version>\InstallDir`, which is only
+  written by the installer's all-users path. Per-user / portable / dev-
+  rebuild installs may not write that key and the script exits with
+  `"Could not find the 3dsMax python executable from the registry."`.
+* **CreateProcess + `SW_HIDE` + cmd.exe.** `CreateProcessAndWait` runs the
+  whole shim through `cmd.exe /c` with `STARTF_USESHOWWINDOW + SW_HIDE`,
+  which on some service-account contexts (`3dsmaxbatch` invoked under a
+  Windows service, render farms, CI workers without an interactive
+  desktop) refuses to spawn or returns immediately without launching
+  `usdzip` -- producing a "success" status with no `.usdz` on disk.
+* **Unicode in `#temp` or filenames.** The shim already explicitly rejects
+  unicode in `getDir #temp` (see `io_unicode_test.ms::test_unicode_usdz_tempdir`
+  and the `MaxUsd::HasUnicodeCharacter` gate in
+  `USDIOController.cpp:298-304`). The in-process API does not have that
+  limitation -- unicode asset names round-trip cleanly.
+
+The audit observes that all four failure modes share a root cause: the
+packaging is performed out-of-process via Windows-specific shell tooling
+rather than via the `pxr.UsdUtils` C++ / Python API the rest of the plugin
+already binds against. `pxr::UsdUtilsCreateNewUsdzPackage` is the
+in-process equivalent, available everywhere the plugin builds (it lives in
+`pxr/usd/usdUtils/dependencies.h` and is exported by `libusdUtils`). The
+Python validator demonstrates the equivalence at the USD layer with nine
+named cases.
+
+**Why it matters.** Headless export from `3dsmaxbatch` is the path render
+farms and CI pipelines use; silently-failing USDZ export on those paths
+manifests as "the artist exported a .usdz from the UI, the CI re-export of
+the same scene produced no .usdz, nobody noticed until the downstream
+ARKit Quick Look ingest reported the file missing". The proposed
+in-process swap eliminates all four failure modes in a single bite.
+
+**Audit (this PR -- no C++ logic change).** The architecture-mode audit
+pins the surgical bounds the future in-process swap MUST preserve, lands
+the Python validator that exercises the in-process API directly, lands a
+MaxScript regression for the headless export path, and lands a visual
+auditor pair demonstrating the packaging is lossless. The C++ swap itself
+is held for a follow-on bite that runs on a Windows build host (Mac cannot
+build per `[[repo-3dsmax-usd]]`); the swap commit only needs to wire the
+`UsdUtilsCreateNewUsdzPackage` call.
+
+**Surgical bounds (each pinned by one named case in the Python validator,
+`validate_usdz_packaging_fidelity.py`):**
+
+| Bound | Case | What it pins |
+| --- | --- | --- |
+| Layer-only stages package cleanly | `SimpleNoAssets` | `.usdz` with zero external assets contains exactly one zip member (the root layer); reopening via `Usd.Stage.Open(.usdz)` succeeds |
+| External image assets are bundled, the `file` input is rewritten | `WithImageDep` | Texture .png is bundled alongside the root layer; the `UsdUVTexture.file` input in the packaged stage now points at a relative path inside the .usdz |
+| ARKit packaging flattens sublayers | `ARKitSingleLayer` | `CreateNewARKitUsdzPackage` produces exactly one `.usd[ac]` layer + assets |
+| Non-ARKit packaging preserves sublayers | `SublayerComposition` | `CreateNewUsdzPackage` keeps sublayers as separate zip members; `CreateNewARKitUsdzPackage` flattens them |
+| Unicode asset names survive the round-trip | `UnicodeAssetName` | Asset filenames containing non-ASCII characters (`いろはにほへ.png`) bundle correctly and `Usd.Stage.Open` on the resulting .usdz resolves the texture file input |
+| Missing assets surface as an error, NOT a silent dangling reference | `MissingAssetRefuses` | `Tf.ErrorException` raised by `UsdZipFileWriter::AddFile`; strict-input behavior stricter than the legacy `usdzip` CLI which would silently produce a corrupt .usdz |
+| The call site MUST clean up on failure | `MissingAssetRefuses` (second half) | On the `Tf.ErrorException` path the API leaves behind a structurally-valid-but-content-incomplete `.usdz`; the call site must `fs::remove_all` it (mirror the existing success-branch temp-dir cleanup) |
+| The call site MUST pass the temp `.usd`, never the user-supplied `.usdz` | `AlreadyZippedInput` | `CreateNewUsdzPackage(.usdz, .usdz)` recursively repackages (treats the input as an opaque first-layer blob). Pin: the asset-path argument to the in-process call MUST be the temp `.usd` path the writer just authored, NOT the user-supplied final `.usdz` path |
+| The first zip member is the root layer | `UsdzMemberOrder` | Downstream tools (ARKit Quick Look, some USDZ readers) position-index the first member as the root layer; the in-process API guarantees this |
+| Idempotence: same input → content-identical output | `Idempotence` | Two consecutive packaging runs against the same source produce zips with identical content (modulo timestamps); confirms the API is deterministic per input |
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/45c60621-dae1-4ac7-8904-9cebbe168ba0/validate_usdz_packaging_fidelity.py`
+mirrors the C++ decision at the USD layer; nine cases + idempotence; all
+pass on the 2026-06-26 baseline against `pxr.Usd 0.25.5`. The validator
+runs entirely in `hython` and does not need a Windows build host -- exactly
+the equivalence proof an architecture-mode audit needs for a code path
+whose C++ swap ships unverified.
+
+**MaxScript regression** in `src/Tests/Integration/export_usdz_test.ms`:
+
+* `test_usdz_headless_packaging_round_trip` exercises the `exportFile foo.usdz
+  #noprompt` path (the `suppressPrompts:true` branch in
+  `USDExporter::ExportFile`, which routes through
+  `USDIOController::Export -> RunUsdZip`). Asserts the .usdz exists, is a
+  valid zip, the FIRST member is the root layer, and the texture .png is
+  bundled.
+* `test_usdz_headless_failure_surfaces_status` exercises the failure
+  contract: a `#noprompt` export to an unreachable path must surface
+  failure via the returned status, not silently report success with no
+  file on disk.
+
+**Surgical-bounds comment block in C++** in both `USDIOController::Export`
+and `USDSceneController::Export` at the `isUSDZExport` branch, enumerating
+every bound the in-process swap must preserve and pointing at the named
+Python case + the MaxScript regression. The comment is the contract; the
+swap commit only needs to wire the call.
+
+**Visual auditor pair**:
+
+* `render_unreal_reference.png` -- Karma CPU render of the *source* `.usda`
+  (texture asset = sibling `.png` on disk).
+* `render_karma_postfix.png` -- Karma CPU render of the same scene packaged
+  through `pxr.UsdUtils.CreateNewUsdzPackage` and re-opened (texture asset
+  = zip member inside the `.usdz`).
+
+The two renders show the same magenta-on-yellow checker pattern in the same
+orientation at the same scale, demonstrating that packaging is lossless at
+the pixel level. SHA-256-distinct (two separate `usdrecord` invocations
+have different sampler seeds) so they're confirmed not to be the same file.
+`compare_side_by_side.png` is the auditor's at-a-glance comparison.
+
+**Retirement condition.** Once the follow-on bite swaps the `RunUsdZip`
+call to `UsdUtilsCreateNewUsdzPackage` and lands on a Windows build host,
+this audit entry stays as the structural contract; the changelog gains a
+"MAX-PKG-001 in-process swap landed" bullet and the test suite continues
+to assert the same observable structure.
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -2523,3 +2654,62 @@ product is the right call.
   this bite — the audit is purely additive observability + test +
   doc infrastructure that locks in the two existing surgical
   guarantees.
+* 2026-06-26 — MAX-PKG-001 USDZ-packaging headless fidelity audit:
+  introduce the FIRST MAX-PKG entry to the mapping doc, covering the
+  `.usdz` export path in `USDIOController::Export` and the parallel
+  `USDSceneController::Export`. Today both branches route through
+  `MaxUsd::UsdToolsUtils::RunUsdZip`, a four-process shim
+  (`cmd.exe -> powershell.exe -file RunUsdTool.ps1 UsdZip
+  -> python.exe UsdToolWrapper.py UsdZip -> usdzip`) that silently
+  fails under four headless-hostile conditions the existing test suite
+  does not exercise — PowerShell `Restricted` ExecutionPolicy, missing
+  `HKLM:\SOFTWARE\Autodesk\3dsMax\*` registry entries on portable / per-
+  user installs, `CreateProcess + SW_HIDE` under a service account
+  (`3dsmaxbatch` from a Windows service or render-farm worker), and
+  unicode in `getDir #temp`. The proposed in-process replacement
+  (`pxr::UsdUtilsCreateNewUsdzPackage`) eliminates all four failure
+  modes in one bite. The audit is purely additive: it pins the surgical
+  bounds the future in-process swap MUST preserve, lands the Python
+  validator that demonstrates the equivalence at the USD layer, lands
+  MaxScript regressions for the headless export path, and lands a
+  visual auditor pair showing packaging is lossless — without
+  introducing C++ logic that would ship unverified on this Mac. The
+  swap itself is held for a follow-on bite that can run on a Windows
+  build host. Adds a long-form surgical-bounds comment block to
+  `USDIOController::Export` at the `isUSDZExport` branch enumerating
+  every bound the in-process swap must preserve (nine, each pointing at
+  one named Python case + one MaxScript regression), and a back-pointer
+  comment block in `USDSceneController::Export` to the matching write-
+  up. Python validator
+  (`validate_usdz_packaging_fidelity.py`, 9 cases + idempotence) covers:
+  SimpleNoAssets, WithImageDep, ARKitSingleLayer, SublayerComposition
+  (non-ARKit preserves sublayers, ARKit flattens), UnicodeAssetName,
+  MissingAssetRefuses (the in-process API raises `Tf.ErrorException` on
+  missing assets — STRICTER than the legacy `usdzip` CLI which silently
+  produces a corrupt .usdz; the call site MUST clean up the orphan
+  partial .usdz on the failure path), AlreadyZippedInput (`CreateNewUsdzPackage`
+  on a `.usdz` input recursively repackages — the call site MUST pass
+  the temp `.usd` path it just authored, NEVER the user-supplied `.usdz`
+  target), UsdzMemberOrder (root layer is the first zip member),
+  Idempotence. All 9 cases + the idempotence check pass on the
+  2026-06-26 baseline against `pxr.Usd 0.25.5` -- the equivalence proof
+  the in-process swap can land on. MaxScript regressions
+  (`test_usdz_headless_packaging_round_trip` exercises the
+  `exportFile foo.usdz #noprompt` path -- the same code path
+  `3dsmaxbatch` takes -- asserts a valid zip with the root layer FIRST
+  and the texture asset bundled; `test_usdz_headless_failure_surfaces_status`
+  asserts the failure contract -- a `#noprompt` export to an unreachable
+  path must surface failure via the returned status, never silently
+  report success with no file on disk) added to `export_usdz_test.ms`.
+  Visual auditor pair (`render_karma_postfix.png` Karma CPU render of
+  the same scene packaged through `pxr.UsdUtils.CreateNewUsdzPackage`
+  and re-opened from the .usdz; `render_unreal_reference.png` Karma
+  CPU render of the source `.usda` with the texture as a sibling .png
+  on disk -- both show the same magenta-on-yellow 8x8 checker on a
+  flat plane, demonstrating packaging is lossless at the pixel level)
+  lives in the run's arch-build directory; SHA-256-distinct (two
+  separate `usdrecord` invocations), `compare_side_by_side.png` is the
+  auditor's at-a-glance composite. No C++ logic change in this bite --
+  purely additive observability + test + doc infrastructure that
+  locks in the surgical contract the in-process swap will ride on
+  when a Windows build host is available.
