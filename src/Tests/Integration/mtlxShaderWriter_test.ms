@@ -393,6 +393,98 @@ struct mtlx_shader_writer_test
         assert_equal (rotInput.Get()) 0.25
     ),
 
+    -- MAX-MAT-009 regression: a MaterialXMaterial whose base_color
+    -- input carries `colorspace="srgb_texture"` must round-trip the
+    -- colorSpace metadata to the USD attribute. The same fixture also
+    -- carries `colorspace="srgb_texture"` on `base`, `specular_roughness`,
+    -- and `specular_IOR` (all float-typed). The MtlxShaderWriter audit
+    -- (`_TypeSupportsColorSpace`) rejects float-typed inputs, so the
+    -- exported USD MUST author colorSpace metadata ONLY on the color3
+    -- `base_color` input and NEVER on the float-typed inputs, even
+    -- though the source MaterialX authors a colorspace attribute on
+    -- all four. A future regression that widened the C++ predicate
+    -- would surface here as colorSpace metadata leaking onto a float
+    -- attribute.
+    function test_export_material_preserves_color_space_metadata_on_color3_inputs = (
+        maxver = maxVersion()
+        -- MaterialXMaterial.importMaterial is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereColorSpace"
+        local mtl1 = MaterialXMaterial()
+        mtl1.name = "matIntentionalColorSpace"
+        local scriptDir = getFilenamePath (getThisScriptFilename())
+        local mtlxDoc = (scriptDir + @"data\intentional_color_space_test\intentional_color_space.mtlx")
+        mtl1.importMaterial mtlxDoc
+        sphere001.material = mtl1
+        mtl1.explode()
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testIntentionalColorSpace.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/IntentionalColorSpace/IntentionalColorSpace")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        -- Positive control: the color3 `base_color` input MUST carry
+        -- `colorSpace = "srgb_texture"` USD metadata. The MaterialX
+        -- input's `colorspace="srgb_texture"` attribute, after the
+        -- MaterialX active-color-space resolution and the C++
+        -- `_SetInputValue` propagation, lands on the USD attribute.
+        local baseColorInput = surfaceShader.GetInput "base_color"
+        assert_true (baseColorInput != undefined)
+        local baseColorAttr = baseColorInput.GetAttr()
+        assert_equal (baseColorAttr.GetColorSpace()) "srgb_texture"
+
+        -- Negative control 1: float-typed `base` input -- even though
+        -- the source MaterialX authors `colorspace="srgb_texture"` on
+        -- this input, the C++ `_TypeSupportsColorSpace` predicate
+        -- rejects float-typed inputs and the propagation is skipped.
+        -- Note: `base` is at the standard_surface nodedef default 0.8
+        -- AND `base_color` is non-default, so MAX-MAT-006's
+        -- spec-default strip MAY remove the `base` input entirely
+        -- (which is also acceptable -- absent = falls back to nodedef
+        -- default 0.8). The permissive assertion: either the input is
+        -- absent OR it has NO colorSpace metadata. NEVER does it
+        -- carry colorSpace metadata.
+        local baseInput = surfaceShader.GetInput "base"
+        if baseInput != undefined then (
+            local baseAttr = baseInput.GetAttr()
+            assert_equal (baseAttr.GetColorSpace()) ""
+        )
+
+        -- Negative control 2: float-typed `specular_roughness` input
+        -- with `colorspace="srgb_texture"` on the source MaterialX
+        -- side. The exported USD MUST NOT carry colorSpace metadata
+        -- on this attribute. `specular_roughness = 0.2` is the
+        -- nodedef default, so MAX-MAT-006 may strip it -- permissive
+        -- shape as above.
+        local roughInput = surfaceShader.GetInput "specular_roughness"
+        if roughInput != undefined then (
+            local roughAttr = roughInput.GetAttr()
+            assert_equal (roughAttr.GetColorSpace()) ""
+        )
+
+        -- Negative control 3: float-typed `specular_IOR` input. Same
+        -- shape -- nodedef default value 1.5, may be stripped by
+        -- MAX-MAT-006, MUST NOT carry colorSpace metadata if present.
+        local iorInput = surfaceShader.GetInput "specular_IOR"
+        if iorInput != undefined then (
+            local iorAttr = iorInput.GetAttr()
+            assert_equal (iorAttr.GetColorSpace()) ""
+        )
+    ),
+
     -- MAX-MAT-002 regression: PhysicalMaterial export must not carry the
     -- spurious emission = 1.0 paired with emission_color = (0, 0, 0) that
     -- 3ds Max's MtlxIOUtil bridge writes on every standard_surface. The
@@ -1212,7 +1304,8 @@ struct mtlx_shader_writer_test
         test_export_physical_material_strips_spec_default_inputs,
         test_export_material_preserves_non_default_spec_inputs,
         test_export_openpbr_material_preserves_collision_named_inputs,
-        test_export_writer_path_separation_color_emission
+        test_export_writer_path_separation_color_emission,
+        test_export_material_preserves_color_space_metadata_on_color3_inputs
         )
 )
 

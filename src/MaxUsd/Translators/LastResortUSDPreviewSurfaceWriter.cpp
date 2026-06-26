@@ -130,6 +130,32 @@ LastResortUSDPreviewSurfaceWriter::LastResortUSDPreviewSurfaceWriter(
 // `src/Tests/Integration/mtlxShaderWriter_test.ms` pins the bound at
 // the full-export layer by re-exporting the same PhysicalMaterial
 // under both targets in a single test run.
+//
+// MAX-MAT-009 surgical-coverage bound (audit, no logic change): the
+// `diffuseColor` value authored below is a `Color3f` USD attribute,
+// NOT a `UsdUVTexture` shader output -- this writer does not create
+// any child texture nodes. Therefore:
+//   (a) NO `sourceColorSpace` token input is or can be authored --
+//       `sourceColorSpace` is a UsdUVTexture-specific input convention
+//       (UsdPreviewSurface spec). There is no UsdUVTexture child here.
+//   (b) NO `colorSpace` USD metadata is authored on the `diffuseColor`
+//       attribute itself. Per UsdPreviewSurface spec, `diffuseColor`
+//       authored as a Color3f value is **linear by definition**;
+//       tagging it with a `colorSpace` metadata would be misleading
+//       (linear by spec -- renderers ignore the tag) or actively wrong
+//       (an "sRGB" tag would either be ignored or applied
+//       inconsistently across renderers, producing a visible appearance
+//       drift the artist did not author).
+// A future PR that extended this writer to bake a texture would have
+// to author `sourceColorSpace` on its UsdUVTexture child, mirroring
+// the Python `set_bitmap_scale_bias_sourcecolorspace` shape rather
+// than tagging the `diffuseColor` attribute directly. The Python
+// validator's `LastResort_no_colorSpace_anywhere` case pins this
+// bound:
+//   * NO child shader under the Material has id `UsdUVTexture` --
+//     positive control for the value-only writer contract.
+//   * NO `colorSpace` USD metadata on the `diffuseColor` attribute --
+//     positive control that this writer does not invent a tag.
 /* virtual */
 void LastResortUSDPreviewSurfaceWriter::Write()
 {

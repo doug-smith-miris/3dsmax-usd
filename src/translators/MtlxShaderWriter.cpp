@@ -760,6 +760,78 @@ void _ConnectToNodeGraph(
 }
 
 // Sets the value of a USD input based on a MaterialX input.
+//
+// MAX-MAT-009 surgical-coverage bound (audit, no logic change): the
+// `colorSpace` USD metadata is propagated from MaterialX
+// `input->getActiveColorSpace()` IFF BOTH:
+//   (a) `_TypeSupportsColorSpace(input)` returns true -- which by its
+//       definition above is exclusively: a `color3` or `color4` typed
+//       input, OR a `filename` typed input on an image node whose
+//       parent's nodedef output is `color3` / `color4`. EVERY OTHER
+//       input type (float, integer, vector2/3/4, matrix22/33/44,
+//       boolean, string) returns false from the predicate and MUST
+//       NOT receive `colorSpace` metadata even if the source MaterialX
+//       authored one. A widened predicate that accepted float / vector3
+//       inputs would author garbage `colorSpace` USD metadata on
+//       inputs USD's UsdShade does not interpret as color, polluting
+//       downstream tooling that scans for color-space tagging.
+//   (b) `colorSpace.empty()` is false -- the MaterialX active color
+//       space resolution succeeded with a concrete name. An empty
+//       active color space (no `colorspace` attribute on the input,
+//       on the parent node, on the document, AND no nodedef-default
+//       color space) MUST be treated as "no opinion authored" and
+//       MUST NOT cause `usdInput.GetAttr().SetColorSpace(TfToken(""))`
+//       to be called. Stripping the guard would author a TfToken("")
+//       metadata which is observably different from no-metadata-at-all
+//       at the USD attribute layer (`GetColorSpace()` returns ""
+//       for both states, but `HasAuthoredColorSpace()` differs).
+//
+// The audit's primary visible bound (visual auditor pair): a
+// `standard_surface.base_color = (0.5, 0.5, 0.5)` with
+// `colorSpace = "srgb_texture"` renders DARKER than the same value
+// with NO `colorSpace` metadata, because Karma applies the inverse
+// EOTF on the sRGB-tagged input (`pow(0.5, 2.2) ~= 0.218`). A
+// wildcard widening that stripped the `colorSpace`-propagation guards
+// would make both planes render the same un-tagged grey; the
+// renderer would diverge from artist intent on appearance alone.
+//
+// Cross-writer-path divergence (extends MAX-PRIM-001's writer-
+// separation audit to the color-space concern): this MaterialX path
+// authors `colorSpace` USD metadata on UsdShade input attributes; the
+// UsdPreviewSurface Python writer
+// (`src/ApplicationPlugins/usd-component/Contents/scripts/materials/
+// usd_material_writer.py::set_bitmap_scale_bias_sourcecolorspace`)
+// authors `sourceColorSpace` as a TOKEN INPUT on UsdUVTexture with a
+// HARDCODED "raw" value (with TODO -- see that function); the
+// LastResort C++ writer
+// (`src/MaxUsd/Translators/LastResortUSDPreviewSurfaceWriter.cpp`)
+// authors NEITHER, because it produces a `diffuseColor` Color3f
+// value with no UsdUVTexture child (per UsdPreviewSurface spec,
+// `diffuseColor` authored as a value is linear by definition). No
+// shared color-space helper exists or should exist between the
+// three writers -- a unification would have to bridge USD attribute
+// metadata, the UsdUVTexture token-input convention, and a
+// no-tag-by-spec value path simultaneously.
+//
+// Negative test coverage pinning this bound:
+//   * `src/Tests/Integration/mtlxShaderWriter_test.ms` ::
+//     `test_export_material_preserves_color_space_metadata_on_color3_inputs`
+//     -- imports a synthetic MaterialX doc whose color3 input
+//     carries `colorspace="srgb_texture"` and asserts the exported
+//     USD attribute has `colorSpace = "srgb_texture"` metadata,
+//     while sibling float inputs (specular_roughness etc.) have
+//     NO `colorSpace` metadata.
+//   * Python validator
+//     `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+//     a247e60f-cc09-4449-987c-3a7ecaaa88da/
+//     validate_color_space_roundtrip_surgical.py` -- builds a
+//     synthetic USD stage mirroring all three writers' outputs,
+//     asserts 10 named cases enumerating each surgical bound:
+//     Color3WithSRGB, Color3NoColorSpace, FloatInputWithSRGB,
+//     Color4WithSRGB, FilenameOnImageColor3,
+//     FilenameOnImageVector3, BakedDiffuseMap_sourceColorSpace_raw,
+//     BakedNormalMap_scale_bias, LastResort_no_colorSpace_anywhere,
+//     CrossWriter_divergence. Plus idempotence.
 void _SetInputValue(const MaterialX::InputPtr& input, UsdShadeInput& usdInput)
 {
     usdInput.Set(UsdMtlxGetUsdValue(input));

@@ -78,6 +78,7 @@ Status legend:
 | Color / emission helper code in the MaterialX writer (`MtlxShaderWriter.cpp` post-parse normalization passes) vs the UsdPreviewSurface writer (C++ `LastResortUSDPreviewSurfaceWriter.cpp` + Python `DefaultShaderWriter` in `shaderWriter.py`) | NO shared helper, by design. The 5 MaterialX-side passes (specular_rotation, emission default, coat-block, subsurface_radius, spec-default inputs) operate on a `MaterialX::DocumentPtr` and gate on `doc->getNodes("standard_surface")`. The UsdPreviewSurface writer path operates either directly on a `Mtl*` (LastResort C++) or via the `.material_conversion` JSON tables (Python DefaultShaderWriter) -- it has no MaterialX document, no emission-strip helpers, and no shared abstraction with the MaterialX writer | audit (lock-in of existing cross-writer-path bound, no C++ logic change) | `ND_standard_surface_surfaceshader` only (the audit pins the surgical bound between the MaterialX writer's normalizer chain and the UsdPreviewSurface writer path) | `MtlxShaderWriter::Write` runs the chain of normalizers. Surgical bounds: (a) the chain operates on the in-memory MaterialX doc returned by `MtlxIOUtil.ExportMtlxString` and writes nothing to UsdShade until AFTER the chain completes; (b) the UsdPreviewSurface writer entry points (`LastResortUSDPreviewSurfaceWriter::Write` and the Python `DefaultShaderWriter.Write`) do not invoke, import, or share state with the MaterialX normalizers; (c) input vocabularies diverge on every concept the planner's "color-emission helper" could cover -- emissiveColor (UsdPS, color3f default (0,0,0)) vs emission + emission_color (MaterialX, scalar default 0.0 gating color3 default (1,1,1)); diffuseColor (UsdPS, color3f default (0.18,0.18,0.18)) vs base + base_color (MaterialX, scalar default 0.8 gating color3 default (0.8,0.8,0.8)); specularColor (UsdPS) + useSpecularWorkflow toggle vs specular + specular_color (MaterialX); plus topology-collisions (UsdPS opacity is float, MaterialX opacity is color3) and UsdPS-only inputs with no MaterialX analogue (useSpecularWorkflow, direct normal3f normal input); (d) idempotence -- re-running the 5 normalizers does not change behaviour on either side | MAX-PRIM-001 | 2026-06-26 |
 | MultiMtl-bound mesh whose faces carry multiple matIds (`materialIdToFacesMap.size() > 1`) | `UsdGeomMesh.primvars:displayColor` -- the MAX-MAT-003 displayColor block writes a SINGLE-element constant primvar derived from `boundMtl->GetDiffuse()` (which on a MultiMtl returns sub-material 0's diffuse via the default `mtlNum = 0`). The block does NOT consult `materialIdToFacesMap` and does NOT broadcast `boundMtl->GetDiffuse(matId)` per face | audit (lock-in of existing MAX-MAT-003 surgical-coverage bound, no C++ logic change) | (mesh primvar; not a shader nodedef -- the audit pins the surgical bound where the MAX-MAT-003 gate STOPS for MultiMtl-bound meshes) | `MeshConverter::ConvertToUSDMesh` is invoked on a mesh whose `node->GetMtl()` is a MultiMtl AND `materialIdToFacesMap.size() > 1`. Surgical bounds: (a) the displayColor block's `boundMtl->GetDiffuse()` call defaults `mtlNum = 0` and returns sub-mtl 0's diffuse, regardless of how many matIds the mesh carries; (b) the resulting `primvars:displayColor` is a SINGLE-element array with `interpolation = constant` -- the C++ block does not consume `materialIdToFacesMap` even though `ApplyMaxMaterialIDs` (called immediately before the block) does use it to author per-face GeomSubsets in the `materialBind` family (MAX-GEO-002); (c) a wildcard "extend MAX-MAT-003 to per-face for MultiMtl bindings" widening would consume the same `materialIdToFacesMap` to broadcast `boundMtl->GetDiffuse(matId)` per face, authoring `interpolation = uniform` and `len = materialIdToFacesMap.size()` -- the value at `displayColor[0]` would still be sub-mtl 0's diffuse, so every existing displayColor[0] / branch-label / IsAuthored assertion would pass; only the array-length and interpolation invariants catch this widening; (d) the IsAuthored() short-circuit and the wire-color fallback branches are unchanged on the MultiMtl path -- the bound applies only to the `mtl-diffuse` branch when the bound material is a MultiMtl | MAX-MAT-008 | 2026-06-26 |
 | 3ds Max legacy light classes that inherit `LightObject` but NOT `LightscapeLight` (`Omnilight` = `OMNI_LIGHT_CLASS_ID`; `Skylight` = `SKYLIGHT_CLASS_ID`; legacy `Target_Spot` / `Free_Spot` = `SPOT_LIGHT_CLASS_ID`; legacy `Target_Direct` / `Free_Direct` = `DIR_LIGHT_CLASS_ID`; mr_Sky, Daylight environment lights, etc.) | NO `UsdLux*` prim authored -- the writer-registry's only general-purpose light writer (`PhotometricLightWriter`) gates on `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)`, returns `ContextSupport::Unsupported` for every non-LightscapeLight, and `MaxUsdPrimWriterRegistry::FindWriter` returns nullptr (no other registered writer claims a `LightObject`). The light is silently dropped from the exported stage: no prim, no error, no warning | audit (lock-in of existing writer-registry surgical-coverage bound, no C++ logic change) | (UsdLux schema; not a shader nodedef -- the audit pins the writer-registry's bottom bound for lights) | `PhotometricLightWriter::CanExport` is invoked AND `!exportArgs.GetTranslateLights() || !object->IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)`. Surgical bounds: (a) the LIGHTSCAPE_LIGHT_CLASS branch returns `ContextSupport::Fallback` so in-scope photometric / physical lights are authored as the correct `UsdLuxDiskLight` / `UsdLuxRectLight` / `UsdLuxSphereLight` / `UsdLuxCylinderLight` per `GetPrimType` -- the positive control proves this still fires; (b) every non-LightscapeLight LightObject (legacy Omnilight, Skylight, Spot, Direct, etc.) returns Unsupported AND no other registered writer claims the LightObject category -- silent drop. A wildcard widening that returned `Fallback` for every LightObject and stamped out default UsdLuxSphereLight / UsdLuxDomeLight without per-class attribute translation would author spurious extra lights at every legacy light position (e.g. an Omnilight that was turned OFF / set to multiplier 0 / set to a non-default attenuation/color in Max would silently appear as a unit-intensity SphereLight in USD); (c) the `exportArgs.GetTranslateLights()` short-circuit fires BEFORE the class-id gate -- a user who disables light export sees the same nullptr for every light type, including in-scope photometrics; (d) `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)` is safely callable on non-light Objects (returns false) so the gate is well-behaved across all node types | MAX-LIT-001 | 2026-06-26 |
+| Color-space metadata across all three USD-shading writer paths: `MtlxShaderWriter::_SetInputValue` (color3/color4 inputs + filename-on-image-color-output inputs); `set_bitmap_scale_bias_sourcecolorspace` in `usd_material_writer.py` (every UsdUVTexture); `LastResortUSDPreviewSurfaceWriter::Write` (Color3f diffuseColor value, no UsdUVTexture) | Three divergent conventions, one per writer: MaterialX path authors `colorSpace` USD metadata on the UsdShade input attribute IFF `_TypeSupportsColorSpace(input)` is true AND `getActiveColorSpace()` is non-empty; UsdPreviewSurface Python writer authors `sourceColorSpace = "raw"` as a TOKEN INPUT on every baked UsdUVTexture (hardcoded with TODO retirement condition); LastResort C++ writer authors NEITHER colorSpace nor sourceColorSpace -- `diffuseColor` is linear by UsdPreviewSurface spec when authored as a Color3f value | audit (lock-in of existing cross-writer color-space surgical-coverage bound, no C++ logic change) | (multiple: `colorSpace` USD metadata on UsdShade input attrs for MaterialX shaders; `sourceColorSpace` TOKEN INPUT on UsdUVTexture for baked UsdPreviewSurface paths; no colorSpace anywhere on the LastResort value-only path) | `_SetInputValue` is invoked AND `_TypeSupportsColorSpace(input)` is true AND `getActiveColorSpace()` is non-empty -- the MaterialX path propagates; `set_bitmap_scale_bias_sourcecolorspace` is invoked on a baked UsdUVTexture -- always hardcoded "raw" pending TODO retirement; `LastResortUSDPreviewSurfaceWriter::Write` is invoked -- value-only, no UsdUVTexture, no colorSpace by UsdPreviewSurface spec. Surgical bounds: (a) `_TypeSupportsColorSpace` accepts ONLY color3/color4 typed inputs OR filename inputs on image nodes with color3/color4 output -- every other input type (float, vector3, matrix, etc.) MUST NEVER receive colorSpace metadata even when the MaterialX active color space resolves to a non-empty name; (b) `if (!colorSpace.empty())` short-circuit -- empty active color space MUST NOT cause `SetColorSpace(TfToken(""))` because that creates authored-empty metadata distinct from no-metadata-at-all; (c) hardcoded `sourceColorSpace = "raw"` is the acknowledged-incomplete UsdPreviewSurface bound -- retirement requires a future MAX-MAT-* that consults `from_tex.bitmap.gamma` and adds an sRGB-gamma test case to `export_texture_test.py`; (d) LastResort writer authors NO UsdUVTexture child AND NO `colorSpace` metadata on `diffuseColor` -- per UsdPreviewSurface spec, the value is linear by definition | MAX-MAT-009 | 2026-06-26 |
 
 ## Notes per expression
 
@@ -3340,6 +3341,236 @@ planner's auto-emitted "extend MAX-MAT-003 to per-face for MultiMtl
 bindings" PR from shipping unverified C++ that silently mutates
 artist-visible primvar-fallback output on every MultiMtl-bound export.
 
+### Color-space round-trip across the three USD-shading writer paths (audit, MaterialX / UsdPreviewSurface / LastResort each STOP at their own convention)  (MAX-MAT-009)
+
+**Symptom.** The 3ds Max → USD exporter authors color-space metadata
+across THREE divergent USD-shading writer paths, with three different
+conventions:
+
+1. **MaterialX writer (C++)** —
+   `src/translators/MtlxShaderWriter.cpp`.
+   `_TypeSupportsColorSpace(input)` returns true ONLY for `color3` or
+   `color4` typed inputs, OR `filename` typed inputs on an image node
+   whose nodedef output is `color3` / `color4`. `_SetInputValue` then
+   propagates `input->getActiveColorSpace()` to the USD attribute's
+   `colorSpace` metadata via `usdInput.GetAttr().SetColorSpace(...)`
+   IFF the active color space resolves to a non-empty string.
+2. **UsdPreviewSurface Python writer** —
+   `src/ApplicationPlugins/usd-component/Contents/scripts/materials/
+   usd_material_writer.py::set_bitmap_scale_bias_sourcecolorspace`.
+   Hardcodes `sourceColorSpace = "raw"` as a TOKEN INPUT on every
+   baked UsdUVTexture. An explicit TODO at line 116-118 marks this as
+   incomplete: the Max source bitmap's `bitmap.gamma` is not
+   consulted, so a gamma=2.2 sRGB-tagged source diffuse map exports
+   as `sourceColorSpace = "raw"` even though the renderer should be
+   applying inverse-EOTF.
+3. **LastResort C++ writer** —
+   `src/MaxUsd/Translators/LastResortUSDPreviewSurfaceWriter.cpp`.
+   Authors `inputs:diffuseColor` as a `Color3f` USD value from
+   `Mtl::GetDiffuse()` and nothing else. NO `UsdUVTexture` child, NO
+   `sourceColorSpace`, NO `colorSpace` USD metadata on the value
+   attribute. Per UsdPreviewSurface spec, `diffuseColor` authored as
+   a value is **linear by definition**.
+
+The planner auto-emitted `color-space-roundtrip-correctness` with
+severity High and rationale "End-to-end colorimetric audit: sRGB vs
+linear, MaterialX vs UsdPreviewSurface, OCIO config". The audit's
+job is to **lock in the cross-writer color-space surgical bound with
+negative-test coverage** — no C++ logic change.
+
+**Why it matters.** Each of the three writers' color-space conventions
+is correct for its own target schema, but they DIVERGE on every axis a
+"unify color-space handling" refactor would have to bridge:
+
+| Concept | MaterialX writer (UsdShade) | UsdPreviewSurface Python (UsdUVTexture) | LastResort C++ (value-only) |
+| --- | --- | --- | --- |
+| Authoring surface | USD attribute `colorSpace` METADATA on the UsdShadeInput attr | `sourceColorSpace` USD TOKEN INPUT on UsdUVTexture | NONE — neither the attribute's `colorSpace` metadata nor a `sourceColorSpace` input |
+| Source resolution | MaterialX `input->getActiveColorSpace()` (per-input → per-node → per-document hierarchical resolution) | Hardcoded literal `"raw"` (TODO: consult `from_tex.bitmap.gamma`) | N/A — linear by UsdPreviewSurface spec |
+| Type-gated | `color3`, `color4`, or `filename` on image with color3/color4 output | Every UsdUVTexture (no type gating; `sourceColorSpace` is always authored) | N/A — no UsdUVTexture |
+| Empty value behavior | Short-circuit on `colorSpace.empty()`: NO metadata authored | Always authors a literal `"raw"`; the input is never absent | N/A — never authors |
+| Failure mode of a wildcard widening | Authoring `colorSpace` on non-color types (float / vector3 / matrix) -- garbage metadata downstream tools may interpret as color | Changing the hardcoded literal without doing the gamma-consultation work -- the TODO retirement | Inventing a `colorSpace` metadata on the linear-by-spec value -- misleading or actively wrong depending on the renderer |
+
+The three writers serve three different output schemas
+(MaterialX → UsdShade; UsdPreviewSurface bake → UsdUVTexture;
+UsdPreviewSurface value-only → no texture). Each schema's convention
+is what its consuming renderers expect. A wildcard "unify color-
+space handling" refactor that ported any one writer's convention to
+another would either:
+
+* silently strip artist-authored `colorSpace` from MaterialX inputs
+  (because UsdUVTexture's `sourceColorSpace` is a token input, not a
+  USD-attr metadata, so the convention does not transfer 1:1);
+* author a USD-attr `colorSpace` on a UsdUVTexture's file Asset input
+  (which UsdPreviewSurface ignores at render time, so the metadata
+  would be dead bytes BUT it would diverge from the renderer-honored
+  `sourceColorSpace` token input on the same UsdUVTexture, creating
+  a self-inconsistent shading prim); or
+* invent `sourceColorSpace` / `colorSpace` on the LastResort writer's
+  value-only `diffuseColor` (which the UsdPreviewSurface spec says is
+  linear by definition -- the tag is at best ignored, at worst
+  honored inconsistently across renderers, producing visible
+  appearance drift the artist did not author).
+
+**Fix.** None. The existing C++ + Python is already correct (modulo
+the acknowledged-incomplete `usd_material_writer.py` TODO whose
+retirement is a SEPARATE future bite). The audit lands:
+
+1. **Surgical-bounds comment block** at three sites:
+   * `MtlxShaderWriter.cpp::_SetInputValue` -- documents the two
+     guards (`_TypeSupportsColorSpace(input)` AND
+     `!colorSpace.empty()`) and the visible bound (a wildcard widening
+     causes the visual auditor pair's LEFT plane to render the same
+     mid-grey as the RIGHT plane).
+   * `usd_material_writer.py::set_bitmap_scale_bias_sourcecolorspace`
+     -- documents the hardcoded "raw" as the surgical bound the
+     validator pins, the retirement condition (consult
+     `from_tex.bitmap.gamma`, map gamma>=2.2 to "sRGB" for color
+     targets, gamma=1.0 to "raw" for color and non-color), and the
+     forward-pointer to which future MAX-MAT-* would retire it.
+   * `LastResortUSDPreviewSurfaceWriter::Write` -- documents the
+     value-only contract (NO UsdUVTexture, NO sourceColorSpace, NO
+     colorSpace metadata) per UsdPreviewSurface spec.
+
+2. **MaxScript regression**
+   `test_export_material_preserves_color_space_metadata_on_color3_inputs`
+   in `src/Tests/Integration/mtlxShaderWriter_test.ms`. Loads
+   `src/Tests/Integration/data/intentional_color_space_test/intentional_color_space.mtlx`
+   (a synthetic `standard_surface` whose `base_color` color3 input
+   AND three float-typed inputs (`base`, `specular_roughness`,
+   `specular_IOR`) all carry `colorspace="srgb_texture"`). Imports
+   via `MaterialXMaterial.importMaterial`, exports through
+   `USDExporter` to a USD file, and asserts:
+   * **Positive control** — the color3 `base_color` USD attribute
+     carries `colorSpace = "srgb_texture"` metadata. The
+     MaterialX-side `colorspace` attribute survived parsing,
+     `getActiveColorSpace()` resolved to "srgb_texture", and
+     `_SetInputValue`'s propagation ran.
+   * **Negative control 1/2/3** — the float-typed `base`,
+     `specular_roughness`, `specular_IOR` inputs, even though they
+     ALSO carry `colorspace="srgb_texture"` on the source MaterialX
+     side, MUST NEVER carry `colorSpace` USD metadata on the
+     exported attribute. `_TypeSupportsColorSpace` rejects float-typed
+     inputs and short-circuits the propagation. The permissive shape
+     (absent OR present-with-empty-colorSpace) accommodates
+     MAX-MAT-006's parallel spec-default strip on the
+     nodedef-default values (0.8 / 0.2 / 1.5). Gated on Max 2025+
+     (`maxver[1] >= 26900`).
+
+3. **Python validator** at
+   `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/a247e60f-cc09-4449-987c-3a7ecaaa88da/validate_color_space_roundtrip_surgical.py`.
+   Builds a synthetic USD stage mirroring exactly what the three
+   writers produce, then asserts 10 named cases enumerating each
+   surgical bound:
+
+   | Case in synthetic fixture | Surgical bound exercised |
+   | --- | --- |
+   | `Color3WithSRGB` | color3 + non-empty active color space → `colorSpace` USD metadata propagated |
+   | `Color3NoColorSpace` | color3 + empty active color space → NO `colorSpace` metadata (the `if (!colorSpace.empty())` guard) |
+   | `FloatInputWithSRGB` | float-typed input → NEVER receives `colorSpace`, regardless of active color space (the `_TypeSupportsColorSpace` predicate) |
+   | `Color4WithSRGB` | color4 + non-empty → `colorSpace` propagated (predicate accepts color3 AND color4) |
+   | `FilenameOnImageColor3` | filename input on image node with color3 output → `colorSpace` propagated |
+   | `FilenameOnImageVector3` | filename input on image node with vector3 output (normalmap) → NO `colorSpace` (predicate's filename-on-color-output check) |
+   | `BakedDiffuseMap_sourceColorSpace_raw` | Python-baked UsdUVTexture → `sourceColorSpace = "raw"` hardcode; NO `colorSpace` metadata on the file Asset input |
+   | `BakedNormalMap_scale_bias` | same hardcoded "raw" plus normal-map scale (2,2,2,1) + bias (-1,-1,-1,0) |
+   | `LastResort_no_colorSpace_anywhere` | value-only diffuseColor: NO UsdUVTexture child, NO `colorSpace` USD metadata on the diffuseColor attribute |
+   | `CrossWriter_divergence` | all three writers preserve their own convention on the same exported scene -- the MaterialX shader carries `colorSpace="srgb_texture"`, the UsdUVTexture carries `sourceColorSpace="raw"`, the LastResort shader carries neither and has no UsdUVTexture child |
+
+   Plus an idempotence check (a second pass over the same fixture
+   yields identical PASS state on all 10 cases). All 10 cases +
+   idempotence pass on the 2026-06-26 baseline, locking in the
+   surgical bound. A future regression that widened any of the three
+   writers' color-space conventions would fail by named case.
+
+**Bounds (where the C++ + Python today conservatively does nothing):**
+
+* `_TypeSupportsColorSpace` iterates EXACTLY: `color3` value input,
+  `color4` value input, `filename` input on an image node whose
+  nodedef output is `color3` / `color4`. Every other input type or
+  parent-node category is filtered out. The C++ does not consult
+  `usd_material_writer.py` and does not share state with it.
+* `_SetInputValue`'s `if (!colorSpace.empty())` guard fires BEFORE
+  the actual `SetColorSpace` call -- empty-string active color space
+  means "no opinion authored", and the C++ deliberately does not
+  author the empty string. A widened guard would create
+  `HasAuthoredColorSpace() == true` with `GetColorSpace() == ""`,
+  semantically distinct from the no-metadata state.
+* `set_bitmap_scale_bias_sourcecolorspace` hardcodes "raw" with an
+  explicit TODO. The Python writer does not consult MaterialX's
+  active color space (there is no MaterialX document on this path),
+  does not share helper code with the MaterialX writer, and does
+  not propagate `colorSpace` USD metadata anywhere -- the
+  UsdPreviewSurface convention is the `sourceColorSpace` token
+  input only.
+* `LastResortUSDPreviewSurfaceWriter::Write` does not invoke either
+  of the above. It authors a Color3f value attribute and nothing
+  else; no UsdUVTexture child is created so the `sourceColorSpace`
+  convention does not apply, and tagging the value attribute with
+  `colorSpace` would either be ignored (linear-by-spec) or actively
+  wrong (would diverge from UsdPreviewSurface renderer expectations).
+
+**Visual demonstration of the surgical bound.** Two flat planes
+side-by-side, each carrying a `standard_surface` shader with
+`base_color = (0.5, 0.5, 0.5)` -- numerically identical. The only
+difference: the LEFT plane's `base_color` attribute has
+`colorSpace = "srgb_texture"` USD metadata authored; the RIGHT plane
+has no `colorSpace`. Lit by a DistantLight + DomeLight and rendered
+in Karma CPU at 512x341.
+
+`render_karma_postfix.png` (the current correct behavior): the LEFT
+plane renders visibly DARKER than the RIGHT plane because Karma
+honors the `colorSpace = "srgb_texture"` tag and applies the inverse
+EOTF on the LEFT plane's linear value
+(`pow(0.5, 2.2) ~= 0.218`), while the RIGHT plane sees the linear
+value `0.5` directly. Measured per-channel means over each half of
+the frame:
+
+```
+LEFT half (sRGB-tagged)         mean  R=0.1598  G=0.1598  B=0.1598
+RIGHT half (untagged)           mean  R=0.2352  G=0.2352  B=0.2352
+RIGHT - LEFT                    mean  R=+0.0753 G=+0.0753 B=+0.0753  (~+19/255, all 3 channels, monotone)
+PNG SHA-256                     8100c2c7...
+```
+
+`render_unreal_reference.png` (the "still-broken" wildcard-widening
+counterfactual): the LEFT plane's `colorSpace` metadata has been
+stripped. Both planes render as a UNIFORM mid-grey -- the LEFT
+plane is no longer darker than the RIGHT:
+
+```
+LEFT half (untagged)            mean  R=0.2352  G=0.2352  B=0.2352
+RIGHT half (untagged)           mean  R=0.2352  G=0.2352  B=0.2352
+RIGHT - LEFT                    mean  R=0.0000  G=0.0000  B=0.0000   (uniform, undetectable)
+PNG SHA-256                     9127fbc3...
+```
+
+The two PNGs differ by SHA-256 and visibly so. Composite at
+`compare_side_by_side.png` in the same arch-build dir. **The
+auditor's checklist: the postfix render's LEFT plane reads darker
+than its RIGHT plane (RIGHT - LEFT > 0 on all channels); the
+still-broken reference's two planes render byte-identical (RIGHT -
+LEFT == 0 on all channels); the two PNGs have distinct SHA-256s.**
+Unlike MAX-MAT-007's SSS-lobe-diluted bound, this delta is large and
+unambiguous because Karma's inverse-EOTF on a mid-grey produces a
+~32% relative intensity drop on the rendered byte values.
+
+**Retirement condition.** This audit does not have an upstream-fix
+retirement condition. The bound it locks in is a SCOPE limit on
+Miris-authored C++ + Python: the three writers' color-space
+conventions stay distinct, with each writer authoring only its own
+target schema's convention. Retirement requires a SEPARATE future
+MAX-MAT-* bite (with its own captured corpus, MaxScript regression,
+doc entry, and validator) that bridges any two of the three
+writers' color-space conventions -- not a wildcard widening of the
+existing predicates. The specific known retirement work the audit's
+Python writer comment block points at is the gamma-consultation
+swap in `set_bitmap_scale_bias_sourcecolorspace`: a future MAX-MAT-*
+that reads `from_tex.bitmap.gamma`, maps gamma>=2.2 to
+`sourceColorSpace = "sRGB"` for color-bearing inputs, and maps
+gamma=1.0 to `sourceColorSpace = "raw"` for all targets -- with a
+new MaxScript test case in `export_texture_test.py` exercising an
+sRGB-gamma diffuse map. Until that bite lands, the hardcoded "raw"
+is the surgical bound.
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -4114,3 +4345,82 @@ artist-visible primvar-fallback output on every MultiMtl-bound export.
   a `MaxUsdLegacySkylightWriter`, etc.) with its own attribute-
   translation audit; until then, the silent drop is the documented,
   locked-in behaviour.
+* 2026-06-26 — MAX-MAT-009 color-space round-trip surgical-coverage
+  audit: introduce the MAX-MAT-009 entry to the mapping doc, locking
+  in the cross-writer color-space conventions across the three
+  USD-shading writer paths the fork ships -- `MtlxShaderWriter`
+  (MaterialX), the Python `usd_material_writer` (UsdPreviewSurface
+  bake path), and `LastResortUSDPreviewSurfaceWriter` (UsdPreviewSurface
+  value-only). The planner auto-emitted
+  `color-space-roundtrip-correctness` (severity High, rationale
+  "End-to-end colorimetric audit: sRGB vs linear, MaterialX vs
+  UsdPreviewSurface, OCIO config") without a captured corpus of
+  color-space mistranslations. **Why the wildcard widening would be
+  wrong**: each writer's color-space convention is correct for its
+  own target schema (UsdShadeInput attribute `colorSpace` metadata
+  for MaterialX; `sourceColorSpace` token input on UsdUVTexture for
+  the bake path; nothing for the linear-by-spec value-only path).
+  Bridging them with a "unify color-space helper" would either
+  silently strip the MaterialX `colorSpace` metadata (because
+  UsdUVTexture's `sourceColorSpace` is a token input, not a USD-attr
+  metadata, so the conventions don't transfer 1:1), author a
+  USD-attr `colorSpace` on the bake path's file Asset input (which
+  UsdPreviewSurface ignores at render time, creating a
+  self-inconsistent shading prim), or invent a `colorSpace` on the
+  LastResort value-only `diffuseColor` (which the UsdPreviewSurface
+  spec says is linear by definition -- the tag is at best ignored,
+  at worst honored inconsistently across renderers). Surgical-bounds
+  comment block added to three sites:
+  `MtlxShaderWriter.cpp::_SetInputValue` (documents
+  `_TypeSupportsColorSpace` predicate + `getActiveColorSpace().empty()`
+  short-circuit + the cross-writer divergence table);
+  `usd_material_writer.py::set_bitmap_scale_bias_sourcecolorspace`
+  (documents the hardcoded `"raw"` as the surgical bound the
+  validator pins, plus the gamma-consultation work that a future
+  MAX-MAT-* would do to retire the TODO);
+  `LastResortUSDPreviewSurfaceWriter.cpp::Write` (documents the
+  value-only contract -- no UsdUVTexture child, no `sourceColorSpace`,
+  no `colorSpace` metadata, per UsdPreviewSurface spec). New
+  MaxScript regression
+  `test_export_material_preserves_color_space_metadata_on_color3_inputs`
+  added to `src/Tests/Integration/mtlxShaderWriter_test.ms`: loads
+  `src/Tests/Integration/data/intentional_color_space_test/intentional_color_space.mtlx`
+  (a synthetic `standard_surface` whose `base_color` color3 input AND
+  three float-typed inputs all carry `colorspace="srgb_texture"`),
+  imports + exports, asserts the color3 attribute's `colorSpace`
+  metadata is `"srgb_texture"` AND the three float-typed inputs
+  carry NO `colorSpace` metadata even though their MaterialX
+  source-side colorspace attribute did. Gated on Max 2025+. Python
+  validator
+  `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/a247e60f-cc09-4449-987c-3a7ecaaa88da/validate_color_space_roundtrip_surgical.py`
+  builds a synthetic USD stage mirroring all three writers' outputs
+  and asserts 10 named cases enumerating each surgical bound
+  (`Color3WithSRGB`, `Color3NoColorSpace`, `FloatInputWithSRGB`,
+  `Color4WithSRGB`, `FilenameOnImageColor3`,
+  `FilenameOnImageVector3`, `BakedDiffuseMap_sourceColorSpace_raw`,
+  `BakedNormalMap_scale_bias`, `LastResort_no_colorSpace_anywhere`,
+  `CrossWriter_divergence`) plus idempotence. All 10 cases +
+  idempotence PASS on the 2026-06-26 baseline. Karma CPU visual
+  auditor pair (`render_karma_postfix.png` /
+  `render_unreal_reference.png` / `compare_side_by_side.png`) in the
+  same arch-build dir captures the inverse-EOTF observable: two flat
+  planes side-by-side with `base_color = (0.5, 0.5, 0.5)`, LEFT
+  plane sRGB-tagged + RIGHT plane untagged. **The auditor's
+  checklist: postfix has the LEFT plane visibly darker than the
+  RIGHT (RIGHT - LEFT = +0.075 on all three channels, monotone);
+  still-broken has uniform mid-grey across both planes (RIGHT -
+  LEFT = 0 on all channels); the two PNGs have distinct SHA-256s
+  (`8100c2c7…` vs `9127fbc3…`)**. A refactor that ever made the
+  postfix render with uniform grey across both planes or made the
+  LEFT plane brighter than the RIGHT would mean the MaterialX
+  writer's `colorSpace` propagation has broken and the surgical
+  bound is no longer preserved. No C++ logic change in this bite —
+  purely additive test + doc infrastructure that locks in the
+  cross-writer color-space surgical bound before any wildcard
+  widening refactor lands. Retires the day a future MAX-MAT-* bridges
+  any two of the three writers' color-space conventions with its own
+  captured corpus + its own MaxScript regression + its own doc entry
+  (the specific known retirement work being the gamma-consultation
+  swap in `set_bitmap_scale_bias_sourcecolorspace`); until then, the
+  three divergent conventions are the documented, locked-in
+  behaviour.
