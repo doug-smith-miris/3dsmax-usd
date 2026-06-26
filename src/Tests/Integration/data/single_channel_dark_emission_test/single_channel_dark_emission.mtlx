@@ -1,0 +1,67 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  MAX-MAT-002 surgical-preservation fixture (second reinforcement,
+  tolerance-band edge case).
+
+  Carries an INTENTIONAL emission pair at the per-component edge of the
+  normalizer's color gate:
+
+    emission       = 1.0                (matches the leak scalar EXACTLY)
+    emission_color = (0.05, 0.0, 0.0)   (one channel just barely above
+                                         the per-component epsilon)
+
+  This case sits at the bound the first reinforcement's
+  IntentionalColor / IntentionalScalar cases do NOT exercise. The first
+  reinforcement's fixture uses (0.8, 0.4, 0.1) -- way outside the gate
+  on all three channels and large in magnitude (~0.9). A future refactor
+  that switched the per-component check to a magnitude check
+  (||c|| < epsilon) would still correctly preserve (0.8, 0.4, 0.1) but
+  would silently strip (0.05, 0, 0): magnitude 0.05 is smaller than any
+  reasonable magnitude threshold a refactor might pick.
+
+  The surgical bound the test enforces: the C++ gate must reject this
+  pair on the per-component check of channel 0 (0.05 > 1e-6), preserving
+  both inputs verbatim in the exported USD. A faint dark-red glow is
+  visually observable in the Karma audit pair.
+
+  All other inputs are at MaterialX standard_surface nodedef defaults so
+  the test focuses on emission behaviour and is robust to the parallel
+  MAX-MAT-001/004/005 normalization passes (none of which match).
+-->
+<materialx version="1.38">
+  <standard_surface name="SR_SingleChannelDarkEmission" type="surfaceshader">
+    <input name="base" type="float" value="0.8" />
+    <input name="base_color" type="color3" value=" 0.500000, 0.500000, 0.500000" />
+    <input name="diffuse_roughness" type="float" value="0.0" />
+    <input name="metalness" type="float" value="0.0" />
+    <input name="specular" type="float" value="1.0" />
+    <input name="specular_color" type="color3" value=" 1.000000, 1.000000, 1.000000" />
+    <input name="specular_roughness" type="float" value="0.2" />
+    <input name="specular_IOR" type="float" value="1.5" />
+    <input name="specular_anisotropy" type="float" value="0.0" />
+    <input name="specular_rotation" type="float" value="0.0" />
+    <input name="transmission" type="float" value="0.0" />
+    <input name="transmission_color" type="color3" value=" 1.000000, 1.000000, 1.000000" />
+    <input name="transmission_depth" type="float" value="0.0" />
+    <input name="subsurface" type="float" value="0.0" />
+    <input name="subsurface_color" type="color3" value=" 1.000000, 1.000000, 1.000000" />
+    <input name="subsurface_radius" type="color3" value=" 1.000000, 1.000000, 1.000000" />
+    <input name="subsurface_scale" type="float" value="1.0" />
+    <input name="sheen" type="float" value="0.0" />
+    <input name="sheen_color" type="color3" value=" 1.000000, 1.000000, 1.000000" />
+    <input name="sheen_roughness" type="float" value="0.3" />
+    <input name="coat" type="float" value="0.0" />
+    <input name="coat_color" type="color3" value=" 1.000000, 1.000000, 1.000000" />
+    <input name="coat_roughness" type="float" value="0.1" />
+    <input name="coat_IOR" type="float" value="1.5" />
+    <input name="coat_affect_color" type="float" value="0.0" />
+    <input name="coat_affect_roughness" type="float" value="0.0" />
+    <input name="emission" type="float" value="1.0" />
+    <input name="emission_color" type="color3" value=" 0.050000, 0.000000, 0.000000" />
+    <input name="opacity" type="color3" value=" 1.000000, 1.000000, 1.000000" />
+    <input name="thin_walled" type="boolean" value="false" />
+  </standard_surface>
+  <surfacematerial name="SingleChannelDarkEmission" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="SR_SingleChannelDarkEmission" />
+  </surfacematerial>
+</materialx>
