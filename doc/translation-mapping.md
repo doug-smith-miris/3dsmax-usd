@@ -48,6 +48,12 @@ Status legend:
   exporter should produce.
 * **no equivalent** — the source property has no MaterialX representation;
   the writer emits a `TF_WARN` so the divergence is observable.
+* **observability hint** — the exporter authors USD-correct output, but a
+  silent semantic gap exists between what 3ds Max records and what
+  downstream USD consumers assume (most commonly the unit-system mismatch
+  documented as MAX-UNIT-001). The fix is a `MaxUsd::Log::Warn` call so the
+  artist sees the divergence at export time and can either reconfigure
+  3ds Max or post-process the USD; the exported bytes are unchanged.
 
 ## Status
 
@@ -64,6 +70,7 @@ Status legend:
 | Per-face matIds on a mesh whose bound material is non-MultiMtl | (no GeomSubsets; first matId stored as `customData.3dsmax.matId` on the Mesh prim) | bug normalization | (Mesh prim; not a shader nodedef) | `materialIdToFacesMap.size() > 1` AND `node->GetMtl()` is null or a non-MultiMtl AND the prim does not already have existing `materialBind` subsets | MAX-GEO-002 | 2026-06-20 |
 | GeomSubset name for the null / non-Multi / unnamed-slot fallback path | `mat_{maxScriptId}` (single material) / `mat_{maxScriptId}_{subMtlName}` (multi w/o slot name) | cosmetic normalization | (Mesh / GeomSubset prim name; not a shader nodedef) | `MaterialUtils::CreateSubsetName` is invoked AND (the bound material is null/non-Multi OR the Multi/Sub-Object slot name is empty) | MAX-GEO-003 | 2026-06-20 |
 | 3ds Max camera Near Clip / Far Clip values (every camera type, regardless of "Clip Manually") | `UsdGeomCamera.clippingRange` | bug normalization | (camera schema attribute; not a shader nodedef) | `CameraWriter::Write` is invoked AND the camera object resolves as a `GenCamera` -- the writer now authors `clippingRange` unconditionally from `GetClipDist(...)` rather than gating on `GetManualClip() != 0`, with degenerate values (≤ 0, NaN, far ≤ near) sanity-clamped to `(1.0, 1000.0)` in scene units | (this PR) | 2026-06-20 |
+| 3ds Max system unit (Customize > Units Setup > System Unit Setup) | `UsdStage` `metersPerUnit` layer metadata | observability hint | (stage layer metadata; not a shader nodedef) | `USDSceneBuilder::BuildStage` is creating a new stage AND `GetSystemUnitScale(UNITS_METERS)` rounded to `digits10` is NOT exactly 1.0. The metersPerUnit value is still authored faithfully (USD-correct); a `MaxUsd::Log::Warn` is emitted naming the value, the implied 1-unit-to-meter factor, the downstream consumers that assume meters (Karma at 1:1, ARKit / Quick Look, Miris asset ingest, glTF), and both workarounds (set Max units to meters before export; or post-scale + rewrite metersPerUnit). The bound: a scene already in meters (`stageScale == 1.0`) stays silent | MAX-UNIT-001 | 2026-06-26 |
 
 ## Notes per expression
 
@@ -1423,6 +1430,175 @@ values are the only intentional near/far metadata Max carries about a
 camera; honouring them is correct regardless of the upstream
 `GetManualClip()` toggle.
 
+### 3ds Max system unit → UsdStage metersPerUnit  (MAX-UNIT-001)
+
+**Symptom.** 3ds Max's default scene system unit is **inches**
+(`Customize > Units Setup > System Unit Setup`). When the exporter
+authors `metersPerUnit` from this scene, `UsdGeomSetStageMetersPerUnit`
+records `0.0254` — USD-correct (1 Max unit = 1 inch = 0.0254 m), but a
+silent semantic mismatch with the most common downstream USD consumers:
+
+* **Houdini Karma at default 1:1** — interprets scene-unit positions as
+  meters internally; assets-in-inches that aren't pre-rescaled appear at
+  the wrong physical scale relative to a meter-anchored world.
+* **ARKit / Quick Look** — assumes meters; an asset in inches imports at
+  1/39th of its authored footprint.
+* **Miris asset ingest** — per
+  [docs.miris.com/preparing-assets/usd-guidelines](https://docs.miris.com/preparing-assets/usd-guidelines),
+  `metersPerUnit` must equal 1 and the asset must measure between
+  1 cm³ and 100 km³. A direct upload of a `metersPerUnit=0.0254` Max
+  export fails ingest outright.
+* **glTF importers** — glTF is meter-native; tools that bridge USD →
+  glTF either silently rescale or report a units mismatch.
+
+The diagnostic corpus
+(`/Users/d.smith/MirisProjects/Agent Builder/agent/pipeline-runs/3e596cac-1d4f-45fe-82eb-afa09679eae9/complex_export.usda`)
+exhibits the canonical case: `metersPerUnit = 0.0254` because the source
+Max scene used inches. Of the four PRs the diagnostic agent identified
+as not yet landed in the v0.15.0.14 installed binary, this one is the
+only "metadata + layer structure" finding — every other entry mutates
+shader inputs or primvars.
+
+**Why it matters.** Unlike the MAX-MAT-* normalizers, this is not a
+buggy default the exporter should overwrite — `metersPerUnit = 0.0254`
+is the right answer for a scene authored in inches. The problem is
+*signal*: the artist has no warning at export time that the resulting
+USD will be at unit-mismatched scale in downstream meter-anchored
+pipelines. A successful export silently produces an asset that:
+
+* renders 39× off-scale in Karma without explicit rescale,
+* fails Miris ingest outright,
+* imports tiny in ARKit / Quick Look,
+* and silently mismatches a glTF export converter.
+
+Each of those failure modes is opaque from inside 3ds Max — the artist
+sees a successful export, opens the asset elsewhere, and finds it broken
+without ever seeing a unit-related message.
+
+**Fix.** Add a single `MaxUsd::Log::Warn` call in
+`USDSceneBuilder::BuildStage` immediately after
+`pxr::UsdGeomSetStageMetersPerUnit`. The warning fires when the rounded
+`stageScale` is not exactly 1.0 (i.e. the source scene is NOT in
+meters), and the message names:
+
+1. the metersPerUnit value written into the layer,
+2. the implied 1-Max-unit-to-meter factor,
+3. the four downstream consumers above by name (including the explicit
+   "metersPerUnit must equal 1" Miris ingest constraint, which is the
+   most acute of the four),
+4. both catalog workarounds — set Max's system unit to meters before
+   exporting (3ds Max rescales geometry to preserve physical sizes); or
+   post-scale the root prim's `xformOp:scale` by the factor and rewrite
+   `metersPerUnit = 1.0` after the fact.
+
+The exported USD bytes are unchanged; the warning is observability, not
+a value rewrite. This is the **observability hint** kind introduced for
+this bite.
+
+**Bounds (where the fix conservatively does nothing):**
+
+* `stageScale == 1.0` exactly (scene already in meters) — no warning;
+  the gate's epsilon is `1e-9`, well below the digits10=6 rounding step
+  immediately above the warning, so a meters-scene cannot accidentally
+  trigger it.
+* `isNewStage == false` (exporting into an existing stage) — the
+  warning lives inside the `if (isNewStage)` block where
+  `SetStageMetersPerUnit` itself runs. When the exporter merges into an
+  existing stage it does NOT re-author the metersPerUnit, so the
+  warning would be misleading and is structurally skipped.
+* The warning is `MaxUsd::Log::Warn`, not `MaxUsd::Log::Error` — the
+  export still succeeds. Artists who intentionally want sub-meter or
+  super-meter scales (e.g. very small jewelry, very large architectural
+  walkthroughs) see the warning and can ignore it; the choice of unit
+  is theirs.
+* The warning fires once per export (not per material or per prim) —
+  it's emitted from the single `SetStageMetersPerUnit` call site.
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/f91079a4-a515-4957-8078-592e21faf5aa/validate_meters_per_unit_warning_surgical.py`
+mirrors the C++ gate at the USD layer. Each case authors a synthetic
+stage with the target `metersPerUnit`, applies the same digits10=6
+rounding the C++ helper does, and asks `would_warn(rounded)` against
+the expected outcome. Nine cases cover every branch the gate selects:
+
+| Case | raw scale | rounded | expected warn | bound exercised |
+| --- | --- | --- | --- | --- |
+| `InchesDefault`                  | 0.0254       | 0.0254  | yes | 3ds Max default; the canonical MAX-UNIT-001 case |
+| `Millimeters`                    | 0.001        | 0.001   | yes | ArchViz / industrial |
+| `Centimeters`                    | 0.01         | 0.01    | yes | Maya / Houdini default cross-DCC trip-wire |
+| `Kilometers`                     | 1000.0       | 1000.0  | yes | Other side of 1.0 — divergence is symmetric |
+| `TwoMetersUnit`                  | 2.0          | 2.0     | yes | Meters + SystemScale=2; off-meter by multiple |
+| `HalfFeet`                       | 0.1524       | 0.1524  | yes | Non-round divergence — gate isn't only common values |
+| `ExactMeters`                    | 1.0          | 1.0     | no  | Common-case silence |
+| `MetersWithinTolerance`          | 1.0+5e-10    | 1.0     | no  | Sub-epsilon noise stays silent |
+| `MetersDriftedBy_1e_minus_5`     | 1.00001      | 1.00001 | yes | Locks the 1e-9 epsilon AND the rounding-then-gate ordering |
+
+Plus an idempotence check (the gate is pure; a second pass returns the
+same decision for every case) and a corpus check (the published
+diagnostic `complex_export.usda` carries `metersPerUnit = 0.0254`
+which the gate flags as expected). All 9 cases + idempotence + corpus
+check pass on the 2026-06-26 baseline.
+
+**MaxScript regression.**
+`src/Tests/Integration/export_metersPerUnit_test.ms` (extended in this
+PR) carries two new cases that exercise the warning emission:
+
+* `testInchesUnitsWarns` — sets Max units to inches, configures
+  `exportOptions.LogLevel = #warn` and a fixture log path, exports a
+  default scene, asserts the resulting USD has `metersPerUnit = 0.0254`
+  AND the log file contains BOTH `*metersPerUnit*` AND `*Miris*`. The
+  two substrings together lock in "the warning names the specific
+  divergence and the most acute downstream consumer".
+* `testMetersUnitsDoesNotWarn` — sets Max units to meters with the same
+  log configuration, exports, asserts `metersPerUnit = 1.0` AND the log
+  file does NOT contain `*metersPerUnit*`. This is the surgical bound
+  the gate's `abs(stageScale - 1.0) > 1e-9` clause locks in — meters
+  silence cannot accidentally regress to spam.
+
+**Karma renders.** Because the C++ change is observability-only, the
+USD bytes are unchanged — Karma rendering the exported USD on its own
+gives the same image before and after the fix. The visual evidence
+supporting the warning instead demonstrates *what downstream consumers
+actually see* when the warning is ignored:
+
+* `render_karma_postfix.png` — the diagnostic corpus referenced verbatim
+  into a `metersPerUnit = 1.0` outer stage alongside three 1 m^3
+  reference cubes. Because USD treats the referenced layer's
+  metersPerUnit as informational (geometry is composed unscaled), the
+  Max asset's positions-in-inches are interpreted as positions-in-meters
+  by the outer stage — the gold teapot is rendered at ~50 m across, the
+  ground plane at ~240 m. The asset blows out the entire right half of
+  the frame; the reference cubes are tiny dots at the bottom-left. This
+  is the silent downstream rescale the new warning surfaces.
+* `render_unreal_reference.png` — same composite, but the referencing
+  xform applies `xformOp:scale = 0.0254` to convert inches to meters
+  (the catalog's second workaround applied at the USD layer). The Max
+  asset now sits at correct physical scale next to the reference cubes:
+  the teapot, the red ball, the white cube are all recognizable and
+  comparable in size to the 1 m cubes.
+* `compare_side_by_side.png` — composites both for direct comparison.
+
+The auditor's checklist: **the reference image shows the Max asset and
+the 1 m cubes at comparable scale; the postfix image shows the Max
+asset overwhelming the frame as the cubes shrink to dots. If both
+images look identical, the workaround xform was lost (auditor
+infrastructure bug). If the reference image shows the Max asset huge,
+the workaround was applied to the wrong stage (auditor infrastructure
+bug). The two PNGs are SHA-256-distinct.**
+
+**Retirement condition.** Unlike MAX-MAT-001 through MAT-006 this is
+not a workaround for an Autodesk-side bridge bug — the exporter's
+behavior is USD-correct. The warning is therefore permanent: it tells
+the artist about a downstream consumer mismatch that no exporter-side
+fix can eliminate without changing the source DCC's unit (or rescaling
+the geometry, which is itself a destructive operation that should be
+explicitly chosen by the artist). A future bite could promote the
+warning to an opt-in **convert-to-meters** export option that
+rewrites `metersPerUnit = 1.0` and pre-scales every position attribute
+by `stageScale` — but that's a separate workflow change with UI and
+binding implications, deliberately out of scope for this observability
+bite.
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -1604,3 +1780,40 @@ camera; honouring them is correct regardless of the upstream
   integration tests updated to assert the new pattern; the
   back-compat read test (`import_material_id_test.ms`) still
   constructs synthetic `_N_` inputs and is intentionally unchanged.
+* 2026-06-26 — MAX-UNIT-001 metersPerUnit export-time observability
+  hint: add a `MaxUsd::Log::Warn` call in
+  `USDSceneBuilder::BuildStage` immediately after
+  `pxr::UsdGeomSetStageMetersPerUnit` that fires whenever the rounded
+  source-scene scale is not exactly 1.0 (i.e. the 3ds Max system
+  unit is not meters). The exported USD bytes are unchanged — the
+  authored metersPerUnit value is USD-correct — but downstream
+  meter-anchored consumers (Houdini Karma at 1:1, ARKit / Quick
+  Look, Miris asset ingest [which REQUIRES metersPerUnit == 1],
+  glTF importers) silently rescale or outright reject a
+  not-in-meters export, and the artist had no export-time signal
+  for that. The warning names: the metersPerUnit value, the
+  implied 1-Max-unit-to-meter factor, the four consumers above,
+  and both catalog workarounds (set Max's system unit to meters
+  before exporting; or post-scale + rewrite metersPerUnit). The
+  bound: `meters` exports stay silent (`stageScale == 1.0`
+  within float-rounding tolerance). Validator
+  (`validate_meters_per_unit_warning_surgical.py`) covers 9 cases
+  — inches/mm/cm/km/2m-unit/half-feet positives, exact-meters /
+  sub-epsilon-noise negatives, plus a 1.00001 case that locks
+  both the 1e-9 gate epsilon and the rounding-then-gate ordering
+  — plus idempotence and a check against the diagnostic baseline
+  corpus. MaxScript regressions
+  (`testInchesUnitsWarns`, `testMetersUnitsDoesNotWarn` in
+  `export_metersPerUnit_test.ms`) assert the warning DOES fire on
+  inches with the expected substrings AND does NOT fire on meters.
+  Visual auditor pair: `render_karma_postfix.png` (the corpus
+  referenced verbatim into a metersPerUnit=1 outer stage — Max
+  asset blown up to ~39x size, dominates the frame) vs
+  `render_unreal_reference.png` (the same composite with the
+  workaround applied as an outer `xformOp:scale = 0.0254` — Max
+  asset sits at proper meter scale next to three 1 m reference
+  cubes). The auditor's checklist is the relative size of the
+  Max asset versus the 1 m cubes; the two PNGs are
+  SHA-256-distinct. Introduces a new "observability hint" Kind in
+  the Status table for future export-time warnings that don't
+  rewrite values.
