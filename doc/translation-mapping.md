@@ -75,6 +75,7 @@ Status legend:
 | 3ds Max Photometric / Physical light Kelvin + RGB filter color (Light > Color > Kelvin toggle, kelvin spinner, filter swatch, RGB swatch) | `UsdLux.enableColorTemperatureAttr` + `colorTemperatureAttr` + `inputs:color` -- dichotomous: `useKelvin = true` writes the blackbody temperature + filter-only color; `useKelvin = false` writes the lightColor x filterColor combined product with the blackbody enable off | direct pairing | (UsdLux base-light schema; not a shader nodedef) | `PhotometricLightWriter::Write` is invoked, always (the dichotomy fires per-light per-export). Surgical bounds: (a) useKelvin -> enable=true + ct=clamped-K + color=filter (NOT lightColor combined; would double-tint the renderer's blackbody integrand); (b) !useKelvin -> enable=false + NO ct authored + color=lightColor*filter (intentionally lossy on round-trip); (c) out-of-range K -> clamped to [1000, 10000] with a one-shot Log::Warn that preserves the original value in the message | MAX-LIT-002 | 2026-06-26 |
 | 3ds Max export of any stage to a path with extension `.usdz` (UI Save As… "USDZ", MaxScript `exportFile foo.usdz`, `3dsmaxbatch ... -export foo.usdz`) | Single .usdz zip archive containing the root layer + every external asset (textures, sublayer references) reachable from the stage. ARKit-strict mode flattens sublayers and bundles one .usdc root | observability + audit (lock-in for proposed in-process packaging swap) | (zip archive structure; not a shader nodedef or USD prim schema) | `USDIOController::Export` (and `USDSceneController::Export`) sees `stageExportExtension == ".usdz"`. Today: routes through `MaxUsd::UsdToolsUtils::RunUsdZip` which spawns `cmd.exe -> powershell.exe -> python.exe -> usdzip` (four nested processes; PowerShell `Restricted` ExecutionPolicy / missing `HKLM:\SOFTWARE\Autodesk\3dsMax\*` registry entries / `CreateProcess + SW_HIDE` under a service account all break it silently). Proposed (MAX-PKG-001 follow-on): replace with `pxr::UsdUtilsCreateNewUsdzPackage(SdfAssetPath(tempUsd), filePath)` called in-process from the same function. The audit pins nine surgical bounds the in-process replacement preserves -- see Notes per expression for the full case list | MAX-PKG-001 | 2026-06-26 |
 | 3ds Max OpenPBR material (`OpenPBR()`, Max 2025.3+) exported via the MaterialX target | `ND_open_pbr_surface_surfaceshader` shader prim (MaterialX 1.39 OpenPBR Surface v1.1) -- NOT touched by any of the five MAX-MAT-001/002/004/005/006 normalization passes. The passes are gated `doc->getNodes("standard_surface")` and skip the OpenPBR shader entirely | audit (lock-in of existing surgical-coverage bound, no C++ logic change) | `ND_standard_surface_surfaceshader` (the audit pins the surgical bound where the passes STOP) | `MtlxShaderWriter::Write` is invoked on an OpenPBR-bound material. Surgical bounds: (a) every existing MAX-MAT-* pass iterates `doc->getNodes("standard_surface")`, returning an empty list when the shader's MaterialX node category is `open_pbr_surface`; (b) name-collision-named inputs (`coat_color`, `subsurface_color`, `specular_color`, `transmission_color` -- all color3, plus `subsurface_radius` which on open_pbr_surface is type=`float` rather than `color3` as on standard_surface) survive verbatim, including artist-authored `subsurface_color = (1, 1, 1)` which would visually shift to the OpenPBR default `(0.8, 0.8, 0.8)` if the passes were widened; (c) renamed gate inputs (`coat_weight` -> standard_surface `coat`; `subsurface_weight` -> `subsurface`; `transmission_weight` -> `transmission`; `coat_ior` -> `coat_IOR`; `specular_ior` -> `specular_IOR`; `emission_luminance` -> `emission`; `specular_roughness_anisotropy` -> `specular_anisotropy`) are likewise untouched; (d) idempotence -- a second run of the pass chain on the same exported doc does nothing more than the first | MAX-MAT-007 | 2026-06-26 |
+| Color / emission helper code in the MaterialX writer (`MtlxShaderWriter.cpp` post-parse normalization passes) vs the UsdPreviewSurface writer (C++ `LastResortUSDPreviewSurfaceWriter.cpp` + Python `DefaultShaderWriter` in `shaderWriter.py`) | NO shared helper, by design. The 5 MaterialX-side passes (specular_rotation, emission default, coat-block, subsurface_radius, spec-default inputs) operate on a `MaterialX::DocumentPtr` and gate on `doc->getNodes("standard_surface")`. The UsdPreviewSurface writer path operates either directly on a `Mtl*` (LastResort C++) or via the `.material_conversion` JSON tables (Python DefaultShaderWriter) -- it has no MaterialX document, no emission-strip helpers, and no shared abstraction with the MaterialX writer | audit (lock-in of existing cross-writer-path bound, no C++ logic change) | `ND_standard_surface_surfaceshader` only (the audit pins the surgical bound between the MaterialX writer's normalizer chain and the UsdPreviewSurface writer path) | `MtlxShaderWriter::Write` runs the chain of normalizers. Surgical bounds: (a) the chain operates on the in-memory MaterialX doc returned by `MtlxIOUtil.ExportMtlxString` and writes nothing to UsdShade until AFTER the chain completes; (b) the UsdPreviewSurface writer entry points (`LastResortUSDPreviewSurfaceWriter::Write` and the Python `DefaultShaderWriter.Write`) do not invoke, import, or share state with the MaterialX normalizers; (c) input vocabularies diverge on every concept the planner's "color-emission helper" could cover -- emissiveColor (UsdPS, color3f default (0,0,0)) vs emission + emission_color (MaterialX, scalar default 0.0 gating color3 default (1,1,1)); diffuseColor (UsdPS, color3f default (0.18,0.18,0.18)) vs base + base_color (MaterialX, scalar default 0.8 gating color3 default (0.8,0.8,0.8)); specularColor (UsdPS) + useSpecularWorkflow toggle vs specular + specular_color (MaterialX); plus topology-collisions (UsdPS opacity is float, MaterialX opacity is color3) and UsdPS-only inputs with no MaterialX analogue (useSpecularWorkflow, direct normal3f normal input); (d) idempotence -- re-running the 5 normalizers does not change behaviour on either side | MAX-PRIM-001 | 2026-06-26 |
 
 ## Notes per expression
 
@@ -1022,6 +1023,224 @@ mutates artist-authored OpenPBR materials. **A future PR that adds
 genuine OpenPBR-specific normalizers should land as a separate
 MAX-MAT-* entry with its own captured corpus of OpenPBR leak values
 from MtlxIOUtil — not as a wildcard widening of these five passes.**
+
+### Color/emission writer-path separation (audit, MaterialX normalizers STOP at MtlxShaderWriter) (MAX-PRIM-001)
+
+**Symptom.** The 3ds Max → USD exporter has two parallel writer paths
+that author colour and emission for the same source 3ds Max material
+under different target schemas:
+
+1. **MaterialX writer path** (`src/translators/MtlxShaderWriter.cpp`,
+   Max 2025+) — for materials with a MaterialX bridge representation
+   (PhysicalMaterial via `MtlxIOUtil.ExportMtlxString`,
+   `MaterialXMaterial` directly, OpenPBR in 2025.3+). Runs 5 post-parse
+   normalization passes on the in-memory `MaterialX::Document`
+   (`_NormalizeStandardSurfaceSpecularRotation`,
+   `_NormalizeStandardSurfaceEmissionDefault`,
+   `_NormalizeStandardSurfaceCoatDefaults`,
+   `_NormalizeStandardSurfaceSubsurfaceRadiusDefault`,
+   `_StripStandardSurfaceSpecDefaultInputs`), all gated on
+   `doc->getNodes("standard_surface")`. Authors `UsdShade` shader prims
+   carrying `ND_standard_surface_surfaceshader` (and, for OpenPBR,
+   `ND_open_pbr_surface_surfaceshader` — see MAX-MAT-007).
+
+2. **UsdPreviewSurface writer path** — for materials targeted at
+   `UsdImagingTokens->UsdPreviewSurface`. Split between
+   `src/MaxUsd/Translators/LastResortUSDPreviewSurfaceWriter.cpp` (the
+   C++ fallback registered with `ContextSupport::Fallback`, authors a
+   single `inputs:diffuseColor` from `Mtl::GetDiffuse()`) and the Python
+   `DefaultShaderWriter` in
+   `src/ApplicationPlugins/usd-component/Contents/scripts/materials/shaderWriter.py`
+   (registered for `PhysicalMaterial`, `PBR Material (Metal/Rough)`,
+   `PBR Material (Spec/Gloss)`, `USD Preview Surface`, `OpenPBR Material`
+   when `ConvertMaterialsTo == "UsdPreviewSurface"`; data-driven from
+   the `.material_conversion` JSON tables in
+   `data_files/default.material_conversion`,
+   `3dsmax_materials.mat_def`, `usd_materials.mat_def`). Authors
+   `UsdShade` shader prims carrying `UsdPreviewSurface`.
+
+There is no shared color/emission helper between the two paths today.
+The planner auto-emitted `MAX-PRIM-001-unify-color-emission-helper`
+with severity medium and rationale "Unify color-emission helper across
+MaterialX and UsdPreviewSurface writers". The audit's job is to **lock
+in the cross-writer-path bound with negative-test coverage** — no C++
+logic change.
+
+**Why it matters.** The two writers' input vocabularies, defaults,
+gate topology, and document models all diverge on every axis a "unify
+color-emission helper" would have to bridge:
+
+| Concept | UsdPreviewSurface input | MaterialX standard_surface input | Conflict |
+| --- | --- | --- | --- |
+| Emission color | `emissiveColor` (color3f, default `(0, 0, 0)`) | `emission_color` (color3, default `(1, 1, 1)`) gated by `emission` (float, default 0.0) | Different name, different dimensionality (1 vs 2 inputs), opposite default-zero semantic |
+| **Diffuse color** | **`diffuseColor` (color3f, default `(0.18, 0.18, 0.18)` — 18% linear grey)** | **`base_color` (color3, default `(0.8, 0.8, 0.8)`) gated by `base` (float, default 0.8)** | **Different name, different default, MaterialX gates by `base` scalar** |
+| Specular color | `specularColor` (color3f, default `(0, 0, 0)`) + `useSpecularWorkflow` bool toggle | `specular_color` (color3, default `(1, 1, 1)`) gated by `specular` (float, default 1.0) | Different topology — UsdPS has a workflow toggle, MaterialX has a scalar gate |
+| Metallic | `metallic` (float, default 0.0) | `metalness` (float, default 0.0) | Different name only |
+| Roughness | `roughness` (float, default 0.5) | `specular_roughness` (float, default 0.2) | Different name AND different default |
+| Opacity | `opacity` (FLOAT, default 1.0) | `opacity` (color3, default `(1, 1, 1)`) | Name-collision, dimensionality conflict |
+| Normal | `normal` (normal3f direct input) | (no direct input — routed through a `normalmap` node) | Different topology — UsdPS has a direct input, MaterialX wires through a normalmap node |
+
+The "color-emission" concept the planner's bite called out covers
+BOTH the `diffuseColor`/`base_color` and `emissiveColor`/`emission_color`
+axes. On both axes UsdPreviewSurface has a single combined input while
+MaterialX standard_surface has a `(scalar gate, color)` pair —
+structurally not unifiable into a single helper that preserves artist
+intent. A unification attempt that flattened MaterialX's split into
+UsdPS's combined inputs would lose the gate scalar; one that split
+UsdPS's combined inputs into a MaterialX-style pair would have to
+invent the gate scalar (and would AUTHOR the `(1.0, (X, Y, Z))` shape
+that MAX-MAT-002 itself strips when the colour is `(0, 0, 0)`).
+
+The audit's **primary visible bound** is `emissiveColor`: an artist
+authoring `(0.05, 0, 0)` on a UsdPreviewSurface shader (a faint
+dark-red glow override) survives a re-export because the MaterialX
+normalizers cannot reach the UsdPreviewSurface writer path. A wildcard
+"unify color-emission helper" refactor that ported the MAX-MAT-002
+strip-gate to UsdPreviewSurface would have to widen the gate to fire
+without the paired `emission` scalar (which UsdPS does not have) — and
+the widened gate would either be dead code OR would silently strip
+artist-authored `emissiveColor` on appearance alone. The Karma render
+pair below shows that branch directly: the postfix sphere reads a
+visible dark-red glow; the still-broken sphere is near-black grey.
+
+**Fix.** None. The existing C++ is already correct. The audit lands:
+
+1. **Surgical-bounds comment block** in
+   `MtlxShaderWriter.cpp::MtlxShaderWriter::Write` above the chain of
+   normalization-pass calls, enumerating the collision-shape table
+   above and naming both the MaxScript regression and the Python
+   validator that pin the bound. A complementary **back-pointer comment
+   block** in `LastResortUSDPreviewSurfaceWriter.cpp` above its `Write`
+   function records the bound from the UsdPreviewSurface side.
+2. **MaxScript regression**
+   `test_export_writer_path_separation_color_emission` in
+   `src/Tests/Integration/mtlxShaderWriter_test.ms`. Exports a
+   PhysicalMaterial with artist-authored `emit_color = color 51 0 0`
+   (faint dark-red emission) under BOTH writer targets in a single
+   test run. Asserts (a) the UsdPreviewSurface shader carries
+   `inputs:emissiveColor` with positive red channel and zero green +
+   blue channels (the cross-writer-path bound — a wildcard unify
+   refactor that ported the MAT-002 strip would zero all three
+   channels), AND (b) the MaterialX standard_surface shader carries
+   both `emission` (positive scalar) AND `emission_color` (positive
+   red, zero green + blue) — the positive control that MAT-002's
+   strict pair-gate is not over-stripping artist intent. Gated on Max
+   2025+ (`maxver[1] >= 26900`).
+3. **Python validator** at
+   `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/da4ca14a-c323-47a6-bd26-8997a625e3f6/validate_color_emission_writer_separation.py`.
+   Builds a synthetic `MaterialX::Document` carrying a
+   `standard_surface` node with every known MAX-MAT-001/002/004/005/006
+   leak side-by-side with a `UsdPreviewSurface`-category node carrying
+   UsdPreviewSurface-shaped inputs (`emissiveColor = (0.05, 0, 0)`
+   authored, `diffuseColor = (0.18, 0.18, 0.18)` UsdPS-default,
+   `metallic = 0.5`, `roughness = 0.3`, `ior = 1.4`,
+   `specularColor = (1, 1, 1)` name-spelling-near-collision,
+   `useSpecularWorkflow = true` UsdPS-only topology,
+   `opacity = 1.0` FLOAT topology-collision,
+   `normal = (0.5, 0.5, 1.0)` UsdPS-only direct input). Runs all five
+   C++-mirror normalization passes, then asserts:
+     * the `standard_surface` leaks are stripped (positive control —
+       confirms the passes are still doing their job);
+     * **every** `UsdPreviewSurface`-category input is preserved — both
+       name (no surprise removal) and type + value (no surprise mutation);
+     * spot checks on the audit's primary visible bound
+       (`emissiveColor = (0.05, 0, 0)`), the UsdPS-default-equals-zero
+       collision (`diffuseColor = (0.18, 0.18, 0.18)`), the
+       name-spelling-near-collision (`specularColor = (1, 1, 1)` vs
+       standard_surface `specular_color = (1, 1, 1)`), the
+       topology-collision (`opacity = 1.0` FLOAT vs standard_surface
+       `opacity` color3), and the UsdPS-only inputs
+       (`useSpecularWorkflow = true`, `normal = (0.5, 0.5, 1.0)`);
+     * idempotence — a second run of all five passes on the
+       post-normalized doc does not strip anything additional on
+       either node category.
+   On the 2026-06-26 baseline the validator passes all 36 named
+   assertions (11 positive-control strips + 23 cross-writer-path
+   preserves + 2 idempotence checks). A wildcard refactor that ported
+   the strip-gate would fail by named case: "usdps: emissiveColor =
+   (0.05, 0, 0) survives ... FAIL  before=…, after=ABSENT".
+
+**Bounds (where the C++ today conservatively does nothing):**
+
+* The 5 normalizers iterate `doc->getNodes("standard_surface")`. Any
+  other node category, including the synthetic `UsdPreviewSurface`
+  category the validator authors, is filtered out.
+* The 5 normalizers are called from `MtlxShaderWriter::Write` only.
+  `LastResortUSDPreviewSurfaceWriter::Write` does not invoke, share
+  state with, or transitively reach the MaterialX normalizers; the
+  Python `DefaultShaderWriter.Write` likewise only invokes
+  `usd_material_writer.export_material` (data-driven from the
+  `.material_conversion` JSON tables).
+* The two writer paths operate on different in-memory document types:
+  MtlxShaderWriter on a `MaterialX::DocumentPtr` returned by the
+  MaxScript bridge; LastResort on a Max `Mtl*` directly; Python
+  DefaultShaderWriter on a `Mtl*` via `pymxs.runtime` plus the
+  `.material_conversion` JSON tables. A "unify color-emission helper"
+  would have to bridge `MaterialX::NodePtr.getInput()`,
+  `Mtl::GetDiffuse()` / `GetSelfIllum*`, and the `.material_conversion`
+  JSON evaluator — three entirely different APIs. No such helper
+  exists today and the audit's bound is that none should be
+  introduced as a wildcard widening of the existing 5 passes.
+
+**Visual demonstration of the surgical bound.** A single
+UsdPreviewSurface sphere is rendered twice in Karma CPU at 512x512
+with the same camera + lighting (DistantLight key 2.0 + fill 0.7,
+opposing angles, low diffuse base so the emission contribution
+dominates). `render_karma_postfix.png` carries
+`inputs:emissiveColor = (0.05, 0, 0)` authored on the shader (the
+current correct behavior — the input survived the export untouched
+because no cross-writer helper exists to strip it).
+`render_unreal_reference.png` (the "still-broken" reference) has the
+same shader with that input ABSENT (the wildcard-cross-writer-unify
+counterfactual where the input was over-stripped, so the renderer
+resolves to the UsdPreviewSurface nodedef default of `(0, 0, 0)`).
+Mean per-channel intensity over the captured PNGs:
+
+```
+render_karma_postfix.png       mean  R=26.38  G=14.21  B=14.21  / 255
+render_unreal_reference.png    mean  R=14.21  G=14.21  B=14.21  / 255
+postfix - reference            mean  R=+12.17 G=0.00   B=0.00   / 255
+                                    (single-channel, large, directional)
+per-pixel max delta            R=46 / 255 (the sphere's red rim)
+nonzero pixels                 34.8% (the foreground sphere mask)
+PNG SHA-256                    492bb970... vs 036104d7...  (distinct)
+```
+
+Unlike MAX-MAT-007's SSS-lobe-diluted bound, this delta is large
+and unambiguous because UsdPreviewSurface's `emissiveColor` is a
+single direct contribution with no lobe gate in between. The G and B
+channels are byte-identical between postfix and still-broken — exactly
+matching the `(0.05, 0, 0)` artist authoring shape. Composite at
+`compare_side_by_side.png` in the same arch-build dir. **The auditor's
+checklist: the postfix render carries a visible dark-red tint across
+the sphere foreground; the still-broken reference is a uniform
+near-black grey; the postfix's mean RED channel is ~12/255 higher; the
+G and B channels match byte-for-byte; the two PNGs have distinct
+SHA-256s.** If the auditor sees a red tint on the still-broken
+reference OR the renders go byte-identical, a cross-writer helper has
+started touching UsdPreviewSurface inputs and the surgical bound has
+broken.
+
+**Retirement condition.** This audit does not have an upstream-fix
+retirement condition the way MAX-MAT-001..006 do: the bound it locks
+in is a SCOPE limit on Miris-authored C++, not a workaround for a 3ds
+Max bridge bug. The bound retires only if the MaterialX writer chain
+itself is removed (e.g. Autodesk's MaxUSD bridge becomes the canonical
+MaterialX writer, replacing both paths with a single helper that
+operates at the bridge layer) — at which point the scope limit becomes
+moot. Until then, this audit + its three artifacts (C++ comment block
+in `MtlxShaderWriter.cpp`, back-pointer comment block in
+`LastResortUSDPreviewSurfaceWriter.cpp`, MaxScript regression, Python
+validator) are the regression-coverage net that prevents a
+"unify color-emission helper across MaterialX and UsdPreviewSurface
+writers" PR (which is what the planner auto-emitted this bite for)
+from shipping unverified C++ that silently mutates artist-authored
+emission or diffuse colour on either writer path. **A future PR that
+genuinely needs to share helper code between the two writer paths
+should land as a separate concern with its own captured corpus + its
+own MaxScript regression + its own doc entry naming what the shared
+helper actually does — not as a wildcard widening of these five
+passes into the UsdPreviewSurface writer's domain.**
 
 ### Node.wireColor / Node.material.diffuse → UsdGeomMesh.primvars:displayColor  (MAX-MAT-003)
 
@@ -2986,3 +3205,75 @@ to assert the same observable structure.
   purely additive observability + test + doc infrastructure that
   locks in the surgical contract the in-process swap will ride on
   when a Windows build host is available.
+
+* 2026-06-26 — MAX-PRIM-001 color-emission writer-path separation
+  audit: lock in the cross-writer-path bound between the MaterialX
+  writer's 5 post-parse normalization passes (`MtlxShaderWriter.cpp`,
+  all gated `doc->getNodes("standard_surface")`) and the
+  UsdPreviewSurface writer path (the C++
+  `LastResortUSDPreviewSurfaceWriter.cpp` + the Python
+  `DefaultShaderWriter` driven by `.material_conversion` JSON tables
+  in `shaderWriter.py` / `usd_material_writer.py`). The two writer
+  paths share NO color/emission helper today; the audit adds the
+  negative-test coverage that prevents a planner-emitted "unify
+  color-emission helper" PR from shipping a wildcard widening of the
+  existing 5 passes into the UsdPreviewSurface writer's domain.
+  Surgical-bounds comment block added to `MtlxShaderWriter.cpp` at the
+  chain call site (immediately after the MAX-MAT-007 cross-shader-type
+  bound) enumerating the cross-writer-path collision shape -- a 7-row
+  table of UsdPreviewSurface inputs vs MaterialX standard_surface
+  inputs, with name disagreement on every concept the "color-emission
+  helper" could cover (emissiveColor vs emission + emission_color;
+  diffuseColor vs base + base_color; specularColor + useSpecularWorkflow
+  vs specular + specular_color; metallic vs metalness; roughness vs
+  specular_roughness), plus topology-collisions (opacity is float on
+  UsdPS vs color3 on MaterialX) and UsdPS-only inputs that have no
+  MaterialX standard_surface analogue (useSpecularWorkflow, direct
+  normal3f normal input). Back-pointer comment block added to
+  `LastResortUSDPreviewSurfaceWriter.cpp` over its `Write` function
+  recording the bound from the UsdPreviewSurface side. New MaxScript
+  regression `test_export_writer_path_separation_color_emission` added
+  to `mtlxShaderWriter_test.ms` (gated on Max 2025+, `maxver[1] >=
+  26900`): authors a PhysicalMaterial with artist-set `emit_color =
+  color 51 0 0` (faint dark-red emission), exports under both writer
+  targets in a single test run, asserts the UsdPreviewSurface shader
+  carries `inputs:emissiveColor` with positive red + zero green +
+  zero blue channels (the cross-writer-path bound -- a wildcard unify
+  refactor that ported the MAT-002 strip would zero all three
+  channels) AND the MaterialX standard_surface shader carries both
+  `emission` (positive scalar) AND `emission_color` (positive red +
+  zero green + zero blue) -- the positive control that MAT-002's
+  strict pair-gate is not over-stripping artist intent. Python
+  validator (`validate_color_emission_writer_separation.py`, 36
+  assertions: 11 positive-control strips on a side-by-side
+  standard_surface fixture + 23 cross-writer-path preserves on a
+  `UsdPreviewSurface`-category synthetic node + 2 idempotence checks)
+  mirrors the C++ pass chain and demonstrates that the gate
+  `doc->getNodes("standard_surface")` filters out the UsdPreviewSurface
+  category for every strip, including name-spelling-near-collisions
+  (`specularColor = (1, 1, 1)` vs stdsurf `specular_color = (1, 1, 1)`
+  MAT-006 strip target), topology-collisions (`opacity = 1.0` FLOAT
+  vs stdsurf `opacity` color3), and UsdPS-only inputs
+  (`useSpecularWorkflow = true`, `normal = (0.5, 0.5, 1.0)`). Visual
+  auditor pair: `render_karma_postfix.png` Karma CPU render of a
+  UsdPreviewSurface sphere with `inputs:emissiveColor = (0.05, 0, 0)`
+  authored (sphere reads visible dark-red glow; mean intensity R=26.38
+  / G=14.21 / B=14.21 over 255); `render_unreal_reference.png` Karma
+  CPU render of the wildcard-cross-writer-unify counterfactual stage
+  where that input is ABSENT and the renderer resolves to the UsdPS
+  nodedef default `(0, 0, 0)` (sphere reads uniform near-black grey;
+  mean intensity R=14.21 / G=14.21 / B=14.21). Postfix is +12.17 / 255
+  brighter on the RED channel ONLY (G and B byte-identical), 34.8%
+  nonzero per-pixel delta, SHA-256-distinct PNGs. Unlike the
+  MAX-MAT-007 audit's SSS-diluted delta, this delta is large and
+  unambiguous because UsdPS `emissiveColor` is a direct emission
+  contribution with no lobe gate. `compare_side_by_side.png` is the
+  auditor's at-a-glance composite. Auditor's checklist: postfix
+  carries visible dark-red tint, still-broken is uniform near-black;
+  postfix mean RED higher by ~12 / 255 with G + B byte-identical; PNG
+  hashes differ -- a refactor that ever introduced a red tint on the
+  still-broken reference OR made the renders byte-identical would
+  mean a cross-writer helper has started touching UsdPreviewSurface
+  inputs and the surgical bound has broken. No C++ logic change in
+  this bite -- purely additive observability + test + doc
+  infrastructure.

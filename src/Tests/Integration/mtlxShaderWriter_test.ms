@@ -1072,6 +1072,129 @@ struct mtlx_shader_writer_test
         assert_equal (ssWeightInput.Get()) 1.0
     ),
 
+    -- MAX-PRIM-001 cross-writer-path separation regression: the post-parse
+    -- normalization passes in MtlxShaderWriter.cpp (specular_rotation,
+    -- emission default, coat-block, subsurface_radius, spec-default inputs)
+    -- operate on a MaterialX::DocumentPtr and gate on
+    -- doc->getNodes("standard_surface"). They MUST NOT bleed into the
+    -- UsdPreviewSurface writer path (the C++ LastResortUSDPreviewSurfaceWriter
+    -- + the Python DefaultShaderWriter in shaderWriter.py). The
+    -- planner-emitted "unify color-emission helper across MaterialX and
+    -- UsdPreviewSurface writers" bite would either (a) be dead code if it
+    -- preserved the MAT-002 strict pair-gate (UsdPS has no companion
+    -- `emission` scalar to fail it), OR (b) silently corrupt artist-
+    -- authored `emissiveColor` if it widened the gate to fire on the
+    -- color3 alone. This test exports the SAME PhysicalMaterial under
+    -- BOTH writer targets in a single test run, asserts the artist's
+    -- emission survives on the MaterialX path (MAT-002 positive control
+    -- on non-zero color -- the gate doesn't fire) AND survives on the
+    -- UsdPreviewSurface path (the cross-writer-path bound -- the
+    -- MaterialX normalizers cannot have touched the UsdPS shader; if a
+    -- future "unify" refactor ports the strip-gate, this assertion fails
+    -- by named case).
+    function test_export_writer_path_separation_color_emission = (
+        maxver = maxVersion()
+        -- PhysicalMaterial MaterialX export path is 2025+.
+        if maxver[1] < 26900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereWriterSep"
+        local mtl1 = PhysicalMaterial()
+        mtl1.name = "matWriterSep"
+        -- Artist-authored faint dark-red emission. Normalized to linear,
+        -- (51, 0, 0) -> approx (0.2, 0, 0) -- non-zero on channel 0 so
+        -- the MAX-MAT-002 strip-gate on the MaterialX path does NOT
+        -- fire (positive control: artist intent survives MAX-MAT-002).
+        -- On the UsdPreviewSurface path the same color maps to
+        -- inputs:emissiveColor via the .material_conversion JSON
+        -- tables; the cross-writer-path bound says no normalizer from
+        -- the MaterialX side has touched it.
+        mtl1.emit_color = color 51 0 0
+        sphere001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+
+        -- 1) UsdPreviewSurface target export. This routes through the
+        --    Python DefaultShaderWriter (shaderWriter.py) and the
+        --    .material_conversion JSON tables; the MaterialX normalizers
+        --    in MtlxShaderWriter.cpp are NEVER invoked on this path.
+        --    The surgical bound: the authored emission must reach the
+        --    UsdPreviewSurface shader's inputs:emissiveColor.
+        exportOptions.AllMaterialTargets = #("UsdPreviewSurface")
+        local exportPathUsdPS = output_prefix + "testWriterPathSepUsdPS.usda"
+        USDExporter.ExportFile exportPathUsdPS exportOptions:exportOptions
+        local stageUsdPS = pyUsd.Stage.Open(exportPathUsdPS)
+        local usdpsPrim = stageUsdPS.GetPrimAtPath("/root/mtl/matWriterSep/matWriterSep")
+        assert_true (usdpsPrim.IsValid())
+        assert_true (usdpsPrim.IsA(pyShade.Shader))
+        assert_equal ((usdpsPrim.GetAttribute "info:id").Get()) "UsdPreviewSurface"
+        local usdpsShader = pyShade.Shader(usdpsPrim)
+        local usdpsEmInput = usdpsShader.GetInput "emissiveColor"
+        assert_true (usdpsEmInput != undefined)
+        local usdpsEmAttr = usdpsEmInput.GetAttr()
+        assert_true (usdpsEmAttr.HasAuthoredValue())
+        local usdpsEmValue = usdpsEmInput.Get()
+        -- The authored emit_color survives at the UsdPS layer. The
+        -- exact value depends on the .material_conversion table's
+        -- gamma + range handling, so we assert the CHANNEL SHAPE (red
+        -- positive, green + blue zero) rather than the exact float --
+        -- the cross-writer-path bound is "the artist intent reached the
+        -- UsdPS shader UNTOUCHED by any MaterialX-side normalizer", not
+        -- "the value is byte-equal to the source". A wildcard cross-
+        -- writer strip would zero ALL three channels (resolves to UsdPS
+        -- nodedef default (0, 0, 0)); the per-channel-shape assertion
+        -- below catches that without coupling to the JSON gamma details.
+        assert_true (usdpsEmValue[1] > 0.0)
+        assert_equal usdpsEmValue[2] 0.0
+        assert_equal usdpsEmValue[3] 0.0
+
+        -- 2) MaterialX target export. This routes through MtlxShaderWriter
+        --    where the 5 MAX-MAT-* normalizers run. With the artist-
+        --    authored non-zero red emission_color, the MAT-002 strip-
+        --    gate's color3 check (must be statically (0, 0, 0)) fails,
+        --    so the pair is preserved -- the positive control that the
+        --    artist intent survives MAT-002 on the MaterialX path.
+        exportOptions.AllMaterialTargets = #("MaterialX")
+        local exportPathMtlx = output_prefix + "testWriterPathSepMtlx.usda"
+        USDExporter.ExportFile exportPathMtlx exportOptions:exportOptions
+        local stageMtlx = pyUsd.Stage.Open(exportPathMtlx)
+        local mtlxPrim = stageMtlx.GetPrimAtPath("/root/mtl/matWriterSep/matWriterSep")
+        assert_true (mtlxPrim.IsValid())
+        assert_true (mtlxPrim.IsA(pyShade.Shader))
+        assert_equal ((mtlxPrim.GetAttribute "info:id").Get()) "ND_standard_surface_surfaceshader"
+        local mtlxShader = pyShade.Shader(mtlxPrim)
+
+        -- The bridge authors (emission = 1.0, emission_color = (0.2, 0, 0))
+        -- on standard_surface for the artist's emit_color. The MAT-002
+        -- gate requires emission_color statically (0, 0, 0); the dark-
+        -- red value fails that check on channel 0 so the pair is
+        -- preserved. Belt-and-suspenders: assert the pair is present
+        -- AND the color carries a positive red channel.
+        local mtlxEmColorInput = mtlxShader.GetInput "emission_color"
+        assert_true (mtlxEmColorInput != undefined)
+        local mtlxEmColorAttr = mtlxEmColorInput.GetAttr()
+        assert_true (mtlxEmColorAttr.HasAuthoredValue())
+        local mtlxEmColorValue = mtlxEmColorInput.Get()
+        assert_true (mtlxEmColorValue[1] > 0.0)
+        assert_equal mtlxEmColorValue[2] 0.0
+        assert_equal mtlxEmColorValue[3] 0.0
+
+        -- The emission scalar should also be present and non-zero (the
+        -- bridge authors it at 1.0 to gate the lobe on; the MAT-002
+        -- strip would only have removed it if the color were
+        -- (0, 0, 0)). A future regression that widened the MAT-002 gate
+        -- to fire on color alone would strip BOTH inputs and fail this
+        -- assertion -- the same shape of failure the cross-writer "unify"
+        -- refactor would produce on the UsdPS path above.
+        local mtlxEmInput = mtlxShader.GetInput "emission"
+        assert_true (mtlxEmInput != undefined)
+        local mtlxEmAttr = mtlxEmInput.GetAttr()
+        assert_true (mtlxEmAttr.HasAuthoredValue())
+        assert_true ((mtlxEmInput.Get()) > 0.0)
+    ),
+
     function teardown = (
     ),
 
@@ -1088,7 +1211,8 @@ struct mtlx_shader_writer_test
         test_export_physical_material_strips_buggy_subsurface_radius,
         test_export_physical_material_strips_spec_default_inputs,
         test_export_material_preserves_non_default_spec_inputs,
-        test_export_openpbr_material_preserves_collision_named_inputs
+        test_export_openpbr_material_preserves_collision_named_inputs,
+        test_export_writer_path_separation_color_emission
         )
 )
 

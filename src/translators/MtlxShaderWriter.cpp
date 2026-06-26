@@ -1096,6 +1096,123 @@ void MtlxShaderWriter::Write()
     //     open_pbr_surface side-by-side, asserts the standard_surface
     //     leak inputs are stripped and the open_pbr_surface inputs are
     //     untouched, including idempotence.
+    //
+    // MAX-PRIM-001 surgical-coverage bound (audit, no logic change): the
+    // five passes below are scoped to the MaterialX writer path ONLY --
+    // specifically, they operate on the in-memory `MaterialX::Document`
+    // returned by `MtlxIOUtil.ExportMtlxString` after `readFromXmlString`,
+    // and they MUST NOT be ported to, shared with, or invoked from the
+    // UsdPreviewSurface writer code path. The UsdPreviewSurface writers
+    // are an entirely separate translator chain:
+    //   * `src/MaxUsd/Translators/LastResortUSDPreviewSurfaceWriter.cpp`
+    //     -- the C++ fallback registered with `ContextSupport::Fallback`
+    //     for `UsdImagingTokens->UsdPreviewSurface`. Authors a single
+    //     `inputs:diffuseColor` from `Mtl::GetDiffuse()` and nothing
+    //     else; carries no emission-strip helpers and never will.
+    //   * `src/ApplicationPlugins/usd-component/Contents/scripts/
+    //     materials/shaderWriter.py` + `usd_material_writer.py` -- the
+    //     Python `DefaultShaderWriter` registered for the Max materials
+    //     PhysicalMaterial / PBR Material (Metal/Rough) / PBR Material
+    //     (Spec/Gloss) / USD Preview Surface / OpenPBR Material when
+    //     `ConvertMaterialsTo == "UsdPreviewSurface"`. Authoring is
+    //     entirely data-driven from the `.material_conversion` JSON
+    //     tables (`data_files/default.material_conversion`,
+    //     `3dsmax_materials.mat_def`, `usd_materials.mat_def`).
+    //
+    // The two writer paths share NO color/emission helper today, and
+    // a planner-emitted "unify color-emission helper across MaterialX
+    // and UsdPreviewSurface writers" refactor would be wrong because the
+    // shapes diverge on every axis the unification would have to bridge:
+    //
+    //   Concept           UsdPreviewSurface     MaterialX standard_surface
+    //   ----------------  --------------------  --------------------------
+    //   Emission color    `emissiveColor`       `emission_color` (color3,
+    //                     (color3f, default     default (1, 1, 1)) gated
+    //                     (0, 0, 0))            by `emission` (float,
+    //                                           default 0.0)
+    //   Diffuse color     `diffuseColor`        `base_color` (color3,
+    //                     (color3f, default     default (0.8, 0.8, 0.8))
+    //                     (0.18, 0.18, 0.18))   gated by `base` (float,
+    //                                           default 0.8)
+    //   Specular color    `specularColor`       `specular_color` (color3,
+    //                     (color3f, default     default (1, 1, 1)) gated
+    //                     (0, 0, 0)) +          by `specular` (float,
+    //                     `useSpecularWorkflow` default 1.0)
+    //                     bool toggle
+    //   Metallic / IOR    `metallic` (float)    `metalness` (float, same
+    //                                           default) -- name only
+    //   Roughness         `roughness` (float,   `specular_roughness`
+    //                     default 0.5)         (float, default 0.2)
+    //   Opacity           `opacity` (float,     `opacity` (color3, default
+    //                     default 1.0)         (1, 1, 1)) -- name-collision
+    //                                           BUT dimensionality conflict
+    //   Normal            `normal` (normal3f    no direct input -- routed
+    //                     direct input)        through a `normalmap` node
+    //
+    // The "color-emission" concept the planner's bite called out covers
+    // BOTH the diffuseColor/base_color and emissiveColor/emission_color
+    // axes. On both axes UsdPreviewSurface has a single combined input
+    // while MaterialX standard_surface has a (scalar gate, color)
+    // pair -- structurally not unifiable into a single helper that
+    // preserves artist intent. A unification attempt that flattened
+    // MaterialX's split into UsdPS's combined inputs would lose the
+    // gate scalar; one that split UsdPS's combined inputs into a
+    // MaterialX-style pair would have to invent the gate scalar (and
+    // would AUTHOR the (1.0, (X, Y, Z)) shape that MAX-MAT-002 itself
+    // strips when the color is (0, 0, 0)).
+    //
+    // The audit's primary visible bound (per its visual auditor pair):
+    // an artist-authored `emissiveColor = (0.05, 0, 0)` on a
+    // UsdPreviewSurface shader (a faint dark-red glow override) survives
+    // a re-export, because (a) the five passes below iterate
+    // `doc->getNodes("standard_surface")` on the MaterialX doc,
+    // returning an empty list for any UsdPreviewSurface authoring (which
+    // does not live in this MaterialX doc at all), AND (b) the
+    // LastResort + Python UsdPS writers do not carry emission-strip
+    // helpers. Any cross-writer unification that ported the strip-gate
+    // would have to widen it to operate without the paired `emission`
+    // scalar (which UsdPS does not have); the widened gate would either
+    // be dead code or would silently strip artist-authored emissiveColor
+    // on appearance alone -- the still-broken counterfactual the audit's
+    // visual pair captures.
+    //
+    // Negative test coverage pinning this bound:
+    //   * `src/Tests/Integration/mtlxShaderWriter_test.ms` ::
+    //     `test_export_writer_path_separation_color_emission` --
+    //     exports the SAME PhysicalMaterial under both the MaterialX
+    //     and UsdPreviewSurface targets in a single test run, asserts
+    //     (a) the MaterialX export's standard_surface emission inputs
+    //     are stripped per MAX-MAT-002 (positive control), AND
+    //     (b) the UsdPreviewSurface export's authored `emissiveColor`
+    //     survives untouched (the cross-writer-path bound). Gated on
+    //     the same Max 2025+ guard as the surrounding MaterialX tests
+    //     (`IS_MAX2025_OR_GREATER` mirrored at the runtime layer).
+    //   * Python validator
+    //     `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+    //     da4ca14a-c323-47a6-bd26-8997a625e3f6/
+    //     validate_color_emission_writer_separation.py` -- runs all
+    //     five passes on a synthetic MaterialX::Document containing a
+    //     standard_surface node with every known MAX-MAT-001/002/004/
+    //     005/006 leak side-by-side with a UsdPreviewSurface-category
+    //     node carrying UsdPS-shaped inputs (emissiveColor = (0.05,0,0)
+    //     authored, diffuseColor = (0.18,0.18,0.18), metallic = 0.5,
+    //     roughness = 0.3, ior = 1.4, specularColor = (1,1,1),
+    //     useSpecularWorkflow = true, opacity = 1.0 FLOAT,
+    //     normal = (0.5,0.5,1.0)). Asserts the standard_surface leaks
+    //     are stripped (positive control) AND the UsdPreviewSurface-
+    //     category node is untouched on both name and value, including
+    //     name-spelling-near-collisions (`specularColor` vs stdsurf
+    //     `specular_color = (1,1,1)`), topology-collisions (`opacity`
+    //     FLOAT vs stdsurf color3), and UsdPS-only inputs that have no
+    //     MaterialX standard_surface analogue (`useSpecularWorkflow`,
+    //     `normal` direct input). Plus idempotence on both sides.
+    //
+    // A future PR that genuinely needs to share helper code between
+    // these two writer paths should land as a SEPARATE concern with
+    // its own captured corpus + its own MaxScript regression + its own
+    // doc entry naming what the shared helper actually does -- not as
+    // a wildcard widening of these five passes into the UsdPreviewSurface
+    // writer's domain.
     _NormalizeStandardSurfaceSpecularRotation(mtlxDoc);
     _NormalizeStandardSurfaceEmissionDefault(mtlxDoc);
     _NormalizeStandardSurfaceCoatDefaults(mtlxDoc);

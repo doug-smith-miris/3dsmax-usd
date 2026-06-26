@@ -83,6 +83,53 @@ LastResortUSDPreviewSurfaceWriter::LastResortUSDPreviewSurfaceWriter(
     shaderSchema.CreateOutput(UsdShadeTokens->surface, SdfValueTypeNames->Token);
 }
 
+// MAX-PRIM-001 surgical-coverage bound (audit, no logic change): this
+// writer is the C++ fallback on the UsdPreviewSurface writer path
+// (registered via `ContextSupport::Fallback` for
+// `UsdImagingTokens->UsdPreviewSurface`). It authors exactly one input
+// (`inputs:diffuseColor` from `Mtl::GetDiffuse()`) and that is its
+// COMPLETE responsibility -- no emission helper, no roughness helper,
+// no metallic helper. The MaterialX-side post-parse normalization
+// passes in `src/translators/MtlxShaderWriter.cpp`
+// (`_NormalizeStandardSurfaceSpecularRotation`,
+// `_NormalizeStandardSurfaceEmissionDefault`,
+// `_NormalizeStandardSurfaceCoatDefaults`,
+// `_NormalizeStandardSurfaceSubsurfaceRadiusDefault`,
+// `_StripStandardSurfaceSpecDefaultInputs`) operate on a
+// `MaterialX::DocumentPtr` returned by `MtlxIOUtil.ExportMtlxString`
+// and gate on `doc->getNodes("standard_surface")`; they MUST NOT be
+// ported here, shared with this writer, or invoked from `Write()`
+// below. The two writer paths handle materially different inputs
+// (this writer reads `Mtl*` directly; the MaterialX writer reads a
+// MaterialX-XML serialization of the same material via the MaxScript
+// bridge) and serve different USD targets (UsdPreviewSurface here,
+// MaterialX `standard_surface` there) with fundamentally different
+// input vocabularies, defaults, and topology shapes (see the
+// MAX-PRIM-001 cross-writer comment block in MtlxShaderWriter.cpp at
+// the chain call site for the collision-shape table).
+//
+// A future "unify color-emission helper across MaterialX and
+// UsdPreviewSurface writers" refactor that introduced a shared
+// emission-strip helper here would (a) be dead code if it preserved
+// the MAX-MAT-002 strict pair-gate (UsdPS has no companion `emission`
+// scalar), OR (b) silently corrupt artist-authored `emissiveColor`
+// values if it widened the gate to fire on the color3 alone. The
+// audit's visual pair (`render_karma_postfix.png` vs
+// `render_unreal_reference.png` in the run's arch-build directory)
+// captures both branches of the choice on a UsdPreviewSurface sphere
+// with `emissiveColor = (0.05, 0, 0)` authored.
+//
+// The Python validator at
+// `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+// da4ca14a-c323-47a6-bd26-8997a625e3f6/
+// validate_color_emission_writer_separation.py` pins the bound at the
+// MaterialX-document layer with 36 named assertions (11 standard_surface
+// strips as positive control + 23 UsdPreviewSurface-category preserves
+// + 2 idempotence checks). The MaxScript regression
+// `test_export_writer_path_separation_color_emission` in
+// `src/Tests/Integration/mtlxShaderWriter_test.ms` pins the bound at
+// the full-export layer by re-exporting the same PhysicalMaterial
+// under both targets in a single test run.
 /* virtual */
 void LastResortUSDPreviewSurfaceWriter::Write()
 {
