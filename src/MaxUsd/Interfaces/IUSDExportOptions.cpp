@@ -121,10 +121,11 @@ FPInterfaceDesc IUSDExportOptionsDesc(
 		_T("info"), MaxUsd::Log::Level::Info,
 		_T("warn"), MaxUsd::Log::Level::Warn,
 		_T("error"), MaxUsd::Log::Level::Error,
-	IUSDExportOptions::eIdNormalsMode, 3,
+	IUSDExportOptions::eIdNormalsMode, 4,
 		_T("none"), MaxMeshConversionOptions::NormalsMode::None,
 		_T("asAttribute"), MaxMeshConversionOptions::NormalsMode::AsAttribute,
 		_T("asPrimvar"), MaxMeshConversionOptions::NormalsMode::AsPrimvar,
+		_T("both"), MaxMeshConversionOptions::NormalsMode::Both,
 	IUSDExportOptions::eIdMeshFormat, 3,
 		_T("fromScene"), MaxMeshConversionOptions::MeshFormat::FromScene,
 		_T("polyMesh"), MaxMeshConversionOptions::MeshFormat::PolyMesh,
@@ -194,9 +195,10 @@ void IUSDExportOptions::SetNormalsMode(int normalsMode)
     const auto normals = MaxMeshConversionOptions::NormalsMode(normalsMode);
     if (normals != MaxMeshConversionOptions::NormalsMode::AsAttribute
         && normals != MaxMeshConversionOptions::NormalsMode::AsPrimvar
+        && normals != MaxMeshConversionOptions::NormalsMode::Both
         && normals != MaxMeshConversionOptions::NormalsMode::None) {
-        WStr errorMsg(
-            L"Incorrect Normals value. Accepted values are #asAttribute, #asPrimvar and #none.");
+        WStr errorMsg(L"Incorrect Normals value. Accepted values are #asAttribute, #asPrimvar, "
+                      L"#both and #none.");
         throw RuntimeError(errorMsg.data());
     }
 
