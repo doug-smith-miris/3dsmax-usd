@@ -80,6 +80,7 @@ Status legend:
 | 3ds Max legacy light classes that inherit `LightObject` but NOT `LightscapeLight` (`Omnilight` = `OMNI_LIGHT_CLASS_ID`; `Skylight` = `SKYLIGHT_CLASS_ID`; legacy `Target_Spot` / `Free_Spot` = `SPOT_LIGHT_CLASS_ID`; legacy `Target_Direct` / `Free_Direct` = `DIR_LIGHT_CLASS_ID`; mr_Sky, Daylight environment lights, etc.) | NO `UsdLux*` prim authored -- the writer-registry's only general-purpose light writer (`PhotometricLightWriter`) gates on `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)`, returns `ContextSupport::Unsupported` for every non-LightscapeLight, and `MaxUsdPrimWriterRegistry::FindWriter` returns nullptr (no other registered writer claims a `LightObject`). The light is silently dropped from the exported stage: no prim, no error, no warning | audit (lock-in of existing writer-registry surgical-coverage bound, no C++ logic change) | (UsdLux schema; not a shader nodedef -- the audit pins the writer-registry's bottom bound for lights) | `PhotometricLightWriter::CanExport` is invoked AND `!exportArgs.GetTranslateLights() || !object->IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)`. Surgical bounds: (a) the LIGHTSCAPE_LIGHT_CLASS branch returns `ContextSupport::Fallback` so in-scope photometric / physical lights are authored as the correct `UsdLuxDiskLight` / `UsdLuxRectLight` / `UsdLuxSphereLight` / `UsdLuxCylinderLight` per `GetPrimType` -- the positive control proves this still fires; (b) every non-LightscapeLight LightObject (legacy Omnilight, Skylight, Spot, Direct, etc.) returns Unsupported AND no other registered writer claims the LightObject category -- silent drop. A wildcard widening that returned `Fallback` for every LightObject and stamped out default UsdLuxSphereLight / UsdLuxDomeLight without per-class attribute translation would author spurious extra lights at every legacy light position (e.g. an Omnilight that was turned OFF / set to multiplier 0 / set to a non-default attenuation/color in Max would silently appear as a unit-intensity SphereLight in USD); (c) the `exportArgs.GetTranslateLights()` short-circuit fires BEFORE the class-id gate -- a user who disables light export sees the same nullptr for every light type, including in-scope photometrics; (d) `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)` is safely callable on non-light Objects (returns false) so the gate is well-behaved across all node types | MAX-LIT-001 | 2026-06-26 |
 | Color-space metadata across all three USD-shading writer paths: `MtlxShaderWriter::_SetInputValue` (color3/color4 inputs + filename-on-image-color-output inputs); `set_bitmap_scale_bias_sourcecolorspace` in `usd_material_writer.py` (every UsdUVTexture); `LastResortUSDPreviewSurfaceWriter::Write` (Color3f diffuseColor value, no UsdUVTexture) | Three divergent conventions, one per writer: MaterialX path authors `colorSpace` USD metadata on the UsdShade input attribute IFF `_TypeSupportsColorSpace(input)` is true AND `getActiveColorSpace()` is non-empty; UsdPreviewSurface Python writer authors `sourceColorSpace = "raw"` as a TOKEN INPUT on every baked UsdUVTexture (hardcoded with TODO retirement condition); LastResort C++ writer authors NEITHER colorSpace nor sourceColorSpace -- `diffuseColor` is linear by UsdPreviewSurface spec when authored as a Color3f value | audit (lock-in of existing cross-writer color-space surgical-coverage bound, no C++ logic change) | (multiple: `colorSpace` USD metadata on UsdShade input attrs for MaterialX shaders; `sourceColorSpace` TOKEN INPUT on UsdUVTexture for baked UsdPreviewSurface paths; no colorSpace anywhere on the LastResort value-only path) | `_SetInputValue` is invoked AND `_TypeSupportsColorSpace(input)` is true AND `getActiveColorSpace()` is non-empty -- the MaterialX path propagates; `set_bitmap_scale_bias_sourcecolorspace` is invoked on a baked UsdUVTexture -- always hardcoded "raw" pending TODO retirement; `LastResortUSDPreviewSurfaceWriter::Write` is invoked -- value-only, no UsdUVTexture, no colorSpace by UsdPreviewSurface spec. Surgical bounds: (a) `_TypeSupportsColorSpace` accepts ONLY color3/color4 typed inputs OR filename inputs on image nodes with color3/color4 output -- every other input type (float, vector3, matrix, etc.) MUST NEVER receive colorSpace metadata even when the MaterialX active color space resolves to a non-empty name; (b) `if (!colorSpace.empty())` short-circuit -- empty active color space MUST NOT cause `SetColorSpace(TfToken(""))` because that creates authored-empty metadata distinct from no-metadata-at-all; (c) hardcoded `sourceColorSpace = "raw"` is the acknowledged-incomplete UsdPreviewSurface bound -- retirement requires a future MAX-MAT-* that consults `from_tex.bitmap.gamma` and adds an sRGB-gamma test case to `export_texture_test.py`; (d) LastResort writer authors NO UsdUVTexture child AND NO `colorSpace` metadata on `diffuseColor` -- per UsdPreviewSurface spec, the value is linear by definition | MAX-MAT-009 | 2026-06-26 |
 | Two or more 3ds Max nodes that share one Object (USD-instance pair) but each Node has a different `.material` assignment (per-instance material override). Special case: at least one of the divergent materials is a MultiMtl whose Object carries per-face matIds (`ApplyMaxMaterialIDs` has authored `materialBind`-family GeomSubsets on the prototype child) | THREE override-structure carriers, one per surgical branch: (a) USD instancing PRESERVED (`IsInstanceable() == true`) with per-instance MaterialBindingAPI authored on the local instance prim spec (non-MultiMtl divergence, or MultiMtl-without-subsets divergence -- Branches B and C of the four-branch decision tree); (b) USD instancing BROKEN (`SetInstanceable(false)`) + the prototype's `materialBind`-family GeomSubsets COPIED to an override-child Mesh prim under the divergent instance with `customData[3dsmax:matId]` preserved across the copy + each copied subset bound to the divergent MultiMtl's sub-material (Branch D, the per-instance MultiMtl override case that requires breaking instancing because USD subset bindings on the prototype apply to every instance); (c) MtlSwitcher container materials authored as `UsdShade.Material` with `shadingVariant` UsdVariantSet of N internal-references (variant-sets export style, Branch E) OR single `AddInternalReference` to the active material with no variant set (active-only / 1-variant-fallback, Branch F) OR bare `UsdShade.Material` prim with no references and no variant set (empty switcher, Branch G) | audit (lock-in of existing four-Branches-A/B/C/D + three-Branches-E/F/G override-structure surgical-coverage bound, no C++ logic change) | (multiple non-shader USD constructs: `pxr::Usd.Prim.SetInstanceable`; `pxr::UsdGeom.Subset` + `customData[3dsmax:matId]`; `pxr::UsdShade.MaterialBindingAPI`; `pxr::Usd.VariantSet` (`shadingVariant`); `pxr::Usd.Prim.GetReferences().AddInternalReference`) | `_AddInstancePrimsToMaterialMap` is invoked AND `prototype.GetInstances()` returns >=2 instances. Surgical bounds: (a) sameMaterialForAllInstances == true -> KEEP instancing, bind on the inheritance-base prim's child (Branch A); (b) different non-MultiMtl materials -> KEEP instancing, per-instance MaterialBindingAPI on the instance prim's local spec (Branch B); (c) different MultiMtl, NO subsets on the prototype child -> KEEP instancing, per-instance MaterialBindingAPI via `customData[3dsmax:matId]` lookup (Branch C); (d) different MultiMtl, subsets DO exist on the prototype child -> `BreakInstancingAndCopySubset` runs: `SetInstanceable(false)` + subset copy with matId customData preserved + rebind copied subsets to divergent MultiMtl's sub-mtls (Branch D, the data-loss vector the audit primarily pins). Plus three switcher-shape bounds: (e) AsVariantSets >=2 variants -> `shadingVariant` UsdVariantSet authored with one internal-reference per variant (Branch E); (f) ActiveMaterialOnly OR 1-variant AsVariantSets fallback -> NO variant set, single `AddInternalReference` to active material (Branch F); (g) empty switcher -> warn + early-return, bare Material prim, NO variant set, NO references (Branch G) | MAX-MAT-010 | 2026-06-26 |
+| 3ds Max legacy `Omnilight` (`OMNI_LIGHT_CLASS_ID`) + legacy `Skylight` (`SKYLIGHT_CLASS_ID`) -- the two highest-severity legacy LightObject subclasses MAX-LIT-001 today silently drops -- WHEN claimed by a future `MaxUsdLegacyOmnilightWriter` / `MaxUsdLegacySkylightWriter` | Per-class spec: Omnilight -> `UsdLuxSphereLight` with `intensity` from `.multiplier` (zero when `.on=false`), `inputs:color` from `.rgb` (NO Kelvin), `shadow:enable` from `.castShadows`, `.radius = 0.001 + .treatAsPoint = true` per the MAX-LIT-002 Free_Point precedent, and `customData[3dsmax:legacy_omnilight:farAttenEnd]` as the lossy round-trip channel for `.useFarAtten + .farAttenEnd` (no direct UsdLux equivalent). Skylight -> `UsdLuxDomeLight` with `intensity` from `.multiplier` (direct scale, no candela conversion), `inputs:color` from `.skyColor` ONLY when `.useSkyColor = true` (the color-only branch), `texture:file + texture:format = latlong` ONLY when `.useSkyColor = false` (the map-only branch -- the two are mutually exclusive), `shadow:enable` from `.castShadows`. NO Kelvin on either class; `.rayPerSample` and Max-only attenuation modes have no UsdLux equivalent and are lossy on round-trip | audit (lock-in of would-be per-class writer attribute-translation spec, no C++ logic change -- the silent-drop is still the current behavior; this audit pins the spec the future writers MUST honor) | (UsdLux schema; not a shader nodedef -- two would-be per-class writer outputs side-by-side, `UsdLuxSphereLight` + `UsdLuxDomeLight`) | `PhotometricLightWriter::CanExport` is invoked on a legacy Omnilight or Skylight node AND the current baseline still returns `Unsupported` -> silent drop (the MAX-LIT-001 bottom bound holds). Surgical bounds the audit pins: (a) Omnilight `.multiplier` -> SphereLight `intensity`, preserved through the writer (wildcard widening would silently lose to unit-default); (b) Omnilight `.rgb` -> SphereLight `inputs:color`, preserved through the writer (wildcard widening would silently lose to white); (c) Omnilight `.castShadows` -> SphereLight ShadowAPI `shadow:enable`, preserved (wildcard widening would silently force-enable); (d) Omnilight `.on == false` -> SphereLight `intensity = 0`, NOT dropped prim (preserves the artist's intent that the light was placed but disabled); (e) Skylight `.multiplier` -> DomeLight `intensity`, preserved; (f) Skylight `.skyColor` + `.useSkyColor` -> DomeLight `inputs:color` IFF `useSkyColor` (color-only branch); (g) Skylight `.mapNode` + `!.useSkyColor` -> DomeLight `texture:file` + `texture:format = latlong` ONLY (map-only branch); (h) Skylight `.castShadows` -> DomeLight ShadowAPI `shadow:enable`, preserved (wildcard widening would silently force-enable, inverting the common archviz fill-light convention `.castShadows = false`); (i) cross-writer divergence: BOTH proposed writers active on the same stage carry their OWN UsdLux schema conventions without sharing state -- Omnilight prims are `SphereLight` AND NOT `DomeLight`, Skylight prims are `DomeLight` AND NOT `SphereLight`, `radius` / `treatAsPoint` (Sphere-only) MUST NOT leak onto DomeLight prims, `texture:file` / `texture:format` (Dome-only) MUST NOT leak onto SphereLight prims | MAX-LIT-003 | 2026-06-26 |
 | Animation / time-sampled export across the three writer paths that author time-coded attributes from animated 3ds Max scenes: `src/MaxUsd/Builders/USDSceneBuilder.cpp` (transform/xform via `AddTransformExportOp`); `src/translators/CameraWriter.cpp` (camera focalLength / clippingRange / aperture / fStop / focusDistance / DOF inputs); `src/translators/PhotometricLightWriter.cpp` (light intensity / inputs:color / extent attributes per UsdLux geometry type). The central `MaxUsd::AnimExportTask::Execute` scheduler resolves every per-op USD time code via the substitution `usdTime = animated ? UsdTimeCode(GetFrameFromTimeValue(maxTime)) : UsdTimeCode::Default()` (where `animated = timeConfig.IsAnimated() = startFrame != endFrame`) | Three divergent gate conventions, one per writer, plus a per-writer static-attribute partition that is NEVER time-coded regardless of the gate: (a) Transform `exportTimeSamples = animType == TimeSamples OR nodeTarget OR !isValidController` -- FORCES TimeSamples on lookat-target nodes AND invalid-controller nodes (List / PRS-without-keys / Expose / Linkage); (b) Camera `exportTimeSamples = animType != Curves` -- TimeSamples co-exists ADDITIVELY with the Curves spline path on Max 2026+ (Hydra / Karma / ARKit consumer fallback); (c) Light `exportTimeSamples = animType == TimeSamples` -- STRICT equality, no time-sample fallback on Curves mode (lights serialize as splines only). Each writer's static-attribute partition (camera `projection`; light `enableColorTemperature`, `normalize`, `shaping:ies:file` [MAX-LIT-002 IES branch bound], `colorTemperatureAttr` [MAX-LIT-002 Kelvin branch bound]) is authored at `UsdTimeCode::Default()` ONCE per write, outside the `if (exportTimeSamples)` blocks | audit (lock-in of existing three-writer-path animation surgical-coverage bound, no C++ logic change) | (multiple non-shader USD constructs: `pxr::UsdGeomXformOp` per-component attr time samples; `pxr::UsdGeomCamera.focalLength` / `.clippingRange` / `.horizontalAperture` / `.verticalAperture` / `.focusDistance` / `.fStop` time samples; `pxr::UsdLuxLightAPI.intensity` / `.color` time samples + UsdLux geometry-specific extent attrs `.radius` / `.width` / `.length`) | `AnimExportTask::Execute` is invoked AND `timeConfig.IsAnimated()` (start != end). Surgical bounds the audit pins: (a) `IsAnimated() == false` -> EVERY writer's `attr.Set(value, usdTime)` carries `usdTime = UsdTimeCode::Default()` (the static-asset convention); (b) `IsAnimated() == true` -> EVERY writer's `attr.Set(value, usdTime)` carries `usdTime = UsdTimeCode(frame)` at each frame in `[startTime, endTime]` step `timeStep = ticksPerFrame / samplesPerFrame`; (c) the Transform path's FORCE-TimeSamples cases for `nodeTarget` (lookat needs sample-time worldspace target lookup; spline cannot represent it) and `!isValidController` (List / PRS-without-keys / Expose / Linkage cannot serialize as Ts splines) -- both branch out of the Curves serialization path even when `animType == Curves`; (d) the Camera path's `!= Curves` gate co-exists with the spline path (Curves mode authors BOTH the spline AND the time-sample fallback); (e) the Light path's `== TimeSamples` strict-equality gate (Curves mode authors splines ONLY, no time-sample fallback); (f) each writer's never-time-coded static attrs (camera projection; light enableColorTemperature, normalize, colorTemperature, shaping:ies:file) stay at `UsdTimeCode::Default()` even on animated stages | MAX-ANIM-001 | 2026-06-26 |
 
 ## Notes per expression
@@ -2721,6 +2722,270 @@ ships with the per-attribute lock-in. Until those per-class writers
 land, the silent drop is the documented, locked-in behaviour and this
 audit prevents it from being silently widened.
 
+### Legacy Omnilight + Skylight → would-be per-class writer attribute-translation spec  (audit, the future `MaxUsdLegacyOmnilightWriter` + `MaxUsdLegacySkylightWriter` STOP HERE on every attribute)  (MAX-LIT-003)
+
+**Symptom (the silent-drop is locked in by MAX-LIT-001; this audit pins
+the SPEC the future per-class writers must honor).** MAX-LIT-001 pinned
+the writer-registry's bottom bound: every legacy `LightObject` that is
+NOT a `LightscapeLight` (Omnilight / Skylight / legacy Spot / legacy
+Direct / mr_Sky / Daylight) silently drops to nullptr at
+`MaxUsdPrimWriterRegistry::FindWriter`. The MAX-LIT-001 retirement
+condition named the path forward: a proper per-class legacy-light
+writer per legacy class, each with its own attribute mapping. THIS
+audit (MAX-LIT-003) catalogs the per-class attribute translation tables
+the two highest-severity writers — Omnilight (`OMNI_LIGHT_CLASS_ID` →
+`UsdLuxSphereLight`) and Skylight (`SKYLIGHT_CLASS_ID` →
+`UsdLuxDomeLight`) — MUST honor when they land. The Mac cannot build
+the plugin (Windows-only); any unverified per-class writer C++ would
+silently mutate artist content on the next release. So this audit
+ships ONLY the spec + the cross-writer divergence invariant + the
+existing-silent-drop-with-non-default-customizations regression that
+proves the wildcard widening would lose by named attribute. The
+silent drop is preserved; this audit is the spec the writers will
+satisfy when they land.
+
+**Why this audit pins it.** The MAX-LIT-001 audit's negative cases use
+default-attribute Omnilight + Skylight (`omniLight()`, `Skylight()` at
+construction-time defaults). The wildcard widening counterfactual it
+locks out is "every Omnilight becomes a unit-intensity SphereLight, every
+Skylight becomes a unit-intensity DomeLight". But the audit does NOT
+cover:
+
+* an Omnilight with non-default `multiplier` (= 0.3 in the regression
+  fixture) — would silently lose to unit-intensity under the wildcard
+  widening;
+* an Omnilight with non-default `rgb` (= warm tungsten in the regression
+  fixture) — would silently lose to white under the wildcard widening;
+* an Omnilight with `castShadows = false` (a common archviz setting
+  to suppress AO contours under fill lights) — would silently force
+  shadow:enable=true under the wildcard widening;
+* an Omnilight with `on = false` (the light was placed but disabled by
+  the artist) — under the wildcard widening, would author a default
+  unit-intensity prim, INVENTING illumination the source scene had
+  explicitly disabled;
+* a Skylight with non-default `multiplier` (= 0.4 in the regression
+  fixture) — silently lost;
+* a Skylight with non-default `skyColor` (= cool dusk in the regression
+  fixture) — silently lost;
+* a Skylight with `useSkyColor = false` + a `mapNode` — the
+  color-vs-map dichotomy the spec's mutually-exclusive authoring
+  invariant pins;
+* a Skylight with `castShadows = false` — the archviz fill-light
+  convention — silently force-enabled under the wildcard widening;
+* the cross-writer state-sharing invariant: BOTH writers active on the
+  same scene must each preserve their own UsdLux schema conventions
+  without sharing state (the MAX-MAT-009 cross-writer concern shape
+  applied to two would-be writers).
+
+A regression that:
+
+* Returned `ContextSupport::Fallback` for every `LightObject` AND fell
+  back to a single `UsdLuxSphereLight` default — would author a default
+  unit-intensity SphereLight + default unit-intensity DomeLight at every
+  legacy light position, silently flattening every per-attribute
+  customization the spec catalogs above into the renderer-side default.
+* Added a per-class writer that copy-pasted the wildcard widening's
+  default-attribute authoring into the per-class branch — would pass
+  the MAX-LIT-001 dropout assertions (the silent drop no longer fires)
+  but would fail the MAX-LIT-003 spec validator's per-attribute cases
+  by named attribute.
+
+…would pass every existing test in `export_light_test.ms` AND the
+MAX-LIT-001 dropout regression (which only checks for the PRESENCE of
+the prim, not the per-attribute correctness) because no existing test
+exercises a legacy LightObject WITH non-default customizations.
+
+**Bounds (the attribute translation spec — the future writers MUST
+honor every row of this table):**
+
+Omnilight (`OMNI_LIGHT_CLASS_ID`) → `UsdLuxSphereLight`:
+
+| Max attribute | UsdLux attribute | Transform | Notes |
+| --- | --- | --- | --- |
+| `.multiplier` (scalar) | `inputs:intensity` (scalar) | direct scale × unit conversion | Zero when `.on == false`; the spec preserves the prim at `intensity = 0` (NOT dropped) so artist intent ("light placed but disabled here") survives round-trip |
+| `.rgb` (color3 swatch) | `inputs:color` (color3) | direct pass-through | NO `useKelvin` toggle on legacy Omnilight; `inputs:enableColorTemperature = false` always (a future widening that flipped Kelvin on would double-tint the swatch the artist authored) |
+| `.castShadows` (bool) | `ShadowAPI.shadow:enable` (bool) | direct pass-through | A widening that hardcoded `shadow:enable = true` would silently flip artist's `castShadows = false` (common archviz setting) |
+| (point-light shape) | `.radius = 0.001` + `.treatAsPoint = true` | per MAX-LIT-002 Free_Point precedent | Same minimal-radius convention as photometric Free_Point lights (`PhotometricLightWriter.cpp:269-279`) |
+| (UsdLux convention) | `inputs:normalize = true` | always | Matches photometric precedent (`PhotometricLightWriter.cpp:296`) |
+| `.useFarAtten` + `.farAttenEnd` | `customData[3dsmax:legacy_omnilight:farAttenEnd]` | lossy round-trip channel | UsdLuxSphereLight has NO range-limited falloff (inverse-square default); the custom-data carries the hint for a future re-importer but no UsdLux attribute is authored |
+| `.useNearAtten` + `.nearAttenStart` + `.nearAttenEnd` | (none) | lossy | No UsdLux equivalent; not preserved |
+| `.decayType` (DECAY_NONE / INVERSE_DECAY / INVERSE_SQUARE_DECAY) | (none) | lossy | UsdLux SphereLight assumes physically-based inverse-square falloff in modern renderers; the Max decay modes have no UsdLux equivalent |
+| `.exclusionList` | (none) | lossy | No UsdLux equivalent |
+
+Skylight (`SKYLIGHT_CLASS_ID`) → `UsdLuxDomeLight`:
+
+| Max attribute | UsdLux attribute | Transform | Notes |
+| --- | --- | --- | --- |
+| `.multiplier` (scalar) | `inputs:intensity` (scalar) | direct scale | NO candela conversion; the dome path is renderer-unit agnostic |
+| `.skyColor` + `.useSkyColor = true` | `inputs:color` (color3) | direct pass-through | color-only branch; mutually exclusive with the map branch — NEVER author both `inputs:color` AND `texture:file` |
+| `.mapNode` + `.useSkyColor = false` | `texture:file` (asset path) + `texture:format = latlong` | map-only branch | Skylight maps are equirectangular environment textures in Max; `latlong` is the matching UsdLux format. A widening that left format unauthored lets the renderer pick its own default (Karma: latlong; ARKit: angularMap), diverging cross-renderer |
+| `.castShadows` (bool) | `ShadowAPI.shadow:enable` (bool) | direct pass-through | Wildcard widening would hardcode `true`, inverting the common archviz fill-light convention `.castShadows = false` |
+| (UsdLux convention) | `inputs:normalize = true` | always | Matches photometric precedent |
+| `.rayPerSample` | (none) | lossy | Renderer-specific; no UsdLux equivalent |
+
+**Why the wildcard widening would be wrong (per-attribute).** The
+planner's `max-lit-001-export-lights` rationale ("Honour optA.lights
+=true and export Max Skylight/Omnilight to UsdLux") might be read as
+"widen `PhotometricLightWriter::CanExport` to return `Fallback` for
+every LightObject and stamp out UsdLuxSphereLight / UsdLuxDomeLight
+per class". That widening, even if it correctly dispatched to the right
+per-class UsdLux prim type, would still silently lose every
+per-attribute customization above unless it ALSO implemented the
+attribute-translation tables. The cross-writer divergence invariant
+catches a different failure mode: a refactor that consolidated the two
+writers into a "generic legacy LightObject writer" with shared
+attribute-list authoring would either break each writer's own
+convention (Sphere-only attrs leaking onto Dome prims, or vice versa)
+OR keep both conventions on each writer's output. The spec's
+mutually-exclusive `inputs:color` vs `texture:file` invariant on the
+dome path is the cleanest worked example: a writer that authored
+BOTH would let the renderer's tint-and-multiply pipeline produce
+source-renderer-dependent appearance (Hydra Karma multiplies the
+swatch through the map; RenderMan ignores the swatch when a map is
+present; ARKit hosts the map alone).
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/4d931178-3f57-4ff7-bba5-edb7bf90a35e/validate_legacy_light_attribute_spec_surgical.py`
+mirrors both proposed per-class writers at the USD layer over a
+synthetic fixture. 10 cases + idempotence + cross-writer divergence +
+spec-vs-widening divergence — 101 assertions total:
+
+| Case | Source-Max setup | Expected UsdLux prim | Spec-pinned attribute |
+| --- | --- | --- | --- |
+| `LegacyOmnilight_AtSpecDefault` | multiplier=1, rgb=white, castShadows=on | UsdLuxSphereLight | default attrs |
+| `LegacyOmnilight_NonDefault_Multiplier` | multiplier=0.3 | UsdLuxSphereLight | `intensity` ≠ 1.0 |
+| `LegacyOmnilight_NonDefault_WarmColor` | rgb=(1, 0.55, 0.20) | UsdLuxSphereLight | `inputs:color` ≠ (1,1,1) |
+| `LegacyOmnilight_NonDefault_ShadowOff` | castShadows=false | UsdLuxSphereLight | `shadow:enable = false` |
+| `LegacyOmnilight_LightOff` | on=false | UsdLuxSphereLight at intensity=0 | prim preserved, intensity zeroed (NOT dropped) |
+| `LegacySkylight_AtSpecDefault` | multiplier=1, useSkyColor=true, white | UsdLuxDomeLight | default attrs, color-only branch |
+| `LegacySkylight_NonDefault_Multiplier` | multiplier=0.4 | UsdLuxDomeLight | `intensity` ≠ 1.0 |
+| `LegacySkylight_NonDefault_CoolColor` | skyColor=(0.20, 0.42, 0.85) | UsdLuxDomeLight | `inputs:color` ≠ (1,1,1) |
+| `LegacySkylight_NonDefault_ShadowOff` | castShadows=false | UsdLuxDomeLight | `shadow:enable = false` |
+| `LegacySkylight_WithMap` | useSkyColor=false + mapNode | UsdLuxDomeLight | `texture:file` authored; `inputs:color` NOT authored (mutually exclusive) |
+
+Plus:
+
+* Cross-writer divergence pass (35 assertions): asserts every Omnilight
+  prim IS `UsdLuxSphereLight` AND NOT `UsdLuxDomeLight`, every Skylight
+  prim IS `UsdLuxDomeLight` AND NOT `UsdLuxSphereLight`, `radius` /
+  `treatAsPoint` (Sphere-only) MUST NOT be authored on any DomeLight
+  prim, `texture:file` (Dome-only) MUST NOT be authored on any
+  SphereLight prim. This is the MAX-MAT-009 cross-writer concern shape
+  applied to two would-be writers: the audit's anchor case ensures a
+  unification refactor that bridged the two writers would either break
+  each writer's own convention (caught by the per-case asserts above)
+  OR keep both conventions on each writer's output (caught here).
+* Spec-vs-wildcard-widening divergence pass (7 assertions): authors the
+  SAME fixtures under the wildcard widening counterfactual (default
+  unit-intensity / white-color / shadow-on) and asserts the spec's
+  output is DIFFERENT on the per-attribute loss cases (multiplier,
+  color, shadow). A spec implementation that silently regressed to
+  wildcard behavior on ANY of those attributes would fail by named
+  case.
+* Idempotence pass (1 assertion): re-authoring the same fixtures
+  produces an identical prim-path set.
+
+All 101 assertions pass on the 2026-06-26 baseline against pxr.Usd
+0.25.5, locking in the spec. A regression that flipped the per-class
+attribute translation (or that consolidated the two writers into a
+shared-state generic-LightObject writer) would fail by named case +
+named attribute.
+
+**MaxScript regression.**
+`src/Tests/Integration/export_light_test.ms` now carries
+`photometric_light_writer_legacy_attribute_dropout_audit_test`. It
+constructs a scene with three lights — a `free_light()` of type
+`#Free_Point` (the LIGHTSCAPE_LIGHT_CLASS positive control), an
+`omniLight()` with **non-default** multiplier (0.3) + **non-default**
+rgb (warm tungsten 255/140/51) + castShadows=false, and a `Skylight()`
+with **non-default** multiplier (0.4) + **non-default** rgb (cool
+dusk 51/107/217) + castShadows=false — exports through `USDExporter`
+with `Lights = true`, and asserts that the photometric DiskLight IS
+authored AND BOTH legacy lights with their customizations STILL
+silently drop AND no customData round-trip channel exists for the
+multiplier on either. When a per-class writer lands per the spec, the
+last four assertions flip to assert_true (prim exists) + per-attribute
+checks against the spec table above.
+
+**Visual demonstration of the surgical bound.** A neutral probe
+fixture — a matte-grey sphere on a matte-grey ground plane lit by ONE
+warm-tungsten `UsdLuxSphereLight` on the LEFT (the spec-correct
+widening of an Omnilight with multiplier=0.3, rgb=warm tungsten,
+castShadows=true) PLUS ONE cool-dusk `UsdLuxDomeLight` (the
+spec-correct widening of a Skylight with multiplier=0.4, skyColor=cool
+dusk, castShadows=false) — is rendered twice in Karma CPU at 800px
+wide:
+
+* `render_karma_postfix.png` — the spec-correct widening. The sphere
+  reads with directional warm-cool asymmetry:
+  * LEFT third foreground mean R=120.54 / G=115.91 / B=103.06 / 255
+    (R > B by 17.48 — the warm-tungsten SphereLight color preserved);
+  * MID third foreground mean R=171.42 / G=163.64 / B=144.58 / 255
+    (R > B by 26.84 — the sphere is dominated by the SphereLight bouncing
+    off the front);
+  * RIGHT third foreground mean R=80.59 / G=75.23 / B=75.53 / 255
+    (G ≈ B within 0.30 — the cool-dusk DomeLight tints the dimmer
+    far side; R slightly higher because the SphereLight wraps
+    around);
+  * LEFT-vs-RIGHT R asymmetry = 39.95 / 255, LEFT-vs-RIGHT B
+    asymmetry = 27.53 / 255 — both per-channel directions are large
+    because the SphereLight's multiplier and color preservation made
+    the LEFT side WARM-AND-BRIGHT vs the RIGHT side COOL-AND-DIM;
+  * A single soft directional shadow falls
+    under-and-to-the-RIGHT from the SphereLight; NO AO contour
+    rings the sphere from the DomeLight (its
+    `shadow:enable = false` was preserved).
+* `render_unreal_reference.png` — the wildcard-widening counterfactual.
+  Both legacy lights flatten to default unit-intensity, white-color,
+  shadow-on UsdLux defaults. The sphere reads with PERFECT per-third
+  R=G=B symmetry:
+  * LEFT third foreground mean R=G=B=136.17 / 255 (exact);
+  * MID third foreground mean R=G=B=187.14 / 255 (exact);
+  * RIGHT third foreground mean R=G=B=122.40 / 255 (exact);
+  * LEFT-vs-RIGHT R asymmetry = LEFT-vs-RIGHT B asymmetry =
+    13.77 / 255 — IDENTICAL on both channels (no directional color
+    signal because every customization collapsed to white-default);
+  * A shadow rings the sphere on BOTH sides because the wildcard
+    widening flipped the dome's `shadow:enable = true`, adding AO
+    contours the source Skylight never produced.
+
+PNGs are SHA-256-distinct (`a256a4adc9580f0fc16b26170e04c5e510a52420f3e83ed93300f17b7c4fcc58`
+vs `fe57a3987ad9b0672a2aff700b97bfbd052623077dc7068d9d3fd47e3e61f2bf`).
+59.88% of pixels in the frame have a non-zero per-pixel Manhattan delta
+(mean delta 96.03 / 765 — a 12.55% mean intensity delta across the
+frame). `compare_side_by_side.png` is the auditor's at-a-glance
+composite.
+
+The auditor's checklist: **postfix has (1) LEFT-third R > B by at
+least 10/255 (warm tint preserved); (2) per-third R asymmetry LEFT vs
+RIGHT > 15/255 (SphereLight multiplier preserved as directional
+falloff); (3) per-third B asymmetry LEFT vs RIGHT > 15/255 (DomeLight
+cool tint preserved); (4) a single soft directional shadow
+under-and-to-the-RIGHT, NO AO contour ringing the sphere; AND
+still-broken reference has (5) per-third R=G=B within 5/255 of each
+other on every third (no directional color signal) AND (6) LEFT-vs-
+RIGHT R asymmetry EQUAL to LEFT-vs-RIGHT B asymmetry within 1/255
+(white-default symmetry).** A refactor that ever made the postfix
+per-third asymmetry shrink to within ±5/255 of the reference would
+mean the spec's per-attribute writer convention has silently
+regressed to wildcard widening behavior.
+
+**Retirement condition.** This audit retires the day BOTH per-class
+writers land per the spec — `MaxUsdLegacyOmnilightWriter` registered
+in `plugInfo.json` that returns `ContextSupport::Fallback` for
+`OMNI_LIGHT_CLASS_ID` and authors `UsdLuxSphereLight` per the
+attribute-translation table above, PLUS `MaxUsdLegacySkylightWriter`
+that does the same for `SKYLIGHT_CLASS_ID` → `UsdLuxDomeLight`. At
+that point the MAX-LIT-001 case-table row for `LegacyOmnilight` flips
+from "silent drop" to "claimed by `MaxUsdLegacyOmnilightWriter`,
+attributes translated per MAX-LIT-003 spec table", and the per-class
+writer commits each cite this MAX-LIT-003 spec entry as their
+authoritative attribute-translation source. Until those writers land,
+the spec is the lock-in: any future "extend
+`PhotometricLightWriter::CanExport` to LightObject" refactor must
+satisfy every row in both attribute-translation tables above AND the
+cross-writer divergence invariant, or fail by named case.
+
 ### Photometric / Physical light `.webFile` → UsdLuxShapingAPI.shaping:ies:file  (MAX-LIT-002, IES branch)
 
 **Symptom (covered before the audit, but uncovered by the suite).**
@@ -5190,4 +5455,44 @@ behaviour.
   paths. No C++ logic change. Retires when a separate future
   MAX-ANIM-* genuinely needs to unify the gates as dictated by a
   captured Curves-mode corpus.
+* 2026-06-26 — MAX-LIT-003 Legacy Omnilight + Skylight
+  attribute-translation spec audit. Introduces a new entry for the
+  TWO highest-severity legacy `LightObject` subclasses MAX-LIT-001
+  today silently drops — `Omnilight` (`OMNI_LIGHT_CLASS_ID`) and
+  `Skylight` (`SKYLIGHT_CLASS_ID`) — and catalogs the per-class
+  attribute-translation tables the future `MaxUsdLegacyOmnilight-
+  Writer` (-> `UsdLuxSphereLight`) and `MaxUsdLegacySkylight-
+  Writer` (-> `UsdLuxDomeLight`) MUST honor when they land. The
+  Mac cannot build the plugin (Windows-only); an unverified per-
+  class writer C++ would silently mutate artist content on the
+  next release. So this audit ships the spec + a cross-writer
+  divergence invariant + an extended MaxScript regression that
+  exercises the silent-drop on NON-DEFAULT artist customizations
+  (multiplier 0.3, warm rgb on Omnilight; multiplier 0.4, cool
+  rgb on Skylight; castShadows=false on both), proving the
+  wildcard widening would lose by named attribute. The current
+  silent-drop is preserved at `PhotometricLightWriter::CanExport`.
+  The audit adds a MAX-LIT-003 comment block extending the
+  existing MAX-LIT-001 block with the per-class attribute
+  translation tables + back-pointers to the validator + regression.
+  Python validator
+  (`validate_legacy_light_attribute_spec_surgical.py`, 10 named
+  cases + idempotence + cross-writer divergence + spec-vs-wildcard
+  divergence, 101 assertions total, all PASS on 2026-06-26
+  baseline against pxr.Usd 0.25.5). MaxScript regression
+  `photometric_light_writer_legacy_attribute_dropout_audit_test`
+  added to `export_light_test.ms`. Karma CPU visual auditor pair
+  on a matte-grey-sphere + ground-plane probe lit by two would-be
+  per-class light pools side-by-side: postfix preserves the
+  warm-cool directional dichotomy (LEFT-third R > B by 17.48/255,
+  per-third R/B asymmetry > 27/255 LEFT vs RIGHT), reference
+  flattens to perfect per-third R=G=B symmetry on every third
+  (mean Manhattan delta 96.03/765, 59.88% non-zero pixels, SHA-256
+  distinct PNGs). No C++ logic change. Retires the day both per-
+  class writers land per the spec — at that point the MAX-LIT-001
+  case-table row for `LegacyOmnilight` flips from "silent drop" to
+  "claimed by `MaxUsdLegacyOmnilightWriter`, attributes translated
+  per MAX-LIT-003 spec table", and the per-class writer commits
+  each cite this MAX-LIT-003 spec entry as their authoritative
+  attribute-translation source.
 

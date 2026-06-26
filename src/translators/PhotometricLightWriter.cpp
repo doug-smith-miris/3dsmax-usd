@@ -131,6 +131,75 @@ MaxUsdPhotometricLightWriter::MaxUsdPhotometricLightWriter(
 // with its own attribute mapping + its own MaxScript regression + its
 // own doc entry; this audit pins the bottom bound so those follow-on
 // bites are visible as widenings rather than landing silently.
+//
+// MAX-LIT-003 lock-in: per-class attribute-translation spec for the
+// two highest-severity legacy LightObject subclasses that MAX-LIT-001
+// today drops (Omnilight = OMNI_LIGHT_CLASS_ID; Skylight =
+// SKYLIGHT_CLASS_ID). This file's CanExport gate still returns
+// Unsupported for both (no widening here -- the Mac cannot build the
+// plugin and unverified per-class writers would silently mutate
+// artist content on the next release). MAX-LIT-003 instead pins the
+// SPEC that a future MaxUsdLegacyOmnilightWriter +
+// MaxUsdLegacySkylightWriter MUST honor when they land:
+//
+//   Omnilight (OMNI_LIGHT_CLASS_ID) -> UsdLuxSphereLight
+//     - Max .multiplier               -> UsdLux.intensity         (scaled; preserves the wildcard-widening loss case)
+//     - Max .rgb                      -> UsdLux.inputs:color      (NO Kelvin -- legacy Omnilight has no useKelvin toggle)
+//     - Max .castShadows              -> UsdLuxShadowAPI.shadow:enable
+//     - Max .on == false              -> UsdLux.intensity = 0     (zero, do NOT drop the prim)
+//     - Max .useFarAtten + .farAttenEnd -> customData[3dsmax:legacy_omnilight:farAttenEnd]
+//                                          (NO direct UsdLux equivalent;
+//                                           the spec records the
+//                                           lossy round-trip channel)
+//     - Sphere/point shape            -> .radius = 0.001, .treatAsPoint = true  (per MAX-LIT-002 Free_Point precedent)
+//
+//   Skylight (SKYLIGHT_CLASS_ID)   -> UsdLuxDomeLight
+//     - Max .multiplier               -> UsdLux.intensity         (direct scale; no unit conversion)
+//     - Max .skyColor + .useSkyColor  -> UsdLux.inputs:color      (color-only branch; mutually exclusive with map)
+//     - Max .mapNode + !.useSkyColor  -> UsdLux.texture:file + texture:format = latlong
+//                                          (map-only branch; NO inputs:color)
+//     - Max .castShadows              -> UsdLuxShadowAPI.shadow:enable
+//                                          (wildcard widening would
+//                                           hardcode shadow:enable=true,
+//                                           silently inverting the
+//                                           common archviz `castShadows = false`
+//                                           fill-light setting)
+//     - Max .rayPerSample             -> (NO UsdLux equivalent; renderer-specific)
+//
+// Pinned by the regression suite via
+// src/Tests/Integration/export_light_test.ms ::
+//     photometric_light_writer_legacy_attribute_dropout_audit_test
+//                 (Omnilight + Skylight with NON-DEFAULT artist
+//                  customizations -- multiplier, color, castShadows --
+//                  exported AND asserted that no UsdLux prim survives,
+//                  proving that the customizations are silently lost
+//                  alongside the silent drop. When a per-class writer
+//                  lands and flips this test's expectations, the
+//                  test author MUST consult validate_legacy_light_attribute_spec_surgical.py's
+//                  attribute table to keep the spec honored at the
+//                  test layer.)
+// plus the doc-linked Python validator
+// validate_legacy_light_attribute_spec_surgical.py (101 assertions: 58
+// per-case spec attribute conformance + 35 cross-writer divergence + 7
+// spec-vs-wildcard-widening divergence + 1 idempotence, across 10
+// named cases). The validator builds ONE synthetic UsdStage with BOTH
+// proposed writers' outputs side-by-side and asserts the cross-writer
+// invariant: each writer must preserve its own UsdLux schema
+// conventions without sharing state with the other. A widening that
+// authored UsdLuxSphereLight attrs on UsdLuxDomeLight prims, or vice
+// versa, would fail the cross-writer assertions by named case.
+//
+// Why the wildcard widening would STILL be wrong even with the spec:
+// even when MaxUsdLegacyOmnilightWriter + MaxUsdLegacySkylightWriter
+// land per this spec, a wildcard widening that returned Fallback for
+// every LightObject (without per-class GetPrimType dispatch + per-class
+// attribute translation) would author every Omnilight as a unit-default
+// SphereLight + every Skylight as a unit-default DomeLight, losing
+// every per-attribute customization the spec catalogs above. The
+// wildcard widening fails by named ATTRIBUTE (multiplier preserved?
+// color preserved? shadow flag preserved?) in the spec-vs-widening
+// pass of the Python validator -- the validator's cases 2/3/4 + 7/8/9
+// each pin one of those attribute-preservation invariants by name.
 MaxUsdPrimWriter::ContextSupport MaxUsdPhotometricLightWriter::CanExport(
     INode*                                node,
     const MaxUsd::USDSceneBuilderOptions& exportArgs)

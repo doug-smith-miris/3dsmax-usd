@@ -390,6 +390,127 @@ struct export_light_test
             message:(photometricLight.name + " with exportOptions.Lights = false MUST also be dropped (the TranslateLights short-circuit fires before the class-id gate). If the photometric survives a Lights=false export, the option gate has regressed and the legacy-drop assertions above are no longer a clean MAX-LIT-001 baseline.")
     ),
 
+    -- MAX-LIT-003 attribute-translation spec audit: extends the
+    -- MAX-LIT-001 dropout audit to assert that, even when the source
+    -- legacy Omnilight + Skylight carry NON-DEFAULT artist customizations
+    -- (multiplier ≠ 1, rgb ≠ white, castShadows ≠ default, on != true),
+    -- the writer-registry STILL silently drops the lights AND the
+    -- customizations are lost along with the prim with no diagnostic.
+    --
+    -- The MAX-LIT-001 regression covers the default-attribute drop case
+    -- (omniLight() + Skylight() at default settings -> no prim). This
+    -- test pins the attribute-loss surface: if a future widening lands
+    -- (PhotometricLightWriter::CanExport extended to LightObject without
+    -- per-class GetPrimType + per-class attribute translation), the
+    -- customizations below would be silently flattened to default
+    -- intensity/white/shadow-on. The spec at
+    --   /Users/d.smith/MirisProjects/Agent\ Builder/agent/arch-builds/
+    --     4d931178-3f57-4ff7-bba5-edb7bf90a35e/
+    --       validate_legacy_light_attribute_spec_surgical.py
+    -- catalogs the per-class attribute translation table the future
+    -- writers MUST honor (Omnilight.multiplier -> UsdLux.intensity,
+    -- Omnilight.rgb -> UsdLux.color, Skylight.skyColor -> UsdLux.color
+    -- (color-only branch), Skylight.castShadows -> shadow:enable).
+    -- This test pins that under the CURRENT baseline, the customizations
+    -- are lost; when a writer lands per the spec, the assertions below
+    -- flip to "prim exists at the path AND each attribute matches the
+    -- spec".
+    function photometric_light_writer_legacy_attribute_dropout_audit_test = (
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.RootPrimPath = "/"
+        exportOptions.Lights = true
+
+        -- Positive control: a Photometric Free_Point still authored
+        -- correctly. Same precedent as the MAX-LIT-001 audit; pinned
+        -- here so the per-class-attribute negative cases are not
+        -- confused with an upstream writer-registry regression.
+        local photometricLight = free_light()
+        photometricLight.name = "PhotometricPositiveControl_NonDefaults"
+        photometricLight.type = #Free_Point
+        photometricLight.distribution = 2 -- uniform hemispherical/diffuse
+
+        -- Negative case A: legacy Omnilight with NON-DEFAULT customizations
+        -- the spec preserves -- multiplier = 0.3 (dim), rgb = warm tungsten,
+        -- castShadows = false (no shadow).
+        local legacyOmni = omniLight()
+        legacyOmni.name = "LegacyOmni_NonDefault_Customizations"
+        legacyOmni.pos = [200, 0, 100]
+        legacyOmni.multiplier = 0.3
+        legacyOmni.rgb = color 255 140 51   -- warm tungsten in 0-255
+        legacyOmni.baseobject.castShadows = false
+
+        -- Negative case B: legacy Skylight with NON-DEFAULT customizations
+        -- -- multiplier = 0.4 (dim), skyColor = cool dusk, castShadows = false.
+        -- Per the MAX-LIT-003 spec, the future writer would author
+        -- UsdLuxDomeLight at intensity=0.4, color=(0.20, 0.42, 0.85),
+        -- shadow:enable=false; under the CURRENT baseline, ALL of those
+        -- are silently lost together with the prim.
+        local legacySky = Skylight()
+        legacySky.name = "LegacySky_NonDefault_Customizations"
+        legacySky.pos = [-200, 0, 100]
+        legacySky.multiplier = 0.4
+        -- Skylight uses .rgb to drive the sky color when no map is bound.
+        legacySky.rgb = color 51 107 217    -- cool dusk in 0-255
+        legacySky.baseobject.castShadows = false
+
+        local exportPath = output_prefix + "test_legacy_lights_attribute_dropout_audit_export.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        -- Positive-control surgical bound: the LIGHTSCAPE_LIGHT_CLASS
+        -- branch fires; the photometric light IS authored at its path.
+        local photometricPath = "/" + photometricLight.name
+        local photometricPrim = pyUsd.Prim.GetPrimAtPath stage photometricPath
+        assert_true (photometricPrim.IsValid()) \
+            message:(photometricLight.name + " positive control should be authored as a UsdLux prim under MAX-LIT-003 baseline.")
+
+        -- Surgical bound A1 (Omnilight prim dropped): the legacy Omnilight
+        -- is silently dropped even WITH non-default multiplier + rgb +
+        -- castShadows. A wildcard widening that landed without per-class
+        -- attribute translation would author a UsdLuxSphereLight at this
+        -- path -- this assertion catches that widening even when the
+        -- spurious prim authored is NOT default white (the spec validator
+        -- catches the per-attribute regression on the prim).
+        local legacyOmniPath = "/" + legacyOmni.name
+        local legacyOmniPrim = pyUsd.Prim.GetPrimAtPath stage legacyOmniPath
+        assert_false (legacyOmniPrim.IsValid()) \
+            message:(legacyOmni.name + " is the MAX-LIT-003 negative case for Omnilight: a legacy Omnilight with non-default multiplier (0.3), non-default rgb (warm tungsten), AND castShadows=false MUST still be silently dropped under the current writer-registry baseline. If this assertion fails, a per-class writer has landed -- the spec validator at validate_legacy_light_attribute_spec_surgical.py catalogs the attribute translation table this writer MUST honor (intensity from multiplier, color from rgb, shadow:enable from castShadows). Flipping this assertion to assert_true requires also updating the per-attribute assertions in this test to the spec's expected values.")
+
+        -- Surgical bound A2 (Omnilight customizations are silently lost):
+        -- in the current baseline there is no observable round-trip channel
+        -- for the multiplier / color / shadow customizations of legacy
+        -- Omnilights. A regression that silently authored a UsdLuxSphereLight
+        -- with DEFAULT unit-intensity / white-color / shadow-on at the
+        -- legacy Omnilight's path (the wildcard widening counterfactual)
+        -- would pass A1 above only if the writer also dropped the prim --
+        -- but then the customizations are doubly lost (no prim + no
+        -- round-trip channel). The customDataByKey check below pins that
+        -- no spec channel (e.g. customData['3dsmax:legacy_omnilight:multiplier'])
+        -- exists either: the current baseline carries the customizations
+        -- in ZERO channels.
+        local legacyOmniCustomData = pyUsd.Prim.GetCustomDataByKey legacyOmniPrim "3dsmax:legacy_omnilight:multiplier"
+        assert_true (legacyOmniCustomData == undefined) \
+            message:(legacyOmni.name + " legacy Omnilight customizations should NOT be smuggled into customData under the current baseline -- the MAX-LIT-003 spec defines customData[3dsmax:legacy_omnilight:*] as the round-trip channel for non-translatable attributes (far attenuation), NOT for attributes that have direct UsdLux equivalents (multiplier, rgb, castShadows). If this assertion fails, the writer is leaking artist customizations into a non-spec channel.")
+
+        -- Surgical bound B1 (Skylight prim dropped): symmetric to A1 for
+        -- the Skylight case. A wildcard widening that authored a
+        -- UsdLuxDomeLight without per-attribute translation would fail here.
+        local legacySkyPath = "/" + legacySky.name
+        local legacySkyPrim = pyUsd.Prim.GetPrimAtPath stage legacySkyPath
+        assert_false (legacySkyPrim.IsValid()) \
+            message:(legacySky.name + " is the MAX-LIT-003 negative case for Skylight: a legacy Skylight with non-default multiplier (0.4), non-default rgb (cool dusk), AND castShadows=false MUST still be silently dropped under the current writer-registry baseline. The MAX-LIT-003 spec catalogs the dome-side translation table (intensity from multiplier, color from skyColor, shadow:enable from castShadows). When a Skylight writer lands, flip this assertion to assert_true and add per-attribute checks per the spec.")
+
+        -- Surgical bound B2 (Skylight customizations are silently lost):
+        -- symmetric to A2 for the dome path. Pins that no
+        -- customData['3dsmax:legacy_skylight:*'] round-trip channel exists
+        -- in the current baseline.
+        local legacySkyCustomData = pyUsd.Prim.GetCustomDataByKey legacySkyPrim "3dsmax:legacy_skylight:multiplier"
+        assert_true (legacySkyCustomData == undefined) \
+            message:(legacySky.name + " legacy Skylight customizations should NOT be smuggled into customData under the current baseline. Same reasoning as the Omnilight customData check above.")
+    ),
+
     -- MAX-LIT-002 surgical-preservation regression: pin both branches of
     -- the useKelvin dichotomy in PhotometricLightWriter::Write (lines
     -- 481-535 of PhotometricLightWriter.cpp, post-MAX-LIT-002 comment
@@ -1708,6 +1829,7 @@ struct export_light_test
         photometric_light_general_attributes_export_test,
         photometric_light_on_off_export_test,
         photometric_light_writer_legacy_dropout_audit_test,
+        photometric_light_writer_legacy_attribute_dropout_audit_test,
         photometric_light_ies_file_export_test,
         photometric_light_kelvin_filter_color_round_trip_test,
         photometric_point_light_attributes_export_test,
