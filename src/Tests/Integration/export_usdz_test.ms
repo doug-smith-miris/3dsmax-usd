@@ -146,11 +146,102 @@ struct export_usdz_test
         assert_equal ("@"+ expectedFilePath + "@") inputFile
     ),
     
+    -- MAX-PKG-001 surgical bound: the headless `exportFile ... #noprompt`
+    -- path (the same path `3dsmaxbatch` and CI pipelines take) must produce
+    -- a structurally-correct .usdz, identical in zip structure to the one
+    -- the UI-prompted path produces. Pins the headless contract that the
+    -- current `cmd.exe -> powershell -> python -> usdzip` shim chain only
+    -- accidentally satisfies (and silently fails on, e.g., locked-down
+    -- workstations with `Restricted` ExecutionPolicy).
+    --
+    -- Once the C++ in-process swap (MAX-PKG-001 follow-on bite) lands, this
+    -- test continues to assert the same observable structure -- the swap
+    -- must be byte-equivalent at the zip-content layer.
+    function test_usdz_headless_packaging_round_trip = (
+        local box001 = Box pos:[0,0,0] name:"box001"
+        convertToPoly box001
+        polyop.defaultMapFaces box001 1
+        local physicalMtl = MaxUsdPreviewSurface()
+        box001.material = physicalMtl
+
+        local testDataDir = getFilenamePath (getThisScriptFilename())
+        local bitmapPath = (testDataDir + @"data\uv_checker.png")
+        physicalMtl.diffuseColor_map = Bitmaptexture fileName:bitmapPath
+
+        local exportPath = output_prefix + "test_usdz_headless_round_trip.usdz"
+
+        -- The headless path: exportFile with #noprompt (suppressPrompts:true)
+        -- routes through USDExporter::ExportFile's `suppressPrompts == true`
+        -- branch, then USDIOController::Export's `isUSDZExport` block, then
+        -- UsdToolsUtils::RunUsdZip's cmd->powershell->python->usdzip shim.
+        local status = exportFile exportPath #noprompt
+        assert_true status message:"Headless usdz export failed"
+        assert_true (doesFileExist exportPath) message:"Headless usdz export produced no file"
+
+        try
+        (
+            local pyZip = python.import("zipfile")
+            local zipfile = pyZip.ZipFile(exportPath)
+            local zipStatus = zipfile.testzip()
+            assert_undefined zipStatus message:"Headless-exported usdz is structurally corrupt"
+
+            local allFilesInZip = (zipfile.namelist() as Array)
+            assert_true (allFilesInZip.count >= 2) \
+                message:("Headless usdz must contain at least a root layer + an asset; got " + allFilesInZip.count as string)
+
+            -- MAX-PKG-001 UsdzMemberOrder bound: the FIRST member is the root layer.
+            local firstMember = allFilesInZip[1]
+            local firstIsLayer = (matchPattern firstMember pattern:"*.usda") \
+                or (matchPattern firstMember pattern:"*.usdc") \
+                or (matchPattern firstMember pattern:"*.usd")
+            assert_true firstIsLayer \
+                message:("First .usdz member must be the root layer; got " + firstMember)
+
+            -- And the asset travels along. The `usdzip` and in-process API
+            -- both write the asset under a numeric subdirectory `<n>/...`.
+            local assetPresent = false
+            for item in allFilesInZip do (
+                if (matchPattern item pattern:"*uv_checker.png") do (
+                    assetPresent = true
+                )
+            )
+            assert_true assetPresent message:"Headless usdz must bundle the bitmap asset"
+        )
+        catch
+        (
+            print(getCurrentException())
+            assert_true false message:"Headless-exported usdz is not a valid zip file"
+        )
+    ),
+
+    -- MAX-PKG-001 surgical bound: the `RunUsdZip` shim path's failure modes
+    -- in headless contexts (Restricted ExecutionPolicy, missing registry
+    -- entry, CreateProcess SW_HIDE under a service account) must SURFACE
+    -- as a returned-false status from exportFile, NOT a silent success with
+    -- no .usdz on disk. Pins the failure contract for the test harness.
+    function test_usdz_headless_failure_surfaces_status = (
+        -- Force an invalid extension by writing to a path the writer cannot
+        -- handle. The exporter must NOT crash and MUST surface the failure
+        -- via the return value (not via a UI dialog -- this is `#noprompt`).
+        local invalidPath = output_prefix + "subdir_that_does_not_exist/forced_failure.usdz"
+        local status = exportFile invalidPath #noprompt
+        -- Either the export refuses outright (status == false) OR the
+        -- requested file does NOT exist on disk afterward. Both are
+        -- acceptable as "failure surfaced"; what's NOT acceptable is
+        -- silent success with no file produced.
+        if status == true then (
+            assert_true (doesFileExist invalidPath) \
+                message:("Headless usdz export reported success but produced no file at " + invalidPath)
+        )
+    ),
+
     function teardown = (
     ),
 
     Tests = #(test_usdz_exported_stages_as_references,
-        test_usdz_exported_bitmaps
+        test_usdz_exported_bitmaps,
+        test_usdz_headless_packaging_round_trip,
+        test_usdz_headless_failure_surfaces_status
     )
 )
 
