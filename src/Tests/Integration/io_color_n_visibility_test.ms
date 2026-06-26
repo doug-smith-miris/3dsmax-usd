@@ -344,6 +344,59 @@ struct io_color_n_visibility_test
         assert_equal 1 dispColor[3] message:"Unexpected displayColor[2], pre-authored vertex color (blue) must survive over the material diffuse (green)."
     ),
 
+    -- MAX-MAT-003 SECOND-REINFORCEMENT SURGICAL BOUND: the IsAuthored()
+    -- gate has no value filter. The companion of
+    -- test_display_color_preserves_authored_when_material_bound at the
+    -- VALUE-COINCIDENCE edge: the artist's authored displayColor is
+    -- (0, 0, 0) -- the canonical "black default" sentinel and the value
+    -- a hypothetical "treat default-looking authored as effectively
+    -- unauthored" widening would most plausibly target (alongside
+    -- (1, 1, 1) and (0.5, 0.5, 0.5); see the tolerance-band validator
+    -- for all three). The bound material's diffuse is a vivid red
+    -- (255, 38, 26) that would over-write the authored value if the
+    -- gate ever gained a sentinel filter. The first reinforcement's
+    -- BLUE-vs-GREEN pair would still pass that widening because blue
+    -- is not a default sentinel; this test pins the case that pair
+    -- leaves uncovered.
+    function test_display_color_preserves_default_looking_authored_value_when_material_bound = (
+        testFilePath = output_prefix + "test_display_color_preserves_default_looking_authored_value_when_material_bound.usd"
+        local b = box name:"box"
+        convertToPoly b
+        -- Wireframe color: red. Material diffuse: vivid red. Authored
+        -- vertex color: (0, 0, 0) -- the canonical black-default
+        -- sentinel. The fix must preserve the black: the gate is purely
+        -- state-based (IsAuthored()) and value coincidence with a
+        -- sentinel must not trigger any short-circuit-bypass branch.
+        -- The 0-255 values round-trip through vertex-color export as
+        -- exact float zeros, so we can use the same assert_equal pattern
+        -- the existing displayColor tests use on the primary-color cases.
+        b.wireColor = Color 255 0 0
+        local blackColor = Color 0 0 0
+        polyop.setVertColor b 0 #(1,2,3,4,5,6,7,8) blackColor
+
+        local mtl = Standard()
+        mtl.name = "matVividRed"
+        mtl.diffuse = Color 255 38 26
+        b.material = mtl
+
+        exportOptions.SetChannelPrimvarMapping 0 "displayColor"
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = pyUsdGeom.Gprim.Get stage ("/" + b.name)
+        local mesh = pyUsdGeom.Mesh(prim)
+        local displayColorAttr = mesh.GetDisplayColorAttr()
+        local dispColor = (displayColorAttr.Get())[0]
+        -- Expect (0, 0, 0): the artist-authored black-default sentinel,
+        -- NOT the material's vivid red. A failure on any channel means
+        -- the gate gained a default-value filter or a sentinel
+        -- short-circuit and started overwriting authored values that
+        -- happen to coincide with canonical defaults.
+        assert_equal 0 dispColor[1] message:"Unexpected displayColor[0], pre-authored black-default sentinel must survive over the material diffuse (vivid red)."
+        assert_equal 0 dispColor[2] message:"Unexpected displayColor[1], pre-authored black-default sentinel must survive over the material diffuse (vivid red)."
+        assert_equal 0 dispColor[3] message:"Unexpected displayColor[2], pre-authored black-default sentinel must survive over the material diffuse (vivid red)."
+    ),
+
     function teardown = (
     ),
 
@@ -354,7 +407,8 @@ struct io_color_n_visibility_test
         test_export_visibility_warnings,
         test_display_color_uses_material_diffuse_when_bound,
         test_display_color_still_uses_wire_color_when_no_material,
-        test_display_color_preserves_authored_when_material_bound)
+        test_display_color_preserves_authored_when_material_bound,
+        test_display_color_preserves_default_looking_authored_value_when_material_bound)
 )
 
 runUsdTestFixture io_color_n_visibility_test (getThisScriptFilename())

@@ -1022,6 +1022,79 @@ becomes solid green, the IsAuthored() gate has started overwriting
 artist-authored displayColor.** Composite at `compare_side_by_side.png`
 in the same arch-build dir.
 
+**Value-coincidence band validator (second reinforcement, added 2026-06-26).**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/7a0593e4-57d8-4f15-baee-e73250d1e9a0/validate_display_color_tolerance_bounds.py`
+pins the gate at **value-coincidence edges** the first reinforcement's
+high-distinctness fixtures (BLUE / YELLOW / MAGENTA) do not exercise.
+The MAX-MAT-003 gate is purely boolean (`IsAuthored()`) so there is no
+float tolerance to widen, but the gate has two value-class edges the
+first 8 cases do not pin:
+
+  1. **Authored values coincident with default-looking sentinels.** A
+     future refactor that swapped the bare `!IsAuthored()` check for
+     "treat authored values that look like exporter defaults
+     (`(0,0,0)`, `(1,1,1)`, `(0.5,0.5,0.5)`) as effectively unauthored"
+     would silently start eating any mesh whose artist-authored
+     displayColor happens to match a sentinel. The first reinforcement
+     uses BLUE / YELLOW for its authored values; that widening passes
+     every existing case.
+  2. **Material-diffuse extremes the verbatim-write doesn't run on.**
+     The gate writes whatever `GetDiffuse()` returns without clamping
+     or epsilon-skipping. The first reinforcement's bland-LDR mtl cases
+     (MAGENTA, YELLOW, BLACK, WHITE) sit comfortably in the mid-band; a
+     widening that added "skip HDR diffuse" (`if (any channel > 1.0)
+     fall back to wire`) or "skip near-zero diffuse" (`if (||c|| < eps)
+     fall back to wire`) would still pass them.
+
+| Case in synthetic fixture       | preauthored        | mtl diffuse        | wire                | expected color     | branch taken |
+| ---                             | ---                | ---                | ---                 | ---                | --- |
+| `AuthoredBlackWithMtl`          | `(0, 0, 0)`        | `(0.42, 0.18, 0.73)`| `(1, 0, 0)`         | `(0, 0, 0)`        | `preauthored-preserved` |
+| `AuthoredWhiteWithMtl`          | `(1, 1, 1)`        | `(0.20, 0.40, 0.80)`| `(1, 0, 0)`         | `(1, 1, 1)`        | `preauthored-preserved` |
+| `AuthoredMidGreyWithMtl`        | `(0.5, 0.5, 0.5)`  | `(0.95, 0.15, 0.10)`| `(1, 0, 0)`         | `(0.5, 0.5, 0.5)`  | `preauthored-preserved` |
+| `AuthoredZeroNoMtl`             | `(0, 0, 0)`        | (absent)           | `(0.70, 0.30, 0.10)`| `(0, 0, 0)`        | `preauthored-preserved` |
+| `MtlDiffuseHDR`                 | (absent)           | `(2.0, 0.5, 0.5)`  | `(1, 0, 0)`         | `(2.0, 0.5, 0.5)`  | `mtl-diffuse` |
+| `MtlDiffuseTinyChannel`         | (absent)           | `(1e-3, 0, 0)`     | `(0.5, 0.5, 0.5)`   | `(1e-3, 0, 0)`     | `mtl-diffuse` |
+
+Plus an idempotence check (second pass takes `preauthored-preserved`
+on every case). All 6 cases + idempotence pass on the 2026-06-26
+baseline. The validator asserts the **branch label** as well as the
+final color so a regression that produces the right color via the
+wrong branch surfaces by name (same pattern as the state-shape
+validator).
+
+**MaxScript regression (added 2026-06-26).**
+`src/Tests/Integration/io_color_n_visibility_test.ms` now also carries
+`test_display_color_preserves_default_looking_authored_value_when_material_bound`,
+the value-coincidence companion of the first reinforcement's
+`test_display_color_preserves_authored_when_material_bound`. It builds
+a box with wireframe red, an artist-authored **black** vertex color
+(`(0, 0, 0)` — the canonical default-looking sentinel) mapped to
+`displayColor` via `SetChannelPrimvarMapping 0 "displayColor"`, AND a
+Standard material with vivid red diffuse `(255, 38, 26)` bound to the
+node, and asserts the exported `primvars:displayColor` is the artist's
+black, not the material's red. A failure means the gate gained a
+default-value filter or a sentinel short-circuit — the surgical bound
+the first reinforcement's BLUE-vs-GREEN value pair leaves uncovered.
+
+**Visual demonstration of the value-coincidence bound.** A second
+single-sphere fixture renders the mid-grey sentinel `(0.5, 0.5, 0.5)`
+versus the bound material's vivid red `(0.95, 0.15, 0.10)`. The
+postfix render (`render_karma_postfix.png`) shows a visibly grey
+sphere — the artist's mid-grey is preserved by the IsAuthored() gate
+even though it coincides with a canonical default sentinel. The
+reference render (`render_unreal_reference.png`) shows the same
+sphere painted vivid red — what a future "treat default-looking
+authored as effectively unauthored" widening would write. The two
+PNGs differ by SHA-256. **Auditor's checklist for the second
+reinforcement: the postfix render is solid grey; if it ever becomes
+solid red, the gate has started overwriting artist-authored
+displayColor at default-looking values.** Together with the first
+reinforcement's blue-vs-green pair the two visual auditor pairs cover
+the gate's two principal widening vectors (unconditional overwrite
+when mtl is bound, and value-coincidence overwrite at default
+sentinels). Composite at `compare_side_by_side.png` in the same
+arch-build dir.
+
 **Retirement condition.** Unlike MAX-MAT-001/002 this is not a workaround
 for an external 3ds Max bug — the code being fixed is the fork's own
 `MeshConverter::ConvertToUSDMesh`. The fix is permanent.
@@ -1833,6 +1906,34 @@ bite.
   in this bite — the reinforcement is purely additive test
   infrastructure that locks in the surgical guarantee against future
   regressions.
+* 2026-06-26 — MAX-MAT-003 value-coincidence band reinforcement
+  (second layer, stacked on the 2026-06-23 reinforcement): pin the
+  IsAuthored() gate at the **value-coincidence edges** the first
+  reinforcement's high-distinctness BLUE / YELLOW / MAGENTA fixtures
+  do not exercise. Adds
+  `test_display_color_preserves_default_looking_authored_value_when_material_bound`
+  to `io_color_n_visibility_test.ms`, exercising authored
+  `(0, 0, 0)` (the canonical "black default" sentinel) against a
+  vivid red bound material — the case where a hypothetical "treat
+  default-looking authored as effectively unauthored" widening would
+  silently overwrite legitimate artist authoring. Python validator
+  `validate_display_color_tolerance_bounds.py` covers the same bound
+  at the USD layer alongside `AuthoredWhiteWithMtl` and
+  `AuthoredMidGreyWithMtl` (the other two canonical sentinels),
+  `AuthoredZeroNoMtl` (sentinel + no-mtl), `MtlDiffuseHDR` (channel
+  > 1.0 — pins "no clamp"), and `MtlDiffuseTinyChannel`
+  (`(1e-3, 0, 0)` — pins "no magnitude filter on diffuse"). All 6
+  cases + idempotence pass on the 2026-06-26 baseline. Extends the
+  C++ surgical-bounds comment block in
+  `MeshConverter::ConvertToUSDMesh` to enumerate the new
+  value-coincidence and diffuse-extreme bounds and points at both
+  Python validators by name. Visual auditor pair
+  (`render_karma_postfix.png` mid-grey sphere where the canonical
+  sentinel `(0.5, 0.5, 0.5)` is preserved; `render_unreal_reference.png`
+  vivid red sphere where the hypothetical sentinel-filter refactor
+  over-wrote) makes the value-coincidence bound visible at the pixel
+  level. No C++ logic change; purely additive test infrastructure
+  stacked on top of the 2026-06-23 reinforcement.
 * 2026-06-20 — MAX-GEO-001 mesh normals dual-author: add
   `NormalsMode::Both` and make it the new default so the writer
   populates both `primvars:normals` AND `UsdGeomMesh.normals` (the

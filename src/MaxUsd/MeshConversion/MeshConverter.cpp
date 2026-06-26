@@ -256,10 +256,15 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
             // src/Tests/Integration/io_color_n_visibility_test.ms ::
             //     test_display_color_override
             //     test_display_color_preserves_authored_when_material_bound
+            //     test_display_color_preserves_default_looking_authored_value_when_material_bound
             //     test_display_color_still_uses_wire_color_when_no_material
             //     test_display_color_uses_material_diffuse_when_bound
-            // plus the doc-linked Python validator
-            // validate_display_color_surgical.py):
+            // plus the doc-linked Python validators
+            // validate_display_color_surgical.py (state-shape bounds) and
+            // validate_display_color_tolerance_bounds.py (value-coincidence
+            // bounds):
+            //
+            //   State-shape bounds (first reinforcement, 0353d63):
             //   * GetDisplayColorAttr().IsAuthored() is already true -- the
             //     vertex-color -> displayColor channel mapping
             //     (SetChannelPrimvarMapping 0 "displayColor") ran first and
@@ -282,11 +287,31 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
             //     fall through to the wireframe color for legitimate
             //     pure-black or pure-white materials.
             //
+            //   Value-coincidence bounds (second reinforcement, this commit):
+            //   * The authored value EQUALS a canonical "default-looking"
+            //     sentinel: (0, 0, 0), (1, 1, 1), or (0.5, 0.5, 0.5). The
+            //     IsAuthored() gate is purely state-based; the authored
+            //     value's coincidence with a sentinel is irrelevant. A
+            //     refactor that added "treat near-default authored values
+            //     as effectively unauthored" before the IsAuthored() check
+            //     would silently overwrite legitimate artist authoring at
+            //     those values, and the first reinforcement's
+            //     high-distinctness fixtures (BLUE / YELLOW) would still
+            //     pass. Cases at (0,0,0)+mtl, (1,1,1)+mtl, (0.5,0.5,0.5)+
+            //     mtl, and (0,0,0)+no-mtl pin the gate against that class.
+            //   * boundMtl->GetDiffuse() returns an HDR value (channel > 1)
+            //     or a sub-epsilon non-zero (e.g. (1e-3, 0, 0)). The gate
+            //     writes whatever it gets verbatim, with no clamp or
+            //     magnitude filter. The first reinforcement's bland-LDR
+            //     mtl cases (MAGENTA, YELLOW, BLACK, WHITE) do not exercise
+            //     either extreme. Cases at (2.0, 0.5, 0.5) and (1e-3, 0, 0)
+            //     pin both extremes.
+            //
             // A future refactor that widens any of these gates would
             // silently corrupt artist-authored displayColor or substitute
-            // the wrong source. Both the .ms surgical tests and the Python
-            // validator name the specific bound they exercise, so a
-            // regression in any branch fails with a useful, localised
+            // the wrong source. Both the .ms surgical tests and the two
+            // Python validators name the specific bound they exercise, so
+            // a regression in any branch fails with a useful, localised
             // error.
             if (!usdMesh.GetDisplayColorAttr().IsAuthored()) {
                 Color displayColorSrc;
