@@ -121,22 +121,104 @@ struct export_metersPerUnit_test
         --given
         units.SystemType = #Inches
         units.SystemScale = 1
-            
+
         --when
         exportPath = (output_prefix + "export_inchesmeters_test.usda")
         USDExporter.ExportFile exportPath exportOptions:exportOptions
         local stage = pyUsd.Stage.Open(exportPath)
         local metersPerUnits = pyUsdGeom.GetStageMetersPerUnit(stage)
-        
+
         --then
         assert_float_equal 0.0254 metersPerUnits
     ),
+
+    -- MAX-UNIT-001 regression — surface the scene-units mismatch at
+    -- export time so artists working in inches/cm/mm see the divergence
+    -- before downstream pipelines (Karma at 1:1, ARKit, Miris ingest,
+    -- glTF) silently rescale their asset. The C++ in USDSceneBuilder.cpp
+    -- emits MaxUsd::Log::Warn whenever the rounded stage-scale is not
+    -- exactly 1.0; both negative cases (meters → no warning) and positive
+    -- cases (inches/mm/cm → warning) need to be covered.
+    function testInchesUnitsWarns = (
+        --given
+        units.SystemType = #Inches
+        units.SystemScale = 1
+        local logPath = (output_prefix + "warn_inches.log")
+        deleteFile logPath
+        exportOptions.LogLevel = #warn
+        exportOptions.LogPath = logPath
+
+        --when
+        exportPath = (output_prefix + "export_warn_inches.usda")
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+
+        --then — the export still succeeds with the correct metersPerUnit
+        local stage = pyUsd.Stage.Open(exportPath)
+        local metersPerUnits = pyUsdGeom.GetStageMetersPerUnit(stage)
+        assert_float_equal 0.0254 metersPerUnits
+
+        -- and the warning is present in the log
+        local logExists = doesFileExist logPath
+        assert_true logExists message:"MAX-UNIT-001: expected log file to be created at the configured path."
+        if logExists do (
+            local logFile = openFile logPath
+            local logText = ""
+            while not eof logFile do (
+                logText = logText + (readLine logFile) + "\n"
+            )
+            close logFile
+            local found = matchPattern logText pattern:"*metersPerUnit*"
+            assert_true found message:"MAX-UNIT-001: expected warning naming 'metersPerUnit' to be emitted for an inches-units scene."
+            local namesMiris = matchPattern logText pattern:"*Miris*"
+            assert_true namesMiris message:"MAX-UNIT-001: expected warning to name the Miris-ingest constraint among the downstream consumers."
+        )
+
+        -- restore the default log state for the rest of the suite
+        exportOptions.LogLevel = #off
+        exportOptions.LogPath = ((GetDir #temp) + "\\MaxUsdExport.log")
+    ),
+
+    function testMetersUnitsDoesNotWarn = (
+        --given
+        units.SystemType = #Meters
+        units.SystemScale = 1
+        local logPath = (output_prefix + "warn_meters.log")
+        deleteFile logPath
+        exportOptions.LogLevel = #warn
+        exportOptions.LogPath = logPath
+
+        --when
+        exportPath = (output_prefix + "export_warn_meters.usda")
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+
+        --then — the export authors the meters case correctly
+        local stage = pyUsd.Stage.Open(exportPath)
+        local metersPerUnits = pyUsdGeom.GetStageMetersPerUnit(stage)
+        assert_float_equal 1.0 metersPerUnits
+
+        -- and NO metersPerUnit warning is in the log (the surgical bound)
+        if doesFileExist logPath do (
+            local logFile = openFile logPath
+            local logText = ""
+            while not eof logFile do (
+                logText = logText + (readLine logFile) + "\n"
+            )
+            close logFile
+            local found = matchPattern logText pattern:"*metersPerUnit*"
+            assert_false found message:"MAX-UNIT-001: scene already in meters must NOT emit the metersPerUnit divergence warning."
+        )
+
+        -- restore the default log state for the rest of the suite
+        exportOptions.LogLevel = #off
+        exportOptions.LogPath = ((GetDir #temp) + "\\MaxUsdExport.log")
+    ),
+
     function teardown = (
         units.SystemType = initialUnits
         units.SystemScale = initialScale
     ),
 
-    Tests = #(testMillimeterUnits, testCentimeterUnits, testMeterUnits, test2MetersUnits, testKilometerUnits, testInchesUnits)
+    Tests = #(testMillimeterUnits, testCentimeterUnits, testMeterUnits, test2MetersUnits, testKilometerUnits, testInchesUnits, testInchesUnitsWarns, testMetersUnitsDoesNotWarn)
 )
 
 runUsdTestFixture export_metersPerUnit_test (getThisScriptFilename())

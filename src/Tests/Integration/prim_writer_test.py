@@ -156,7 +156,7 @@ class DummyExportArgsWriter(maxUsd.PrimWriter):
             rt.assert_equal(maxUsd.LogLevel.Off, options.GetLogLevel())
             rt.assert_equal(maxUsd.MeshFormat.FromScene, options.GetMeshFormat())
             rt.assert_equal(maxUsd.FileFormat.ASCII , options.GetFileFormat())
-            rt.assert_equal(maxUsd.NormalsMode.AsPrimvar, options.GetNormalsMode())
+            rt.assert_equal(maxUsd.NormalsMode.Both, options.GetNormalsMode())
             rt.assert_equal(False, options.GetOpenInUsdview())
             rt.assert_equal(False, options.GetPreserveEdgeOrientation())
             rt.assert_equal("/EXPORT_PRIM_WRITER_TEST_test_export_args_exposure_in_writer", str(options.GetRootPrimPath()))           

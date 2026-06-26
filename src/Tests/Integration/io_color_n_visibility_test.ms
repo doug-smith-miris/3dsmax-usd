@@ -242,14 +242,341 @@ struct io_color_n_visibility_test
         deleteFile expOptions.LogPath
     ),
     
+    -- MAX-MAT-003 regression: when a node has a material bound, the mesh's
+    -- primvars:displayColor must be the bound material's diffuse, NOT the
+    -- node's viewport wireframe color. The wireframe color is a Max
+    -- scene-graph organizational tag with no relationship to surface color;
+    -- using it as displayColor misleads any USD consumer that falls back to
+    -- displayColor when the bound material cannot be evaluated.
+    function test_display_color_uses_material_diffuse_when_bound = (
+        testFilePath = output_prefix + "test_display_color_uses_material_diffuse_when_bound.usd"
+        local b = box name:"box"
+        -- Wireframe color: full red.
+        local redColor = Color 255 0 0
+        b.wireColor = redColor
+        -- Material diffuse: full green. The fix must prefer this over the
+        -- wireframe color when the node has a material bound.
+        local greenColor = Color 0 255 0
+        local mtl = Standard()
+        mtl.name = "matGreen"
+        mtl.diffuse = greenColor
+        b.material = mtl
+
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = pyUsdGeom.Gprim.Get stage ("/" + b.name)
+        local mesh = pyUsdGeom.Mesh(prim)
+        local displayColorAttr = mesh.GetDisplayColorAttr()
+        local dispColor = (displayColorAttr.Get())[0]
+        -- Expect the material's diffuse (green), not the wireframe red.
+        assert_equal 0 dispColor[1] message:"Unexpected displayColor[0], should be from the material diffuse (green), not the wireframe color (red)."
+        assert_equal 1 dispColor[2] message:"Unexpected displayColor[1], should be from the material diffuse (green), not the wireframe color (red)."
+        assert_equal 0 dispColor[3] message:"Unexpected displayColor[2], should be from the material diffuse (green), not the wireframe color (red)."
+    ),
+
+    -- MAX-MAT-003 negative case: with no material bound, the previous
+    -- behavior must be preserved -- the wireframe color is still used.
+    -- This is just the existing test_io_display_color guarantee phrased as a
+    -- regression check on the same code path.
+    function test_display_color_still_uses_wire_color_when_no_material = (
+        testFilePath = output_prefix + "test_display_color_still_uses_wire_color_when_no_material.usd"
+        local b = box name:"box"
+        local redColor = Color 255 0 0
+        b.wireColor = redColor
+        -- No material bound on b.
+        b.material = undefined
+
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = pyUsdGeom.Gprim.Get stage ("/" + b.name)
+        local mesh = pyUsdGeom.Mesh(prim)
+        local displayColorAttr = mesh.GetDisplayColorAttr()
+        local dispColor = (displayColorAttr.Get())[0]
+        -- Expect the wireframe color (red): the fallback path is preserved.
+        assert_equal 1 dispColor[1] message:"Unexpected displayColor[0], should be from the wireframe color (red) when no material is bound."
+        assert_equal 0 dispColor[2] message:"Unexpected displayColor[1], should be from the wireframe color (red) when no material is bound."
+        assert_equal 0 dispColor[3] message:"Unexpected displayColor[2], should be from the wireframe color (red) when no material is bound."
+    ),
+
+    -- MAX-MAT-003 SURGICAL BOUND: the GetDisplayColorAttr().IsAuthored()
+    -- gate must short-circuit even when a material IS bound. The existing
+    -- test_display_color_override covers the IsAuthored() case ONLY when no
+    -- material is bound; this test exercises the combined case (artist opted
+    -- in to vertex-color -> displayColor mapping AND assigned a material).
+    -- A future refactor that widened the gate to "always overwrite with the
+    -- bound material's diffuse" would silently eat the artist's authored
+    -- vertex-color displayColor and the existing regression suite would not
+    -- catch it.
+    function test_display_color_preserves_authored_when_material_bound = (
+        testFilePath = output_prefix + "test_display_color_preserves_authored_when_material_bound.usd"
+        local b = box name:"box"
+        convertToPoly b
+        -- Wireframe color: red. Material diffuse: green. Authored vertex
+        -- color: blue. The fix must preserve blue (artist authoring wins
+        -- over both the wire color and the material diffuse).
+        b.wireColor = Color 255 0 0
+        local blueColor = Color 0 0 255
+        polyop.setVertColor b 0 #(1,2,3,4,5,6,7,8) blueColor
+
+        local mtl = Standard()
+        mtl.name = "matGreen"
+        mtl.diffuse = Color 0 255 0
+        b.material = mtl
+
+        -- Explicitly map the vertex color channel to primvar:displayColor.
+        -- This causes GetDisplayColorAttr().IsAuthored() to be true BEFORE
+        -- the MAX-MAT-003 block runs, and the surgical bound requires the
+        -- block to skip the bound-material derivation entirely.
+        exportOptions.SetChannelPrimvarMapping 0 "displayColor"
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = pyUsdGeom.Gprim.Get stage ("/" + b.name)
+        local mesh = pyUsdGeom.Mesh(prim)
+        local displayColorAttr = mesh.GetDisplayColorAttr()
+        local dispColor = (displayColorAttr.Get())[0]
+        -- Expect blue: the artist-authored vertex color, NOT the material's
+        -- green diffuse and NOT the wireframe red.
+        assert_equal 0 dispColor[1] message:"Unexpected displayColor[0], pre-authored vertex color (blue) must survive over the material diffuse (green)."
+        assert_equal 0 dispColor[2] message:"Unexpected displayColor[1], pre-authored vertex color (blue) must survive over the material diffuse (green)."
+        assert_equal 1 dispColor[3] message:"Unexpected displayColor[2], pre-authored vertex color (blue) must survive over the material diffuse (green)."
+    ),
+
+    -- MAX-MAT-003 SECOND-REINFORCEMENT SURGICAL BOUND: the IsAuthored()
+    -- gate has no value filter. The companion of
+    -- test_display_color_preserves_authored_when_material_bound at the
+    -- VALUE-COINCIDENCE edge: the artist's authored displayColor is
+    -- (0, 0, 0) -- the canonical "black default" sentinel and the value
+    -- a hypothetical "treat default-looking authored as effectively
+    -- unauthored" widening would most plausibly target (alongside
+    -- (1, 1, 1) and (0.5, 0.5, 0.5); see the tolerance-band validator
+    -- for all three). The bound material's diffuse is a vivid red
+    -- (255, 38, 26) that would over-write the authored value if the
+    -- gate ever gained a sentinel filter. The first reinforcement's
+    -- BLUE-vs-GREEN pair would still pass that widening because blue
+    -- is not a default sentinel; this test pins the case that pair
+    -- leaves uncovered.
+    function test_display_color_preserves_default_looking_authored_value_when_material_bound = (
+        testFilePath = output_prefix + "test_display_color_preserves_default_looking_authored_value_when_material_bound.usd"
+        local b = box name:"box"
+        convertToPoly b
+        -- Wireframe color: red. Material diffuse: vivid red. Authored
+        -- vertex color: (0, 0, 0) -- the canonical black-default
+        -- sentinel. The fix must preserve the black: the gate is purely
+        -- state-based (IsAuthored()) and value coincidence with a
+        -- sentinel must not trigger any short-circuit-bypass branch.
+        -- The 0-255 values round-trip through vertex-color export as
+        -- exact float zeros, so we can use the same assert_equal pattern
+        -- the existing displayColor tests use on the primary-color cases.
+        b.wireColor = Color 255 0 0
+        local blackColor = Color 0 0 0
+        polyop.setVertColor b 0 #(1,2,3,4,5,6,7,8) blackColor
+
+        local mtl = Standard()
+        mtl.name = "matVividRed"
+        mtl.diffuse = Color 255 38 26
+        b.material = mtl
+
+        exportOptions.SetChannelPrimvarMapping 0 "displayColor"
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = pyUsdGeom.Gprim.Get stage ("/" + b.name)
+        local mesh = pyUsdGeom.Mesh(prim)
+        local displayColorAttr = mesh.GetDisplayColorAttr()
+        local dispColor = (displayColorAttr.Get())[0]
+        -- Expect (0, 0, 0): the artist-authored black-default sentinel,
+        -- NOT the material's vivid red. A failure on any channel means
+        -- the gate gained a default-value filter or a sentinel
+        -- short-circuit and started overwriting authored values that
+        -- happen to coincide with canonical defaults.
+        assert_equal 0 dispColor[1] message:"Unexpected displayColor[0], pre-authored black-default sentinel must survive over the material diffuse (vivid red)."
+        assert_equal 0 dispColor[2] message:"Unexpected displayColor[1], pre-authored black-default sentinel must survive over the material diffuse (vivid red)."
+        assert_equal 0 dispColor[3] message:"Unexpected displayColor[2], pre-authored black-default sentinel must survive over the material diffuse (vivid red)."
+    ),
+
+    -- MAX-MAT-003 THIRD-REINFORCEMENT SURGICAL BOUND: when the gate
+    -- writes (mtl-diffuse or wire-color-fallback branch), the resulting
+    -- primvars:displayColor must have a specific PRIMVAR SHAPE -- a
+    -- single-element constant primvar with no time samples. The first
+    -- two reinforcements pin VALUE (displayColor[0]) and BRANCH; this
+    -- one pins SHAPE.
+    --
+    -- A future refactor that broadcast the gate's output to a per-vertex
+    -- primvar (e.g. "for each vertex, write displayColorSrc; set
+    -- interpolation=vertex") would have displayColor[0] equal to the
+    -- material's diffuse and would still take the mtl-diffuse branch --
+    -- the existing 14 value+branch assertions would PASS. Only an
+    -- explicit array-length + interpolation + time-sample assertion
+    -- catches that class of widening.
+    --
+    -- The companion Python validator
+    -- validate_display_color_primvar_shape.py exercises 8 cases (mtl-
+    -- diffuse / wire-color-fallback / HDR / near-zero plus four
+    -- preserved-shape cases at vertex / faceVarying / constant-len-1 /
+    -- time-sampled) + idempotence; this MaxScript test pins the most
+    -- common write-branch case (mtl-bound LDR) at the export level so
+    -- a regression in the C++ that escapes the Python mirror still
+    -- fails inside Max.
+    function test_display_color_primvar_shape_invariants_on_gate_write = (
+        testFilePath = output_prefix + "test_display_color_primvar_shape_invariants_on_gate_write.usd"
+        local b = box name:"box"
+        convertToPoly b
+        -- Wireframe color: red. Material diffuse: green. No artist
+        -- authoring of displayColor -- the gate fires the mtl-diffuse
+        -- branch and writes a single-element constant primvar.
+        b.wireColor = Color 255 0 0
+        local mtl = Standard()
+        mtl.name = "matGreen"
+        mtl.diffuse = Color 0 255 0
+        b.material = mtl
+
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = pyUsdGeom.Gprim.Get stage ("/" + b.name)
+        local mesh = pyUsdGeom.Mesh(prim)
+        local displayColorAttr = mesh.GetDisplayColorAttr()
+        local dispColor = displayColorAttr.Get()
+        -- Value invariant: the existing test_display_color_uses_material_
+        -- diffuse_when_bound already pins displayColor[0]; we re-check it
+        -- here so a regression in that branch is caught by this single
+        -- test in isolation. Green diffuse must survive.
+        local rgb = dispColor[1]
+        assert_equal 0 rgb[1] message:"Unexpected displayColor[0], should be from the material diffuse (green)."
+        assert_equal 1 rgb[2] message:"Unexpected displayColor[1], should be from the material diffuse (green)."
+        assert_equal 0 rgb[3] message:"Unexpected displayColor[2], should be from the material diffuse (green)."
+        -- Primvar-shape invariants. A widening that broadcast the
+        -- gate's output to per-vertex (interp=vertex, len=N) would have
+        -- the same green at index 0 -- the assertions above would pass.
+        -- These pin the shape so that class is caught.
+        --
+        -- Invariant 1: array length is exactly 1. A per-vertex
+        -- broadcast on a 8-vertex box would write count == 8.
+        assert_equal 1 dispColor.count message:"Unexpected displayColor array length on mtl-diffuse branch: must be a single-element constant primvar, not a per-vertex broadcast."
+        -- Invariant 2: interpolation resolves to "constant". A
+        -- regression that set interp=vertex (with a one-element array
+        -- or a broadcast array) would change Hydra-delegate behaviour
+        -- even at the same color value.
+        local primvarApi = pyUsdGeom.PrimvarsAPI(prim)
+        local primvar = primvarApi.GetPrimvar("displayColor")
+        local interpolation = primvar.GetInterpolation()
+        assert_equal "constant" interpolation message:"Unexpected displayColor interpolation on mtl-diffuse branch: must be \"constant\", not \"vertex\" / \"faceVarying\" / \"uniform\"."
+        -- Invariant 3: no time samples. A regression that sampled
+        -- GetDiffuse() at each timecode during an animated export
+        -- would inflate the file linearly with frame count and change
+        -- consumer behaviour in animated scenes.
+        assert_equal 0 (displayColorAttr.GetNumTimeSamples()) message:"Unexpected displayColor time sample count on mtl-diffuse branch: must be 0 (a single default-time value), not a time-sampled animation."
+    ),
+
+    -- MAX-MAT-008 SCOPE/COVERAGE AUDIT: when a node has a MultiMtl bound
+    -- AND the mesh carries multiple matIds across its faces, the MAX-MAT-003
+    -- displayColor block writes a SINGLE-element constant primvar derived
+    -- from sub-material 0's diffuse (Mtl::GetDiffuse() with the default
+    -- argument mtlNum = 0). The C++ block intentionally does NOT consult
+    -- materialIdToFacesMap and does NOT broadcast GetDiffuse(matId)
+    -- per face -- a per-face widening would be a wildcard refactor that
+    -- silently mutates the primvar's shape (interpolation goes from
+    -- "constant" to "uniform"; array length goes from 1 to
+    -- materialIdToFacesMap.size()), changing the fallback render output
+    -- for every consumer on the primvar-fallback path (minimal Hydra
+    -- delegates, ARKit Quick Look, usdview's displayColor overlay).
+    --
+    -- The companion Python validator
+    -- validate_multimtl_per_face_displaycolor_surgical.py mirrors the
+    -- gate at the USD layer over 8 cases plus a negative-control case
+    -- that constructs the would-be widened primvar directly and asserts
+    -- the shape invariants are VIOLATED. This MaxScript test pins the
+    -- canonical case (Box + 2-sub-mtl MultiMtl + half-and-half matId
+    -- partition) at the export level so a C++ regression that escapes
+    -- the Python mirror still fails inside Max.
+    --
+    -- A future regression that switched the C++ block to per-face would
+    -- still satisfy displayColor[0] == sub-material 0's diffuse (the
+    -- existing test_display_color_uses_material_diffuse_when_bound
+    -- and test_display_color_primvar_shape_invariants_on_gate_write
+    -- assertions). Only the array-length and interpolation invariants
+    -- below catch that widening shape on a MultiMtl-bound mesh.
+    function test_display_color_multimtl_single_constant_not_per_face = (
+        testFilePath = output_prefix + "test_display_color_multimtl_single_constant_not_per_face.usd"
+        local b = box name:"box"
+        convertToPoly b
+        -- Wireframe color: green. Sub-mtl 0: red. Sub-mtl 1: blue.
+        -- A wildcard "extend to per-face for MultiMtl" widening would
+        -- author red on the face-0 partition and blue on the face-1
+        -- partition; the current gate authors red across the whole mesh
+        -- because Mtl::GetDiffuse() returns sub-mtl 0's diffuse.
+        b.wireColor = Color 0 255 0
+
+        local multiSub = multiSubMaterial numsubs:2
+        multiSub.numSubs = 2
+        local matRed = Standard name:"sub_red"
+        matRed.diffuse = Color 255 0 0
+        multiSub.materialList[1] = matRed
+        local matBlue = Standard name:"sub_blue"
+        matBlue.diffuse = Color 0 0 255
+        multiSub.materialList[2] = matBlue
+        b.material = multiSub
+
+        -- Split the Box's 6 faces in half: faces 1,2,3 -> matId 1 (red),
+        -- faces 4,5,6 -> matId 2 (blue). This produces a
+        -- materialIdToFacesMap.size() == 2 partition inside the writer,
+        -- which a per-face widening would consume to broadcast both
+        -- diffuses; the current gate must ignore the partition.
+        polyOp.setFaceMatId b #{1, 2, 3} 1
+        polyOp.setFaceMatId b #{4, 5, 6} 2
+
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = pyUsdGeom.Gprim.Get stage ("/" + b.name)
+        local mesh = pyUsdGeom.Mesh(prim)
+        local displayColorAttr = mesh.GetDisplayColorAttr()
+        local dispColor = displayColorAttr.Get()
+
+        -- Value invariant: displayColor[0] must be sub-material 0's
+        -- diffuse (red), NOT the wireframe color (green) and NOT a
+        -- per-face value derived from the matId partition.
+        local rgb = dispColor[1]
+        assert_equal 1 rgb[1] message:"Unexpected displayColor[0], should be sub-material 0's diffuse (red) -- the MAX-MAT-003 gate calls Mtl::GetDiffuse() with the default mtlNum = 0, not a per-matId broadcast."
+        assert_equal 0 rgb[2] message:"Unexpected displayColor[1], should be sub-material 0's diffuse (red), not the wireframe color (green) and not sub-material 1's diffuse (blue)."
+        assert_equal 0 rgb[3] message:"Unexpected displayColor[2], should be sub-material 0's diffuse (red), not sub-material 1's diffuse (blue)."
+
+        -- Primvar-shape invariants on the MultiMtl path. A widening
+        -- that consumed materialIdToFacesMap to broadcast
+        -- multiSub->GetDiffuse(matId) per face would have:
+        --   * len(displayColor) == materialIdToFacesMap.size() (here, 2
+        --     with a half-and-half split; in general, between 1 and
+        --     the number of distinct matIds on the mesh).
+        --   * interpolation == "uniform" (one entry per face).
+        -- The first reinforcement's value-and-branch assertions would
+        -- still pass (displayColor[0] is still red, the gate still
+        -- took the mtl-diffuse branch). Only these shape invariants
+        -- catch the widening on the MultiMtl-bound mesh.
+        assert_equal 1 dispColor.count message:"Unexpected displayColor array length on MultiMtl-bound mesh: must be a single-element constant primvar, not a per-matId broadcast (a wildcard 'extend MAX-MAT-003 to per-face for MultiMtl' widening would write len = materialIdToFacesMap.size())."
+        local primvarApi = pyUsdGeom.PrimvarsAPI(prim)
+        local primvar = primvarApi.GetPrimvar("displayColor")
+        local interpolation = primvar.GetInterpolation()
+        assert_equal "constant" interpolation message:"Unexpected displayColor interpolation on MultiMtl-bound mesh: must be \"constant\", not \"uniform\" (a per-face widening would set interpolation=\"uniform\" with one entry per matId)."
+        assert_equal 0 (displayColorAttr.GetNumTimeSamples()) message:"Unexpected displayColor time sample count on MultiMtl-bound mesh: must be 0 (a single default-time value), not a time-sampled animation."
+    ),
+
     function teardown = (
     ),
 
-    tests = #(test_io_display_color, 
-        test_display_color_override, 
-        test_visibility, 
+    tests = #(test_io_display_color,
+        test_display_color_override,
+        test_visibility,
         test_import_inherited_visibility,
-        test_export_visibility_warnings)
+        test_export_visibility_warnings,
+        test_display_color_uses_material_diffuse_when_bound,
+        test_display_color_still_uses_wire_color_when_no_material,
+        test_display_color_preserves_authored_when_material_bound,
+        test_display_color_preserves_default_looking_authored_value_when_material_bound,
+        test_display_color_primvar_shape_invariants_on_gate_write,
+        test_display_color_multimtl_single_constant_not_per_face)
 )
 
 runUsdTestFixture io_color_n_visibility_test (getThisScriptFilename())
