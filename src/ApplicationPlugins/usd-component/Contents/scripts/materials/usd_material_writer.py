@@ -112,6 +112,48 @@ def bake_bitmap(from_tex, material_export_options, file_path=None):
     return render_file_path
 
 def set_bitmap_scale_bias_sourcecolorspace(uv_texture_shader, is_normal_map):
+    # MAX-MAT-009 surgical-coverage bound (audit, no logic change): every
+    # baked bitmap exported through this Python writer authors
+    # `sourceColorSpace = "raw"` on the UsdUVTexture, REGARDLESS of the
+    # source 3ds Max bitmap's gamma / color-space tagging. This is
+    # acknowledged-incomplete behavior (see the original TODO immediately
+    # below) -- a gamma=2.2 sRGB-tagged source diffuse map still exports
+    # as `sourceColorSpace = "raw"` even though the renderer should be
+    # applying inverse-EOTF for a UsdPreviewSurface diffuseColor input.
+    #
+    # The bite that retires this audit is a future MAX-MAT-* that:
+    #   (a) consults `from_tex.bitmap.gamma` on the source Max BitmapTexture
+    #       (already accessible -- see `roughness_map.bitmap.gamma = 1.0`
+    #       in `src/Tests/Integration/export_texture_test.py:287`),
+    #   (b) maps gamma >= 2.2 (or gamma "auto" with the OSL/Bitmap
+    #       BitmapManager's sRGB detection) to `sourceColorSpace = "sRGB"`
+    #       for color-bearing inputs (diffuseColor, emissiveColor,
+    #       specularColor), and
+    #   (c) maps gamma = 1.0 (linear) AND any non-color input target
+    #       (normal, roughness, metallic, occlusion, opacity) to
+    #       `sourceColorSpace = "raw"` (the current default for all).
+    # That bite must also carry a MaxScript regression in
+    # `src/Tests/Integration/export_texture_test.py` that explicitly
+    # tests an sRGB-gamma diffuse map -- the existing tests
+    # (`test_bitmaptexture_gamma_1_to_normal_map_usdpreviewsurface_handling`
+    # and three siblings) all pin gamma=1 cases, so a widening that
+    # broke the sRGB case would not surface via the existing suite.
+    #
+    # Until that bite lands the "raw" hardcode is the surgical bound the
+    # validator pins. The audit's Python validator
+    # (`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+    # a247e60f-cc09-4449-987c-3a7ecaaa88da/
+    # validate_color_space_roundtrip_surgical.py`) asserts both:
+    #   * `BakedDiffuseMap_sourceColorSpace_raw` -- the literal "raw" is
+    #     emitted on every baked bitmap, AND
+    #   * the `file` Asset input's USD attribute carries NO `colorSpace`
+    #     USD metadata (UsdPreviewSurface uses the `sourceColorSpace`
+    #     TOKEN INPUT below, not the USD attr `colorSpace` metadata --
+    #     a refactor that tagged the file Asset's `colorSpace` instead
+    #     of the `sourceColorSpace` input would be doubly wrong:
+    #     UsdPreviewSurface's spec ignores file-asset colorSpace, AND
+    #     the token input would then resolve to the nodedef default
+    #     "auto" which behaves differently in some renderers).
     source_color_space_input = uv_texture_shader.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token)
     # when this is implemented in 2024, we need update the logic to check if the max bitmap
     # color space is set to "raw" or not, for not this is not implemented yet

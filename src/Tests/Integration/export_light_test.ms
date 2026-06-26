@@ -200,6 +200,419 @@ struct export_light_test
         assert_float_equal 1.0 (lightSpecularAttrOn.Get()) message:(pointLight.name + " light with 'on' set to true should export specular as 1.0.")
     ),
 
+    -- MAX-LIT-002 surgical-preservation regression: pin both surgical bounds
+    -- of the IES profile authoring branch in PhotometricLightWriter::Write
+    -- (lines 274-329 of PhotometricLightWriter.cpp, post-MAX-LIT-002 comment
+    -- block). The existing happy-path tests for each light-type at lines
+    -- 260, 364, 483, 616, 716, 873 toggle `distribution = 3` (web/IES) but
+    -- never set `.webFile`, so the entire shaping:ies:file authoring branch
+    -- is uncovered by the suite. A regression that dropped the
+    -- `asset.GetId() != kInvalidId` check would emit shaping:ies:file = "";
+    -- a regression that always-authored shaping:ies:file when .webFile was
+    -- non-empty (regardless of distribution) would produce a USD light that
+    -- paradoxically carried both shape-driven distribution AND an IES
+    -- profile. Both bounds are exercised here.
+    function photometric_light_ies_file_export_test = (
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.RootPrimPath = "/"
+        exportOptions.Lights = true
+
+        -- Synthesize a minimal-valid IESNA LM-63 profile in the temp dir.
+        -- The writer references the file by absolute path; it does not
+        -- need to be a renderer-faithful profile for the test, only a
+        -- file the AssetManager can register so asset.GetId() != kInvalidId.
+        local iesPath = pathConfig.appendPath (getDir #temp) "/EXPORT_LIGHT_TEST_profile_audit.ies"
+        local iesFile = createfile iesPath
+        format "IESNA:LM-63-2002\n" to:iesFile
+        format "TILT=NONE\n" to:iesFile
+        format "1 1000.0 1.0 5 1 1 1 0.0 0.0 0.0\n" to:iesFile
+        format "1.0 1.0 0.0\n" to:iesFile
+        format "0.0 22.5 45.0 67.5 90.0\n" to:iesFile
+        format "0.0\n" to:iesFile
+        format "1000.0 800.0 600.0 200.0 0.0\n" to:iesFile
+        close iesFile
+
+        local pointLight = free_light()
+        pointLight.type = #Free_Point
+        pointLight.distribution = 3 -- web/IES
+        pointLight.webFile = iesPath
+
+        -- Surgical bound 1: distribution == WEB_DIST AND webFile set ->
+        -- shaping:ies:file IS authored with the resolved file path.
+        local exportPathWeb = output_prefix + "test_photometric_light_ies_file_web_export.usda"
+        USDExporter.ExportFile exportPathWeb exportOptions:exportOptions
+        local stageWeb = pyUsd.Stage.Open(exportPathWeb)
+        local usd_light_path = "/" + pointLight.name
+        local usdLightWeb = pyUsd.Prim.GetPrimAtPath stageWeb usd_light_path
+        local shapingAPIWeb = pyUsdLux.ShapingAPI(usdLightWeb)
+        local iesFileAttrWeb = shapingAPIWeb.GetShapingIesFileAttr()
+        assert_true (iesFileAttrWeb.IsAuthored()) message:(pointLight.name + " with distribution=Web AND webFile set should author shaping:ies:file")
+        local iesFileValueWeb = iesFileAttrWeb.Get()
+        -- USD reports SdfAssetPath; the resolved/absolute path string round-trips.
+        local iesFileAuthoredPath = iesFileValueWeb.path
+        assert_true (findString iesFileAuthoredPath "profile_audit.ies" != undefined) \
+            message:("shaping:ies:file expected to round-trip the .webFile asset path (audit IES filename); got: " + iesFileAuthoredPath)
+
+        -- Surgical bound 2: distribution != WEB_DIST -> shaping:ies:file
+        -- MUST NOT be authored, even though .webFile is still set on the
+        -- source light. The Max source preserves the picked file across
+        -- distribution toggles; it is only ACTIVE while distribution = WEB.
+        pointLight.distribution = 0 -- isotropic spherical
+        local exportPathIsotropic = output_prefix + "test_photometric_light_ies_file_isotropic_export.usda"
+        USDExporter.ExportFile exportPathIsotropic exportOptions:exportOptions
+        local stageIso = pyUsd.Stage.Open(exportPathIsotropic)
+        local usdLightIso = pyUsd.Prim.GetPrimAtPath stageIso usd_light_path
+        local shapingAPIIso = pyUsdLux.ShapingAPI(usdLightIso)
+        local iesFileAttrIso = shapingAPIIso.GetShapingIesFileAttr()
+        assert_false (iesFileAttrIso.IsAuthored()) \
+            message:(pointLight.name + " with distribution=Isotropic should NOT author shaping:ies:file even though .webFile is set (surgical bound: gate is on distribution first, not on webFile presence)")
+
+        -- Surgical bound 3: distribution == WEB_DIST AND .webFile is empty ->
+        -- shaping:ies:file MUST NOT be authored (no spurious empty asset path).
+        -- A second free_light constructed without a webFile (.webFile defaults
+        -- to undefined) confirms the asset-id check fires correctly.
+        local pointLightNoFile = free_light()
+        pointLightNoFile.type = #Free_Point
+        pointLightNoFile.distribution = 3 -- web/IES, but no file picked
+        local exportPathEmpty = output_prefix + "test_photometric_light_ies_file_empty_export.usda"
+        USDExporter.ExportFile exportPathEmpty exportOptions:exportOptions
+        local stageEmpty = pyUsd.Stage.Open(exportPathEmpty)
+        local usdLightEmptyPath = "/" + pointLightNoFile.name
+        local usdLightEmpty = pyUsd.Prim.GetPrimAtPath stageEmpty usdLightEmptyPath
+        local shapingAPIEmpty = pyUsdLux.ShapingAPI(usdLightEmpty)
+        local iesFileAttrEmpty = shapingAPIEmpty.GetShapingIesFileAttr()
+        assert_false (iesFileAttrEmpty.IsAuthored()) \
+            message:(pointLightNoFile.name + " with distribution=Web and NO webFile should NOT author shaping:ies:file (surgical bound: asset.GetId() != kInvalidId check)")
+
+        deleteFile iesPath
+    ),
+
+    -- MAX-LIT-001 writer-registry bottom-bound audit: pin the silent-drop
+    -- behavior the PhotometricLightWriter::CanExport gate enforces for every
+    -- non-LIGHTSCAPE_LIGHT_CLASS light (Omnilight, Skylight, legacy Spot,
+    -- legacy Directional, mr_Sky/Daylight, etc.). The audit's value is making
+    -- the bottom bound observable so a future "extend PhotometricLightWriter
+    -- to legacy lights" widening lands with a per-class attribute-translation
+    -- + decision-table update rather than silently authoring spurious
+    -- default-intensity UsdLuxSphereLight / UsdLuxDomeLight prims for every
+    -- legacy light position. See PhotometricLightWriter.cpp ::
+    -- CanExport (post-MAX-LIT-001 comment block) for the surgical bounds
+    -- enumeration.
+    --
+    -- The positive control (the Free_Point Photometric light) pins that
+    -- the gate still fires for in-scope lights -- a refactor that
+    -- destabilised the LIGHTSCAPE_LIGHT_CLASS branch surfaces here
+    -- alongside the negative cases.
+    function photometric_light_writer_legacy_dropout_audit_test = (
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.RootPrimPath = "/"
+        exportOptions.Lights = true
+
+        -- Positive control: a Photometric Free_Point light. The
+        -- LIGHTSCAPE_LIGHT_CLASS branch returns ContextSupport::Fallback
+        -- so this light is authored as the correct UsdLux* per the
+        -- PhotometricLightWriter::GetPrimType conversion grid.
+        local photometricLight = free_light()
+        photometricLight.name = "PhotometricPositiveControl"
+        photometricLight.type = #Free_Point
+        photometricLight.distribution = 2 -- uniform hemispherical/diffuse
+
+        -- Negative case A: legacy Omnilight (OMNI_LIGHT_CLASS_ID;
+        -- inherits LightObject but NOT LightscapeLight). The
+        -- !IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS) branch returns
+        -- ContextSupport::Unsupported; no other registered PrimWriter
+        -- claims a LightObject; MaxUsdPrimWriterRegistry::FindWriter
+        -- returns nullptr; the light is silently dropped from the
+        -- exported stage.
+        local legacyOmni = omniLight()
+        legacyOmni.name = "LegacyOmniNegativeCase"
+        legacyOmni.pos = [200, 0, 100]
+        legacyOmni.multiplier = 1.0
+        legacyOmni.rgb = color 255 255 255
+
+        -- Negative case B: legacy Skylight (the "Standard > Skylight"
+        -- class, SKYLIGHT_CLASS_ID; also LightObject-not-LightscapeLight).
+        -- Same writer-registry decision path -> silent drop.
+        local legacySky = Skylight()
+        legacySky.name = "LegacySkylightNegativeCase"
+        legacySky.pos = [-200, 0, 100]
+
+        local exportPath = output_prefix + "test_legacy_lights_dropout_audit_export.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        -- Surgical bound 1 (positive control): the LIGHTSCAPE_LIGHT_CLASS
+        -- branch fires; the photometric light IS authored as a UsdLux
+        -- prim. A regression that broke the IsSubClassOf check (e.g.
+        -- inverted the ternary, or returned Unsupported unconditionally)
+        -- would fail this assertion alongside the negative cases.
+        local photometricPath = "/" + photometricLight.name
+        local photometricPrim = pyUsd.Prim.GetPrimAtPath stage photometricPath
+        assert_true (photometricPrim.IsValid()) \
+            message:(photometricLight.name + " is the positive control: a Free_Point Photometric light MUST be authored as a UsdLux* prim (the LIGHTSCAPE_LIGHT_CLASS gate fires for in-scope lights). If this assertion fails, the writer-registry gate has regressed for in-scope lights, not just for legacy lights.")
+        local photometricLight_usd = pyUsdLux.BoundableLightBase.Get stage photometricPath
+        assert_true (photometricLight_usd.GetIntensityAttr().IsValid()) \
+            message:(photometricLight.name + " positive control should expose UsdLux BoundableLightBase intensity attribute.")
+
+        -- Surgical bound 2 (negative case A): the legacy Omnilight is
+        -- silently dropped. NO prim at its path. A wildcard "extend to
+        -- LightObject" widening would author a UsdLuxSphereLight prim
+        -- here -- this assertion is what catches that widening by
+        -- named case.
+        local legacyOmniPath = "/" + legacyOmni.name
+        local legacyOmniPrim = pyUsd.Prim.GetPrimAtPath stage legacyOmniPath
+        assert_false (legacyOmniPrim.IsValid()) \
+            message:(legacyOmni.name + " is a negative case: a legacy Omnilight (LightObject not LightscapeLight) MUST be silently dropped under the current MAX-LIT-001 baseline. If this assertion fails, either (a) a writer has been added that claims legacy LightObjects -- which requires a corresponding doc entry + decision-table update + per-attribute audit, NOT just a wildcard widening of the existing photometric gate; or (b) the writer-registry has gained a default fallback that silently authors spurious UsdLux prims for unmapped nodes -- which would break the round-trip semantics across every node type, not just lights.")
+
+        -- Surgical bound 3 (negative case B): the legacy Skylight is
+        -- also silently dropped. Same writer-registry decision path.
+        local legacySkyPath = "/" + legacySky.name
+        local legacySkyPrim = pyUsd.Prim.GetPrimAtPath stage legacySkyPath
+        assert_false (legacySkyPrim.IsValid()) \
+            message:(legacySky.name + " is a negative case: a legacy Skylight (LightObject not LightscapeLight) MUST be silently dropped under the current MAX-LIT-001 baseline. If this assertion fails, see the legacy Omnilight failure message for the two ways the writer-registry could have shifted.")
+
+        -- Surgical bound 4 (option still works on this branch): the
+        -- TranslateLights short-circuit suppresses ALL light export,
+        -- including the photometric. Same export call with
+        -- exportOptions.Lights = false MUST drop the photometric
+        -- positive control too -- this pins that the option gate fires
+        -- BEFORE the class-id gate, and that the legacy-drop is NOT
+        -- caused by an upstream option-state difference.
+        exportOptions.Lights = false
+        local exportPathNoLights = output_prefix + "test_legacy_lights_dropout_audit_no_lights_export.usda"
+        USDExporter.ExportFile exportPathNoLights exportOptions:exportOptions
+        local stageNoLights = pyUsd.Stage.Open(exportPathNoLights)
+        local photometricPrimNoLights = pyUsd.Prim.GetPrimAtPath stageNoLights photometricPath
+        assert_false (photometricPrimNoLights.IsValid()) \
+            message:(photometricLight.name + " with exportOptions.Lights = false MUST also be dropped (the TranslateLights short-circuit fires before the class-id gate). If the photometric survives a Lights=false export, the option gate has regressed and the legacy-drop assertions above are no longer a clean MAX-LIT-001 baseline.")
+    ),
+
+    -- MAX-LIT-003 attribute-translation spec audit: extends the
+    -- MAX-LIT-001 dropout audit to assert that, even when the source
+    -- legacy Omnilight + Skylight carry NON-DEFAULT artist customizations
+    -- (multiplier ≠ 1, rgb ≠ white, castShadows ≠ default, on != true),
+    -- the writer-registry STILL silently drops the lights AND the
+    -- customizations are lost along with the prim with no diagnostic.
+    --
+    -- The MAX-LIT-001 regression covers the default-attribute drop case
+    -- (omniLight() + Skylight() at default settings -> no prim). This
+    -- test pins the attribute-loss surface: if a future widening lands
+    -- (PhotometricLightWriter::CanExport extended to LightObject without
+    -- per-class GetPrimType + per-class attribute translation), the
+    -- customizations below would be silently flattened to default
+    -- intensity/white/shadow-on. The spec at
+    --   /Users/d.smith/MirisProjects/Agent\ Builder/agent/arch-builds/
+    --     4d931178-3f57-4ff7-bba5-edb7bf90a35e/
+    --       validate_legacy_light_attribute_spec_surgical.py
+    -- catalogs the per-class attribute translation table the future
+    -- writers MUST honor (Omnilight.multiplier -> UsdLux.intensity,
+    -- Omnilight.rgb -> UsdLux.color, Skylight.skyColor -> UsdLux.color
+    -- (color-only branch), Skylight.castShadows -> shadow:enable).
+    -- This test pins that under the CURRENT baseline, the customizations
+    -- are lost; when a writer lands per the spec, the assertions below
+    -- flip to "prim exists at the path AND each attribute matches the
+    -- spec".
+    function photometric_light_writer_legacy_attribute_dropout_audit_test = (
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.RootPrimPath = "/"
+        exportOptions.Lights = true
+
+        -- Positive control: a Photometric Free_Point still authored
+        -- correctly. Same precedent as the MAX-LIT-001 audit; pinned
+        -- here so the per-class-attribute negative cases are not
+        -- confused with an upstream writer-registry regression.
+        local photometricLight = free_light()
+        photometricLight.name = "PhotometricPositiveControl_NonDefaults"
+        photometricLight.type = #Free_Point
+        photometricLight.distribution = 2 -- uniform hemispherical/diffuse
+
+        -- Negative case A: legacy Omnilight with NON-DEFAULT customizations
+        -- the spec preserves -- multiplier = 0.3 (dim), rgb = warm tungsten,
+        -- castShadows = false (no shadow).
+        local legacyOmni = omniLight()
+        legacyOmni.name = "LegacyOmni_NonDefault_Customizations"
+        legacyOmni.pos = [200, 0, 100]
+        legacyOmni.multiplier = 0.3
+        legacyOmni.rgb = color 255 140 51   -- warm tungsten in 0-255
+        legacyOmni.baseobject.castShadows = false
+
+        -- Negative case B: legacy Skylight with NON-DEFAULT customizations
+        -- -- multiplier = 0.4 (dim), skyColor = cool dusk, castShadows = false.
+        -- Per the MAX-LIT-003 spec, the future writer would author
+        -- UsdLuxDomeLight at intensity=0.4, color=(0.20, 0.42, 0.85),
+        -- shadow:enable=false; under the CURRENT baseline, ALL of those
+        -- are silently lost together with the prim.
+        local legacySky = Skylight()
+        legacySky.name = "LegacySky_NonDefault_Customizations"
+        legacySky.pos = [-200, 0, 100]
+        legacySky.multiplier = 0.4
+        -- Skylight uses .rgb to drive the sky color when no map is bound.
+        legacySky.rgb = color 51 107 217    -- cool dusk in 0-255
+        legacySky.baseobject.castShadows = false
+
+        local exportPath = output_prefix + "test_legacy_lights_attribute_dropout_audit_export.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        -- Positive-control surgical bound: the LIGHTSCAPE_LIGHT_CLASS
+        -- branch fires; the photometric light IS authored at its path.
+        local photometricPath = "/" + photometricLight.name
+        local photometricPrim = pyUsd.Prim.GetPrimAtPath stage photometricPath
+        assert_true (photometricPrim.IsValid()) \
+            message:(photometricLight.name + " positive control should be authored as a UsdLux prim under MAX-LIT-003 baseline.")
+
+        -- Surgical bound A1 (Omnilight prim dropped): the legacy Omnilight
+        -- is silently dropped even WITH non-default multiplier + rgb +
+        -- castShadows. A wildcard widening that landed without per-class
+        -- attribute translation would author a UsdLuxSphereLight at this
+        -- path -- this assertion catches that widening even when the
+        -- spurious prim authored is NOT default white (the spec validator
+        -- catches the per-attribute regression on the prim).
+        local legacyOmniPath = "/" + legacyOmni.name
+        local legacyOmniPrim = pyUsd.Prim.GetPrimAtPath stage legacyOmniPath
+        assert_false (legacyOmniPrim.IsValid()) \
+            message:(legacyOmni.name + " is the MAX-LIT-003 negative case for Omnilight: a legacy Omnilight with non-default multiplier (0.3), non-default rgb (warm tungsten), AND castShadows=false MUST still be silently dropped under the current writer-registry baseline. If this assertion fails, a per-class writer has landed -- the spec validator at validate_legacy_light_attribute_spec_surgical.py catalogs the attribute translation table this writer MUST honor (intensity from multiplier, color from rgb, shadow:enable from castShadows). Flipping this assertion to assert_true requires also updating the per-attribute assertions in this test to the spec's expected values.")
+
+        -- Surgical bound A2 (Omnilight customizations are silently lost):
+        -- in the current baseline there is no observable round-trip channel
+        -- for the multiplier / color / shadow customizations of legacy
+        -- Omnilights. A regression that silently authored a UsdLuxSphereLight
+        -- with DEFAULT unit-intensity / white-color / shadow-on at the
+        -- legacy Omnilight's path (the wildcard widening counterfactual)
+        -- would pass A1 above only if the writer also dropped the prim --
+        -- but then the customizations are doubly lost (no prim + no
+        -- round-trip channel). The customDataByKey check below pins that
+        -- no spec channel (e.g. customData['3dsmax:legacy_omnilight:multiplier'])
+        -- exists either: the current baseline carries the customizations
+        -- in ZERO channels.
+        local legacyOmniCustomData = pyUsd.Prim.GetCustomDataByKey legacyOmniPrim "3dsmax:legacy_omnilight:multiplier"
+        assert_true (legacyOmniCustomData == undefined) \
+            message:(legacyOmni.name + " legacy Omnilight customizations should NOT be smuggled into customData under the current baseline -- the MAX-LIT-003 spec defines customData[3dsmax:legacy_omnilight:*] as the round-trip channel for non-translatable attributes (far attenuation), NOT for attributes that have direct UsdLux equivalents (multiplier, rgb, castShadows). If this assertion fails, the writer is leaking artist customizations into a non-spec channel.")
+
+        -- Surgical bound B1 (Skylight prim dropped): symmetric to A1 for
+        -- the Skylight case. A wildcard widening that authored a
+        -- UsdLuxDomeLight without per-attribute translation would fail here.
+        local legacySkyPath = "/" + legacySky.name
+        local legacySkyPrim = pyUsd.Prim.GetPrimAtPath stage legacySkyPath
+        assert_false (legacySkyPrim.IsValid()) \
+            message:(legacySky.name + " is the MAX-LIT-003 negative case for Skylight: a legacy Skylight with non-default multiplier (0.4), non-default rgb (cool dusk), AND castShadows=false MUST still be silently dropped under the current writer-registry baseline. The MAX-LIT-003 spec catalogs the dome-side translation table (intensity from multiplier, color from skyColor, shadow:enable from castShadows). When a Skylight writer lands, flip this assertion to assert_true and add per-attribute checks per the spec.")
+
+        -- Surgical bound B2 (Skylight customizations are silently lost):
+        -- symmetric to A2 for the dome path. Pins that no
+        -- customData['3dsmax:legacy_skylight:*'] round-trip channel exists
+        -- in the current baseline.
+        local legacySkyCustomData = pyUsd.Prim.GetCustomDataByKey legacySkyPrim "3dsmax:legacy_skylight:multiplier"
+        assert_true (legacySkyCustomData == undefined) \
+            message:(legacySky.name + " legacy Skylight customizations should NOT be smuggled into customData under the current baseline. Same reasoning as the Omnilight customData check above.")
+    ),
+
+    -- MAX-LIT-002 surgical-preservation regression: pin both branches of
+    -- the useKelvin dichotomy in PhotometricLightWriter::Write (lines
+    -- 481-535 of PhotometricLightWriter.cpp, post-MAX-LIT-002 comment
+    -- block).
+    --
+    -- The existing static-frame happy-path test asserts that
+    -- enableColorTemperatureAttr is true/false but never the
+    -- colorTemperature VALUE, never the filter-only color signal under
+    -- useKelvin == true, never the combined-product color signal under
+    -- useKelvin == false, and never the out-of-range Kelvin clamp.
+    -- This test pins all four bounds.
+    function photometric_light_kelvin_filter_color_round_trip_test = (
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.RootPrimPath = "/"
+        exportOptions.Lights = true
+
+        local pointLight = free_light()
+        pointLight.type = #Free_Point
+        pointLight.distribution = 2 -- uniform hemispherical/diffuse
+
+        -- Light color and filter color are intentionally distinct AND
+        -- non-white so the difference between filter-only and combined-
+        -- product authoring is observable in the USD output.
+        pointLight.rgb = color 128 32 230            -- magenta-ish light color
+        pointLight.filterColor = color 255 230 191   -- warm-orange filter
+        pointLight.useKelvin = true
+        pointLight.kelvin = 3200.0
+
+        -- Surgical bound 1 (useKelvin == true):
+        --   * enableColorTemperatureAttr == true
+        --   * colorTemperatureAttr == 3200 (in-range, no clamp)
+        --   * inputs:color == filterColor ONLY (the magenta lightColor
+        --     is intentionally dropped)
+        local exportPathK = output_prefix + "test_photometric_light_kelvin_round_trip_export.usda"
+        USDExporter.ExportFile exportPathK exportOptions:exportOptions
+        local stageK = pyUsd.Stage.Open(exportPathK)
+        local usd_light_path = "/" + pointLight.name
+        local usdLightK = pyUsdLux.BoundableLightBase.Get stageK usd_light_path
+
+        local enableCTAttrK = usdLightK.GetEnableColorTemperatureAttr()
+        assert_true (enableCTAttrK.Get()) message:(pointLight.name + " useKelvin=true should set enableColorTemperatureAttr=true")
+        local colorTempAttrK = usdLightK.GetColorTemperatureAttr()
+        assert_true (colorTempAttrK.IsAuthored()) message:(pointLight.name + " useKelvin=true should author colorTemperatureAttr")
+        assert_float_equal 3200.0 (colorTempAttrK.Get()) message:(pointLight.name + " colorTemperatureAttr value should equal source kelvin (3200) when in [1000, 10000]")
+
+        -- inputs:color must be the FILTER colour only -- the magenta lightColor
+        -- must NOT be combined in on the useKelvin branch.
+        local colorAttrK = usdLightK.GetColorAttr()
+        local colorValueK = colorAttrK.Get()
+        local expectedFilterR = 255.0 / 255.0
+        local expectedFilterG = 230.0 / 255.0
+        local expectedFilterB = 191.0 / 255.0
+        assert_float_equal expectedFilterR colorValueK[1] message:(pointLight.name + " useKelvin=true: inputs:color R must be filterColor R only, not lightColor*filterColor")
+        assert_float_equal expectedFilterG colorValueK[2] message:(pointLight.name + " useKelvin=true: inputs:color G must be filterColor G only")
+        assert_float_equal expectedFilterB colorValueK[3] message:(pointLight.name + " useKelvin=true: inputs:color B must be filterColor B only")
+
+        -- Surgical bound 2 (useKelvin == false):
+        --   * enableColorTemperatureAttr == false
+        --   * colorTemperatureAttr NOT authored
+        --   * inputs:color == lightColor * filterColor (combined product;
+        --     intentionally lossy on round-trip)
+        pointLight.useKelvin = false
+        local exportPathNoK = output_prefix + "test_photometric_light_no_kelvin_round_trip_export.usda"
+        USDExporter.ExportFile exportPathNoK exportOptions:exportOptions
+        local stageNoK = pyUsd.Stage.Open(exportPathNoK)
+        local usdLightNoK = pyUsdLux.BoundableLightBase.Get stageNoK usd_light_path
+
+        local enableCTAttrNoK = usdLightNoK.GetEnableColorTemperatureAttr()
+        assert_false (enableCTAttrNoK.Get()) message:(pointLight.name + " useKelvin=false should set enableColorTemperatureAttr=false")
+
+        local colorAttrNoK = usdLightNoK.GetColorAttr()
+        local colorValueNoK = colorAttrNoK.Get()
+        local expectedCombinedR = (128.0 / 255.0) * (255.0 / 255.0)
+        local expectedCombinedG = (32.0  / 255.0) * (230.0 / 255.0)
+        local expectedCombinedB = (230.0 / 255.0) * (191.0 / 255.0)
+        assert_float_equal expectedCombinedR colorValueNoK[1] message:(pointLight.name + " useKelvin=false: inputs:color R must be lightColor R * filterColor R (combined)")
+        assert_float_equal expectedCombinedG colorValueNoK[2] message:(pointLight.name + " useKelvin=false: inputs:color G must be lightColor G * filterColor G (combined)")
+        assert_float_equal expectedCombinedB colorValueNoK[3] message:(pointLight.name + " useKelvin=false: inputs:color B must be lightColor B * filterColor B (combined)")
+
+        -- Surgical bound 3 (Kelvin clamp): out-of-range Kelvin is clamped
+        -- to [1000, 10000]. The original Max value is preserved in the
+        -- emitted Log::Warn message; here we only assert the USD value
+        -- is the clamped one.
+        pointLight.useKelvin = true
+        pointLight.kelvin = 12000.0  -- above USD spec max
+        local exportPathClampHi = output_prefix + "test_photometric_light_kelvin_clamp_high_export.usda"
+        USDExporter.ExportFile exportPathClampHi exportOptions:exportOptions
+        local stageClampHi = pyUsd.Stage.Open(exportPathClampHi)
+        local usdLightClampHi = pyUsdLux.BoundableLightBase.Get stageClampHi usd_light_path
+        local colorTempAttrClampHi = usdLightClampHi.GetColorTemperatureAttr()
+        assert_float_equal 10000.0 (colorTempAttrClampHi.Get()) message:(pointLight.name + " kelvin=12000 should be clamped to USD-spec max 10000 on export")
+
+        pointLight.kelvin = 500.0  -- below USD spec min
+        local exportPathClampLo = output_prefix + "test_photometric_light_kelvin_clamp_low_export.usda"
+        USDExporter.ExportFile exportPathClampLo exportOptions:exportOptions
+        local stageClampLo = pyUsd.Stage.Open(exportPathClampLo)
+        local usdLightClampLo = pyUsdLux.BoundableLightBase.Get stageClampLo usd_light_path
+        local colorTempAttrClampLo = usdLightClampLo.GetColorTemperatureAttr()
+        assert_float_equal 1000.0 (colorTempAttrClampLo.Get()) message:(pointLight.name + " kelvin=500 should be clamped to USD-spec min 1000 on export")
+    ),
+
     function photometric_point_light_attributes_export_test = (
         local exportOptions = USDExporter.CreateOptions()
         exportOptions.FileFormat = #ascii
@@ -1415,6 +1828,10 @@ struct export_light_test
     Tests = #(
         photometric_light_general_attributes_export_test,
         photometric_light_on_off_export_test,
+        photometric_light_writer_legacy_dropout_audit_test,
+        photometric_light_writer_legacy_attribute_dropout_audit_test,
+        photometric_light_ies_file_export_test,
+        photometric_light_kelvin_filter_color_round_trip_test,
         photometric_point_light_attributes_export_test,
         photometric_point_light_attributes_animation_export_test,
         photometric_sphere_light_attributes_export_test,
