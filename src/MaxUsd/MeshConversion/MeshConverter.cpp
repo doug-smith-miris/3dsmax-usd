@@ -257,12 +257,14 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
             //     test_display_color_override
             //     test_display_color_preserves_authored_when_material_bound
             //     test_display_color_preserves_default_looking_authored_value_when_material_bound
+            //     test_display_color_primvar_shape_invariants_on_gate_write
             //     test_display_color_still_uses_wire_color_when_no_material
             //     test_display_color_uses_material_diffuse_when_bound
             // plus the doc-linked Python validators
-            // validate_display_color_surgical.py (state-shape bounds) and
+            // validate_display_color_surgical.py (state-shape bounds),
             // validate_display_color_tolerance_bounds.py (value-coincidence
-            // bounds):
+            // bounds), and validate_display_color_primvar_shape.py
+            // (primvar-shape bounds):
             //
             //   State-shape bounds (first reinforcement, 0353d63):
             //   * GetDisplayColorAttr().IsAuthored() is already true -- the
@@ -287,7 +289,7 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
             //     fall through to the wireframe color for legitimate
             //     pure-black or pure-white materials.
             //
-            //   Value-coincidence bounds (second reinforcement, this commit):
+            //   Value-coincidence bounds (second reinforcement, d72d51e):
             //   * The authored value EQUALS a canonical "default-looking"
             //     sentinel: (0, 0, 0), (1, 1, 1), or (0.5, 0.5, 0.5). The
             //     IsAuthored() gate is purely state-based; the authored
@@ -307,12 +309,40 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
             //     either extreme. Cases at (2.0, 0.5, 0.5) and (1e-3, 0, 0)
             //     pin both extremes.
             //
+            //   Primvar-shape bounds (third reinforcement, this commit):
+            //   * When the gate writes (mtl-diffuse or wire-color-fallback
+            //     branch), the resulting primvars:displayColor must be a
+            //     SINGLE-ELEMENT CONSTANT primvar at default time --
+            //     array length 1, interpolation "constant" (the UsdGeom
+            //     default for displayColor), no time samples. The first
+            //     two reinforcements assert displayColor[0] and the
+            //     branch label; a widening that broadcast the gate's
+            //     output to a per-vertex primvar (e.g. "for each vertex
+            //     v: write displayColorSrc; set interpolation=vertex")
+            //     would have displayColor[0] equal to the same source
+            //     color the existing assertions check -- the file would
+            //     inflate linearly with vertex count, Hydra-delegate
+            //     behaviour would change, and no current test would
+            //     fail. The third reinforcement pins all three shape
+            //     invariants explicitly.
+            //   * When the gate skips (preauthored-preserved branch),
+            //     the artist's pre-existing primvar shape is honoured
+            //     verbatim -- vertex / faceVarying interpolation,
+            //     multi-element arrays, time-sampled animation all
+            //     survive untouched. A widening that "normalised" the
+            //     preserved primvar to (length=1, interpolation=
+            //     constant) would silently flatten any vertex-color or
+            //     keyed-animation authoring back to the first sample's
+            //     value. The third reinforcement pins shape preservation
+            //     symmetrically across vertex, faceVarying, constant
+            //     len=1, and time-sampled cases.
+            //
             // A future refactor that widens any of these gates would
             // silently corrupt artist-authored displayColor or substitute
-            // the wrong source. Both the .ms surgical tests and the two
-            // Python validators name the specific bound they exercise, so
-            // a regression in any branch fails with a useful, localised
-            // error.
+            // the wrong source. Both the .ms surgical tests and the
+            // three Python validators name the specific bound they
+            // exercise, so a regression in any branch fails with a
+            // useful, localised error.
             if (!usdMesh.GetDisplayColorAttr().IsAuthored()) {
                 Color displayColorSrc;
                 if (Mtl* boundMtl = node->GetMtl()) {

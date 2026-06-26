@@ -397,6 +397,80 @@ struct io_color_n_visibility_test
         assert_equal 0 dispColor[3] message:"Unexpected displayColor[2], pre-authored black-default sentinel must survive over the material diffuse (vivid red)."
     ),
 
+    -- MAX-MAT-003 THIRD-REINFORCEMENT SURGICAL BOUND: when the gate
+    -- writes (mtl-diffuse or wire-color-fallback branch), the resulting
+    -- primvars:displayColor must have a specific PRIMVAR SHAPE -- a
+    -- single-element constant primvar with no time samples. The first
+    -- two reinforcements pin VALUE (displayColor[0]) and BRANCH; this
+    -- one pins SHAPE.
+    --
+    -- A future refactor that broadcast the gate's output to a per-vertex
+    -- primvar (e.g. "for each vertex, write displayColorSrc; set
+    -- interpolation=vertex") would have displayColor[0] equal to the
+    -- material's diffuse and would still take the mtl-diffuse branch --
+    -- the existing 14 value+branch assertions would PASS. Only an
+    -- explicit array-length + interpolation + time-sample assertion
+    -- catches that class of widening.
+    --
+    -- The companion Python validator
+    -- validate_display_color_primvar_shape.py exercises 8 cases (mtl-
+    -- diffuse / wire-color-fallback / HDR / near-zero plus four
+    -- preserved-shape cases at vertex / faceVarying / constant-len-1 /
+    -- time-sampled) + idempotence; this MaxScript test pins the most
+    -- common write-branch case (mtl-bound LDR) at the export level so
+    -- a regression in the C++ that escapes the Python mirror still
+    -- fails inside Max.
+    function test_display_color_primvar_shape_invariants_on_gate_write = (
+        testFilePath = output_prefix + "test_display_color_primvar_shape_invariants_on_gate_write.usd"
+        local b = box name:"box"
+        convertToPoly b
+        -- Wireframe color: red. Material diffuse: green. No artist
+        -- authoring of displayColor -- the gate fires the mtl-diffuse
+        -- branch and writes a single-element constant primvar.
+        b.wireColor = Color 255 0 0
+        local mtl = Standard()
+        mtl.name = "matGreen"
+        mtl.diffuse = Color 0 255 0
+        b.material = mtl
+
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = pyUsdGeom.Gprim.Get stage ("/" + b.name)
+        local mesh = pyUsdGeom.Mesh(prim)
+        local displayColorAttr = mesh.GetDisplayColorAttr()
+        local dispColor = displayColorAttr.Get()
+        -- Value invariant: the existing test_display_color_uses_material_
+        -- diffuse_when_bound already pins displayColor[0]; we re-check it
+        -- here so a regression in that branch is caught by this single
+        -- test in isolation. Green diffuse must survive.
+        local rgb = dispColor[1]
+        assert_equal 0 rgb[1] message:"Unexpected displayColor[0], should be from the material diffuse (green)."
+        assert_equal 1 rgb[2] message:"Unexpected displayColor[1], should be from the material diffuse (green)."
+        assert_equal 0 rgb[3] message:"Unexpected displayColor[2], should be from the material diffuse (green)."
+        -- Primvar-shape invariants. A widening that broadcast the
+        -- gate's output to per-vertex (interp=vertex, len=N) would have
+        -- the same green at index 0 -- the assertions above would pass.
+        -- These pin the shape so that class is caught.
+        --
+        -- Invariant 1: array length is exactly 1. A per-vertex
+        -- broadcast on a 8-vertex box would write count == 8.
+        assert_equal 1 dispColor.count message:"Unexpected displayColor array length on mtl-diffuse branch: must be a single-element constant primvar, not a per-vertex broadcast."
+        -- Invariant 2: interpolation resolves to "constant". A
+        -- regression that set interp=vertex (with a one-element array
+        -- or a broadcast array) would change Hydra-delegate behaviour
+        -- even at the same color value.
+        local primvarApi = pyUsdGeom.PrimvarsAPI(prim)
+        local primvar = primvarApi.GetPrimvar("displayColor")
+        local interpolation = primvar.GetInterpolation()
+        assert_equal "constant" interpolation message:"Unexpected displayColor interpolation on mtl-diffuse branch: must be \"constant\", not \"vertex\" / \"faceVarying\" / \"uniform\"."
+        -- Invariant 3: no time samples. A regression that sampled
+        -- GetDiffuse() at each timecode during an animated export
+        -- would inflate the file linearly with frame count and change
+        -- consumer behaviour in animated scenes.
+        assert_equal 0 (displayColorAttr.GetNumTimeSamples()) message:"Unexpected displayColor time sample count on mtl-diffuse branch: must be 0 (a single default-time value), not a time-sampled animation."
+    ),
+
     function teardown = (
     ),
 
@@ -408,7 +482,8 @@ struct io_color_n_visibility_test
         test_display_color_uses_material_diffuse_when_bound,
         test_display_color_still_uses_wire_color_when_no_material,
         test_display_color_preserves_authored_when_material_bound,
-        test_display_color_preserves_default_looking_authored_value_when_material_bound)
+        test_display_color_preserves_default_looking_authored_value_when_material_bound,
+        test_display_color_primvar_shape_invariants_on_gate_write)
 )
 
 runUsdTestFixture io_color_n_visibility_test (getThisScriptFilename())

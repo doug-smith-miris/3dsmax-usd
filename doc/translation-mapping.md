@@ -1098,6 +1098,102 @@ when mtl is bound, and value-coincidence overwrite at default
 sentinels). Composite at `compare_side_by_side.png` in the same
 arch-build dir.
 
+**Primvar-shape band validator (third reinforcement, added 2026-06-26).**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/46bb7b7e-974c-4ca0-acd6-dec38f5f29e5/validate_display_color_primvar_shape.py`
+pins the gate at the **primvar-shape edge** the first two reinforcements
+leave uncovered. Both prior validators assert displayColor[0] and the
+branch label; neither asserts the resulting primvar's array length,
+interpolation, or time-sample count. A future refactor that broadcast
+the gate's output to a per-vertex primvar (e.g. `for each vertex v:
+write displayColorSrc to v's slot; set interpolation=vertex`) would
+satisfy every existing value-equality assertion — displayColor[0]
+still equals the bound material's diffuse — while inflating the
+file linearly with vertex count, changing Hydra-delegate behaviour
+(constant fallback vs per-vertex interpolation), and silently
+flattening artist authoring on the symmetric "preauthored-preserved"
+branch if the same widening also "normalised" preserved primvars to
+constant len=1.
+
+The third reinforcement enumerates three shape invariants the gate is
+required to satisfy:
+
+  1. **Array length == 1** when the gate writes (mtl-diffuse or
+     wire-color-fallback). A single GfVec3f, not a per-vertex array.
+  2. **Interpolation resolves to "constant"** on the write branches.
+     UsdGeom's default for `primvars:displayColor` is "constant"; the
+     C++ doesn't explicitly set it, so the value lands at the default.
+     A regression that explicitly set `vertex` or `faceVarying`
+     would be caught by this invariant.
+  3. **No time samples** on the write branches.
+     `attr.GetNumTimeSamples() == 0`; only the default-time value is
+     authored. A regression that sampled `boundMtl->GetDiffuse()` at
+     each timecode during an animated export would be caught here.
+
+Symmetric shape-preservation invariants apply to the
+preauthored-preserved branch — vertex / faceVarying / constant len=1
+/ time-sampled artist authoring all survive untouched. A widening
+that "normalised" preserved primvars to (length=1, "constant", 0)
+would silently flatten artist vertex-color or keyed-animation work
+to the first sample's value.
+
+| Case in synthetic fixture                          | preauthored shape          | mtl diffuse           | wire                | expected shape                | branch taken |
+| ---                                                | ---                        | ---                   | ---                 | ---                           | --- |
+| `MtlBound_ShapeConstant`                           | (absent)                   | `(0.0, 0.95, 0.20)`   | `(1, 0, 0)`         | `(1, "constant", 0)`          | `mtl-diffuse` |
+| `NoMtl_ShapeConstant`                              | (absent)                   | (absent)              | `(0.85, 0.30, 0.10)`| `(1, "constant", 0)`          | `wire-color-fallback` |
+| `MtlBoundHDR_ShapeConstant`                        | (absent)                   | `(2.5, 0.10, 0.10)`   | `(1, 0, 0)`         | `(1, "constant", 0)`          | `mtl-diffuse` |
+| `MtlBoundNearZero_ShapeConstant`                   | (absent)                   | `(1e-3, 0, 0)`        | `(0.5, 0.5, 0.5)`   | `(1, "constant", 0)`          | `mtl-diffuse` |
+| `PreauthoredVertex_ShapePreserved`                 | 3 entries, `vertex`, 0 ts  | `(0.50, 0.50, 0.50)`  | `(0.20, 0.20, 0.20)`| `(3, "vertex", 0)`            | `preauthored-preserved` |
+| `PreauthoredFaceVarying_ShapePreserved`            | 6 entries, `faceVarying`, 0 ts | `(0.95, 0.95, 0.95)` | `(0.10, 0.10, 0.10)` | `(6, "faceVarying", 0)`   | `preauthored-preserved` |
+| `PreauthoredConstantLen1_ValueAndShapePreserved`   | 1 entry, `constant`, 0 ts  | `(0.20, 0.95, 0.30)`  | `(0.10, 0.10, 0.10)`| `(1, "constant", 0)`          | `preauthored-preserved` |
+| `PreauthoredTimeSampled_ShapePreserved`            | 1 entry, `constant`, 2 ts  | `(0.95, 0.05, 0.05)`  | `(0.10, 0.10, 0.10)`| `(1, "constant", 2)`          | `preauthored-preserved` |
+
+Plus an idempotence check (the second pass takes
+`preauthored-preserved` and preserves the shape exactly on every
+case — including the multi-element vertex / faceVarying and
+time-sampled cases, where a "settle to constant len=1" widening
+would silently flatten). All 8 cases + idempotence pass on the
+2026-06-26 baseline.
+
+**MaxScript regression (added 2026-06-26).**
+`src/Tests/Integration/io_color_n_visibility_test.ms` now also
+carries `test_display_color_primvar_shape_invariants_on_gate_write`,
+the export-level companion of the Python primvar-shape validator. It
+builds a box with wireframe red, a Standard material with green
+diffuse bound to the node, exports, and asserts the resulting
+`primvars:displayColor`:
+
+  * `dispColor.count == 1` (single-element array)
+  * `primvar.GetInterpolation() == "constant"` via the
+    `pyUsdGeom.PrimvarsAPI(prim).GetPrimvar("displayColor")` wrapper.
+  * `displayColorAttr.GetNumTimeSamples() == 0` (no time-sampled
+    animation).
+  * `dispColor[1] == green` (re-pinned so a regression in the
+    mtl-diffuse branch fails this test in isolation too).
+
+A failure on any shape assertion means the gate gained a per-vertex
+broadcast or a time-sampled write that escapes the existing value-
+equality regressions.
+
+**Visual demonstration of the primvar-shape bound.** A two-sphere
+fixture renders the postfix-vs-regressed shape contrast in Storm
+(`usdrecord --renderer GL`). Sphere A authors displayColor as the
+gate currently writes it -- single-element constant primvar with
+value `(0, 0.78, 0.20)` (green). Sphere B authors the same green at
+every vertex with `interpolation=vertex` AND additionally
+gradient-blends to red at one pole of the sphere -- the SHAPE a
+broadcast widening could produce that still satisfies "value at
+index 0 is green". Storm renders A as a flat green sphere
+(`render_karma_postfix.png`) and B with a visible green-to-red
+hemisphere gradient (`render_unreal_reference.png` -- the
+"still-broken reference" name is the template holdover; here it
+means "what a per-vertex-broadcast regression could look like, even
+though the typical broadcast keeps the same color per vertex").
+**Auditor's checklist: the postfix render is a uniformly green
+sphere; if it ever shows a gradient hemisphere, the gate has started
+broadcasting to per-vertex (or the primvar shape regression has
+flattened a preserved gradient back through the gate).** Composite
+at `compare_side_by_side.png` in the same arch-build dir.
+
 **Retirement condition.** Unlike MAX-MAT-001/002 this is not a workaround
 for an external 3ds Max bug — the code being fixed is the fork's own
 `MeshConverter::ConvertToUSDMesh`. The fix is permanent.
@@ -2416,6 +2512,38 @@ to assert the same observable structure.
   over-wrote) makes the value-coincidence bound visible at the pixel
   level. No C++ logic change; purely additive test infrastructure
   stacked on top of the 2026-06-23 reinforcement.
+* 2026-06-26 — MAX-MAT-003 primvar-shape band reinforcement (third
+  layer, stacked on the value-coincidence reinforcement landed
+  earlier the same day): pin the **primvar shape** the gate produces
+  and preserves — array length, interpolation token, time-sample
+  count. The first two reinforcements assert displayColor[0] and the
+  branch label; neither catches a widening that broadcast the gate's
+  output to a per-vertex primvar (displayColor[0] would still equal
+  the bound material's diffuse, every existing test would pass,
+  while file size inflates linearly with vertex count and Hydra-
+  delegate behaviour changes). Adds
+  `test_display_color_primvar_shape_invariants_on_gate_write` to
+  `io_color_n_visibility_test.ms`, asserting `dispColor.count == 1`,
+  `primvar.GetInterpolation() == "constant"`, and
+  `displayColorAttr.GetNumTimeSamples() == 0` on the mtl-diffuse
+  branch alongside the existing value-equality check. Python
+  validator `validate_display_color_primvar_shape.py` covers the
+  same bound at the USD layer with 8 cases — 4 gate-write cases
+  (mtl-bound LDR / wire-color-fallback / HDR / near-zero, all
+  pinning shape `(1, "constant", 0)`) plus 4 preauthored-preserved
+  cases (vertex-interp 3-element / faceVarying-interp 6-element /
+  constant len=1 / time-sampled, all pinning shape preservation
+  symmetric to the artist's input). All 8 cases + idempotence pass
+  on the 2026-06-26 baseline. Extends the C++ surgical-bounds
+  comment block in `MeshConverter::ConvertToUSDMesh` to enumerate
+  the new primvar-shape bounds on both the write and preserved
+  branches and points at all three Python validators by name.
+  Visual auditor pair (`render_karma_postfix.png` flat green sphere,
+  the constant-interp len=1 shape; `render_unreal_reference.png`
+  green-to-red gradient sphere, the per-vertex-broadcast shape a
+  widening could produce) makes the shape distinction visible at
+  the pixel level. No C++ logic change; purely additive test
+  infrastructure stacked on top of the two earlier reinforcements.
 * 2026-06-20 — MAX-GEO-001 mesh normals dual-author: add
   `NormalsMode::Both` and make it the new default so the writer
   populates both `primvars:normals` AND `UsdGeomMesh.normals` (the
