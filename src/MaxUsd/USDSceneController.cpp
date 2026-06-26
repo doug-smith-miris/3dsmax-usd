@@ -156,6 +156,14 @@ int USDSceneController::Export(const fs::path& filePath, const USDSceneBuilderOp
     }
 
     if (isUSDZExport) {
+        // MAX-PKG-001 -- USDZ packaging path surgical bounds.
+        // This is the second call site of the cmd->powershell->python->usdzip
+        // shim chain; see the matching comment block in
+        // `USDIOController::Export` for the full surgical-bounds list, the
+        // Python validator
+        // (`arch-builds/.../validate_usdz_packaging_fidelity.py`, 9 cases),
+        // and the doc audit entry (`doc/translation-mapping.md`,
+        // MAX-PKG-001). Both call sites swap together in the follow-on bite.
         // first export stage to .usd in #temp folder, then convert to usdz.
         stageExportExtension = "usd";
 

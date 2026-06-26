@@ -200,6 +200,196 @@ struct export_light_test
         assert_float_equal 1.0 (lightSpecularAttrOn.Get()) message:(pointLight.name + " light with 'on' set to true should export specular as 1.0.")
     ),
 
+    -- MAX-LIT-002 surgical-preservation regression: pin both surgical bounds
+    -- of the IES profile authoring branch in PhotometricLightWriter::Write
+    -- (lines 274-329 of PhotometricLightWriter.cpp, post-MAX-LIT-002 comment
+    -- block). The existing happy-path tests for each light-type at lines
+    -- 260, 364, 483, 616, 716, 873 toggle `distribution = 3` (web/IES) but
+    -- never set `.webFile`, so the entire shaping:ies:file authoring branch
+    -- is uncovered by the suite. A regression that dropped the
+    -- `asset.GetId() != kInvalidId` check would emit shaping:ies:file = "";
+    -- a regression that always-authored shaping:ies:file when .webFile was
+    -- non-empty (regardless of distribution) would produce a USD light that
+    -- paradoxically carried both shape-driven distribution AND an IES
+    -- profile. Both bounds are exercised here.
+    function photometric_light_ies_file_export_test = (
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.RootPrimPath = "/"
+        exportOptions.Lights = true
+
+        -- Synthesize a minimal-valid IESNA LM-63 profile in the temp dir.
+        -- The writer references the file by absolute path; it does not
+        -- need to be a renderer-faithful profile for the test, only a
+        -- file the AssetManager can register so asset.GetId() != kInvalidId.
+        local iesPath = pathConfig.appendPath (getDir #temp) "/EXPORT_LIGHT_TEST_profile_audit.ies"
+        local iesFile = createfile iesPath
+        format "IESNA:LM-63-2002\n" to:iesFile
+        format "TILT=NONE\n" to:iesFile
+        format "1 1000.0 1.0 5 1 1 1 0.0 0.0 0.0\n" to:iesFile
+        format "1.0 1.0 0.0\n" to:iesFile
+        format "0.0 22.5 45.0 67.5 90.0\n" to:iesFile
+        format "0.0\n" to:iesFile
+        format "1000.0 800.0 600.0 200.0 0.0\n" to:iesFile
+        close iesFile
+
+        local pointLight = free_light()
+        pointLight.type = #Free_Point
+        pointLight.distribution = 3 -- web/IES
+        pointLight.webFile = iesPath
+
+        -- Surgical bound 1: distribution == WEB_DIST AND webFile set ->
+        -- shaping:ies:file IS authored with the resolved file path.
+        local exportPathWeb = output_prefix + "test_photometric_light_ies_file_web_export.usda"
+        USDExporter.ExportFile exportPathWeb exportOptions:exportOptions
+        local stageWeb = pyUsd.Stage.Open(exportPathWeb)
+        local usd_light_path = "/" + pointLight.name
+        local usdLightWeb = pyUsd.Prim.GetPrimAtPath stageWeb usd_light_path
+        local shapingAPIWeb = pyUsdLux.ShapingAPI(usdLightWeb)
+        local iesFileAttrWeb = shapingAPIWeb.GetShapingIesFileAttr()
+        assert_true (iesFileAttrWeb.IsAuthored()) message:(pointLight.name + " with distribution=Web AND webFile set should author shaping:ies:file")
+        local iesFileValueWeb = iesFileAttrWeb.Get()
+        -- USD reports SdfAssetPath; the resolved/absolute path string round-trips.
+        local iesFileAuthoredPath = iesFileValueWeb.path
+        assert_true (findString iesFileAuthoredPath "profile_audit.ies" != undefined) \
+            message:("shaping:ies:file expected to round-trip the .webFile asset path (audit IES filename); got: " + iesFileAuthoredPath)
+
+        -- Surgical bound 2: distribution != WEB_DIST -> shaping:ies:file
+        -- MUST NOT be authored, even though .webFile is still set on the
+        -- source light. The Max source preserves the picked file across
+        -- distribution toggles; it is only ACTIVE while distribution = WEB.
+        pointLight.distribution = 0 -- isotropic spherical
+        local exportPathIsotropic = output_prefix + "test_photometric_light_ies_file_isotropic_export.usda"
+        USDExporter.ExportFile exportPathIsotropic exportOptions:exportOptions
+        local stageIso = pyUsd.Stage.Open(exportPathIsotropic)
+        local usdLightIso = pyUsd.Prim.GetPrimAtPath stageIso usd_light_path
+        local shapingAPIIso = pyUsdLux.ShapingAPI(usdLightIso)
+        local iesFileAttrIso = shapingAPIIso.GetShapingIesFileAttr()
+        assert_false (iesFileAttrIso.IsAuthored()) \
+            message:(pointLight.name + " with distribution=Isotropic should NOT author shaping:ies:file even though .webFile is set (surgical bound: gate is on distribution first, not on webFile presence)")
+
+        -- Surgical bound 3: distribution == WEB_DIST AND .webFile is empty ->
+        -- shaping:ies:file MUST NOT be authored (no spurious empty asset path).
+        -- A second free_light constructed without a webFile (.webFile defaults
+        -- to undefined) confirms the asset-id check fires correctly.
+        local pointLightNoFile = free_light()
+        pointLightNoFile.type = #Free_Point
+        pointLightNoFile.distribution = 3 -- web/IES, but no file picked
+        local exportPathEmpty = output_prefix + "test_photometric_light_ies_file_empty_export.usda"
+        USDExporter.ExportFile exportPathEmpty exportOptions:exportOptions
+        local stageEmpty = pyUsd.Stage.Open(exportPathEmpty)
+        local usdLightEmptyPath = "/" + pointLightNoFile.name
+        local usdLightEmpty = pyUsd.Prim.GetPrimAtPath stageEmpty usdLightEmptyPath
+        local shapingAPIEmpty = pyUsdLux.ShapingAPI(usdLightEmpty)
+        local iesFileAttrEmpty = shapingAPIEmpty.GetShapingIesFileAttr()
+        assert_false (iesFileAttrEmpty.IsAuthored()) \
+            message:(pointLightNoFile.name + " with distribution=Web and NO webFile should NOT author shaping:ies:file (surgical bound: asset.GetId() != kInvalidId check)")
+
+        deleteFile iesPath
+    ),
+
+    -- MAX-LIT-002 surgical-preservation regression: pin both branches of
+    -- the useKelvin dichotomy in PhotometricLightWriter::Write (lines
+    -- 481-535 of PhotometricLightWriter.cpp, post-MAX-LIT-002 comment
+    -- block).
+    --
+    -- The existing static-frame happy-path test asserts that
+    -- enableColorTemperatureAttr is true/false but never the
+    -- colorTemperature VALUE, never the filter-only color signal under
+    -- useKelvin == true, never the combined-product color signal under
+    -- useKelvin == false, and never the out-of-range Kelvin clamp.
+    -- This test pins all four bounds.
+    function photometric_light_kelvin_filter_color_round_trip_test = (
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.RootPrimPath = "/"
+        exportOptions.Lights = true
+
+        local pointLight = free_light()
+        pointLight.type = #Free_Point
+        pointLight.distribution = 2 -- uniform hemispherical/diffuse
+
+        -- Light color and filter color are intentionally distinct AND
+        -- non-white so the difference between filter-only and combined-
+        -- product authoring is observable in the USD output.
+        pointLight.rgb = color 128 32 230            -- magenta-ish light color
+        pointLight.filterColor = color 255 230 191   -- warm-orange filter
+        pointLight.useKelvin = true
+        pointLight.kelvin = 3200.0
+
+        -- Surgical bound 1 (useKelvin == true):
+        --   * enableColorTemperatureAttr == true
+        --   * colorTemperatureAttr == 3200 (in-range, no clamp)
+        --   * inputs:color == filterColor ONLY (the magenta lightColor
+        --     is intentionally dropped)
+        local exportPathK = output_prefix + "test_photometric_light_kelvin_round_trip_export.usda"
+        USDExporter.ExportFile exportPathK exportOptions:exportOptions
+        local stageK = pyUsd.Stage.Open(exportPathK)
+        local usd_light_path = "/" + pointLight.name
+        local usdLightK = pyUsdLux.BoundableLightBase.Get stageK usd_light_path
+
+        local enableCTAttrK = usdLightK.GetEnableColorTemperatureAttr()
+        assert_true (enableCTAttrK.Get()) message:(pointLight.name + " useKelvin=true should set enableColorTemperatureAttr=true")
+        local colorTempAttrK = usdLightK.GetColorTemperatureAttr()
+        assert_true (colorTempAttrK.IsAuthored()) message:(pointLight.name + " useKelvin=true should author colorTemperatureAttr")
+        assert_float_equal 3200.0 (colorTempAttrK.Get()) message:(pointLight.name + " colorTemperatureAttr value should equal source kelvin (3200) when in [1000, 10000]")
+
+        -- inputs:color must be the FILTER colour only -- the magenta lightColor
+        -- must NOT be combined in on the useKelvin branch.
+        local colorAttrK = usdLightK.GetColorAttr()
+        local colorValueK = colorAttrK.Get()
+        local expectedFilterR = 255.0 / 255.0
+        local expectedFilterG = 230.0 / 255.0
+        local expectedFilterB = 191.0 / 255.0
+        assert_float_equal expectedFilterR colorValueK[1] message:(pointLight.name + " useKelvin=true: inputs:color R must be filterColor R only, not lightColor*filterColor")
+        assert_float_equal expectedFilterG colorValueK[2] message:(pointLight.name + " useKelvin=true: inputs:color G must be filterColor G only")
+        assert_float_equal expectedFilterB colorValueK[3] message:(pointLight.name + " useKelvin=true: inputs:color B must be filterColor B only")
+
+        -- Surgical bound 2 (useKelvin == false):
+        --   * enableColorTemperatureAttr == false
+        --   * colorTemperatureAttr NOT authored
+        --   * inputs:color == lightColor * filterColor (combined product;
+        --     intentionally lossy on round-trip)
+        pointLight.useKelvin = false
+        local exportPathNoK = output_prefix + "test_photometric_light_no_kelvin_round_trip_export.usda"
+        USDExporter.ExportFile exportPathNoK exportOptions:exportOptions
+        local stageNoK = pyUsd.Stage.Open(exportPathNoK)
+        local usdLightNoK = pyUsdLux.BoundableLightBase.Get stageNoK usd_light_path
+
+        local enableCTAttrNoK = usdLightNoK.GetEnableColorTemperatureAttr()
+        assert_false (enableCTAttrNoK.Get()) message:(pointLight.name + " useKelvin=false should set enableColorTemperatureAttr=false")
+
+        local colorAttrNoK = usdLightNoK.GetColorAttr()
+        local colorValueNoK = colorAttrNoK.Get()
+        local expectedCombinedR = (128.0 / 255.0) * (255.0 / 255.0)
+        local expectedCombinedG = (32.0  / 255.0) * (230.0 / 255.0)
+        local expectedCombinedB = (230.0 / 255.0) * (191.0 / 255.0)
+        assert_float_equal expectedCombinedR colorValueNoK[1] message:(pointLight.name + " useKelvin=false: inputs:color R must be lightColor R * filterColor R (combined)")
+        assert_float_equal expectedCombinedG colorValueNoK[2] message:(pointLight.name + " useKelvin=false: inputs:color G must be lightColor G * filterColor G (combined)")
+        assert_float_equal expectedCombinedB colorValueNoK[3] message:(pointLight.name + " useKelvin=false: inputs:color B must be lightColor B * filterColor B (combined)")
+
+        -- Surgical bound 3 (Kelvin clamp): out-of-range Kelvin is clamped
+        -- to [1000, 10000]. The original Max value is preserved in the
+        -- emitted Log::Warn message; here we only assert the USD value
+        -- is the clamped one.
+        pointLight.useKelvin = true
+        pointLight.kelvin = 12000.0  -- above USD spec max
+        local exportPathClampHi = output_prefix + "test_photometric_light_kelvin_clamp_high_export.usda"
+        USDExporter.ExportFile exportPathClampHi exportOptions:exportOptions
+        local stageClampHi = pyUsd.Stage.Open(exportPathClampHi)
+        local usdLightClampHi = pyUsdLux.BoundableLightBase.Get stageClampHi usd_light_path
+        local colorTempAttrClampHi = usdLightClampHi.GetColorTemperatureAttr()
+        assert_float_equal 10000.0 (colorTempAttrClampHi.Get()) message:(pointLight.name + " kelvin=12000 should be clamped to USD-spec max 10000 on export")
+
+        pointLight.kelvin = 500.0  -- below USD spec min
+        local exportPathClampLo = output_prefix + "test_photometric_light_kelvin_clamp_low_export.usda"
+        USDExporter.ExportFile exportPathClampLo exportOptions:exportOptions
+        local stageClampLo = pyUsd.Stage.Open(exportPathClampLo)
+        local usdLightClampLo = pyUsdLux.BoundableLightBase.Get stageClampLo usd_light_path
+        local colorTempAttrClampLo = usdLightClampLo.GetColorTemperatureAttr()
+        assert_float_equal 1000.0 (colorTempAttrClampLo.Get()) message:(pointLight.name + " kelvin=500 should be clamped to USD-spec min 1000 on export")
+    ),
+
     function photometric_point_light_attributes_export_test = (
         local exportOptions = USDExporter.CreateOptions()
         exportOptions.FileFormat = #ascii
@@ -1415,6 +1605,8 @@ struct export_light_test
     Tests = #(
         photometric_light_general_attributes_export_test,
         photometric_light_on_off_export_test,
+        photometric_light_ies_file_export_test,
+        photometric_light_kelvin_filter_color_round_trip_test,
         photometric_point_light_attributes_export_test,
         photometric_point_light_attributes_animation_export_test,
         photometric_sphere_light_attributes_export_test,

@@ -272,6 +272,47 @@ bool MaxUsdPhotometricLightWriter::Write(
         usdLightPrim.CreateNormalizeAttr().Set(true, pxr::UsdTimeCode::Default());
 
         // IES distribution is not animatable
+        //
+        // MAX-LIT-002 surgical bounds (negative cases, ALL must reach this
+        // block without authoring shaping:ies:file in the wrong state) --
+        // enforced by the regression suite via
+        // src/Tests/Integration/export_light_test.ms ::
+        //     photometric_light_ies_file_export_test
+        //                 (WEB_DIST + .webFile set -> shaping:ies:file authored
+        //                  with the resolved file path; subsequent re-export
+        //                  with distribution == ISOTROPIC -> shaping:ies:file
+        //                  MUST NOT be authored)
+        // plus the doc-linked Python validator
+        // validate_photometric_light_fidelity.py (8 cases + idempotence,
+        // mirrors this gate at the USD-side decision level):
+        //
+        //   * distribution != WEB_DIST: shaping:ies:file MUST NOT be
+        //     authored, regardless of whether the source light carries a
+        //     .webFile asset (Max preserves the picked file across
+        //     distribution toggles; it is only ACTIVE while distribution
+        //     == WEB_DIST). A regression that always-authored
+        //     shaping:ies:file whenever .webFile was non-empty would
+        //     produce a USD light that paradoxically carries both a
+        //     shape-driven distribution (e.g. spot's shaping:cone:angle)
+        //     AND an IES profile -- some renderers honour one and ignore
+        //     the other, producing source-renderer-dependent appearance.
+        //   * distribution == WEB_DIST AND asset.GetId() == kInvalidId
+        //     (the user picked "web/IES" distribution but never selected
+        //     a .ies file): shaping:ies:file MUST NOT be authored (no
+        //     spurious empty path). A regression that dropped the
+        //     asset-id check would emit shaping:ies:file = "" and most
+        //     renderers would silently fall back to the disk light's
+        //     default uniform pattern -- visually equivalent to no IES
+        //     authoring on Karma, but lethal for any consumer that
+        //     validates the asset path early (USDZ packagers, schema
+        //     validators, Omniverse asset-graph importers).
+        //   * The TODO on line 277 is a known limitation: the path is
+        //     authored as the asset's resolved-full-file-path (absolute
+        //     on the source machine). A pack-and-go USDZ + IES bundle
+        //     would need a separate pass to copy the .ies file alongside
+        //     the .usd and rewrite the path to relative form. The
+        //     audit's scope is to LOCK IN the current branch shape; the
+        //     pack-and-go improvement is tracked as a candidate mission.
         if (maxPhotometricLight->GetDistribution() == LightscapeLight::WEB_DIST) {
             // IES Light Profile file:
             // TODO: Consider exporting the IES File along with the data. For now, this references
@@ -478,6 +519,50 @@ bool MaxUsdPhotometricLightWriter::Write(
     }
 
     // Light color
+    //
+    // MAX-LIT-002 surgical bounds (the useKelvin dichotomy; both branches
+    // must reach the right UsdLux attribute combination or a downstream
+    // renderer silently produces the wrong-temperature illumination) --
+    // enforced by the regression suite via
+    // src/Tests/Integration/export_light_test.ms ::
+    //     photometric_light_kelvin_filter_color_round_trip_test
+    //                 (useKelvin=true  -> enable=true + ct=K + color=filter;
+    //                  useKelvin=false -> enable=false + NO ct + color=light*filter;
+    //                  out-of-range Kelvin -> clamped to [1000, 10000])
+    // plus the doc-linked Python validator
+    // validate_photometric_light_fidelity.py (8 cases + idempotence,
+    // including the two clamp edges):
+    //
+    //   useKelvin == true branch:
+    //   * enableColorTemperatureAttr is set to true on the first frame
+    //     above (line ~239). colorTemperatureAttr value is authored HERE
+    //     and inputs:color carries the FILTER COLOUR ONLY (the source
+    //     light's RGB component is intentionally dropped because the
+    //     spectrum is now driven by the blackbody temperature). A
+    //     regression that authored lightColor * filterColor here would
+    //     double-tint -- the renderer multiplies inputs:color by the
+    //     blackbody integrand, so a non-white RGB would shift the hue
+    //     away from the spectrum the artist asked for.
+    //   * colorTemperatureAttr value is clamped to [1000, 10000] (the
+    //     USD spec range) and a one-shot warning fires on clamp with
+    //     the original (unclamped) Kelvin value preserved in the
+    //     message. A regression that widened the range would produce
+    //     USD-invalid colorTemperature values that schema validators
+    //     reject and that some renderers extrapolate incorrectly past
+    //     the spec range.
+    //
+    //   useKelvin == false branch:
+    //   * enableColorTemperatureAttr is set to false on the first frame
+    //     above (line ~239). colorTemperatureAttr is NEVER authored on
+    //     this branch (the USD spec default of 6500 K is irrelevant
+    //     because the enable flag is off). inputs:color carries the
+    //     COMBINED PRODUCT lightColor * filterColor -- this is
+    //     intentionally lossy on round-trip (an importer cannot recover
+    //     which factor was the light and which was the filter) but
+    //     matches the renderer's expectation of a single RGB multiplier
+    //     when no blackbody is active. A regression that authored
+    //     either factor alone would silently drop the other half of the
+    //     colour signal.
     if (maxPhotometricLight->GetUseKelvin()) {
         // USD expects Kelvin range values from 1000 to 10000
         auto  colorTemperatureAttribute = usdLightPrim.CreateColorTemperatureAttr();
