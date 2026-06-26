@@ -77,17 +77,41 @@ bool MaxUsdCameraWriter::Write(
     const auto& displayTimeIndependentWarnings = time.IsFirstFrame();
 
     // Clipping range:
-    if (maxCamera->GetManualClip() != 0) {
+    // UsdGeomCamera defaults `clippingRange` to (1.0, 1000000.0) in scene units when the
+    // attribute is unauthored. At metersPerUnit != 1.0 (the Max default of 0.0254 / inches,
+    // or any centimetre / millimetre setup) that fallback yields an absurd near plane and a
+    // far plane in the kilometres -- silently. 3ds Max cameras always carry near/far clip
+    // distance values on every camera type (Free / Target / Physical), regardless of the
+    // "Clip Manually" toggle; the toggle only controls whether Max's *renderer* honours them.
+    // Author them either way so the USD file is unambiguous and downstream consumers
+    // (Karma, Storm, ARKit Quick Look, USDZ packagers) see an explicit, sensible range
+    // instead of falling back to (1, 1e6).
+    {
         float nearDistance = maxCamera->GetClipDist(timeVal, CAM_HITHER_CLIP);
         float farDistance = maxCamera->GetClipDist(timeVal, CAM_YON_CLIP);
 
-        if (nearDistance + FLT_EPSILON > FLT_MIN && farDistance + FLT_EPSILON > FLT_MIN) {
-            pxr::GfVec2f clippingRange { nearDistance, farDistance };
-            usdCamera.CreateClippingRangeAttr().Set(clippingRange, usdTimeCode);
+        // Sanity-clamp degenerate / uninitialised values to defaults in scene units.
+        // `!(x > y)` evaluates true for NaN, so the guards catch NaN/Inf in addition to
+        // non-positive / inverted ranges.
+        constexpr float kFallbackNear = 1.0f;
+        constexpr float kFallbackFar = 1000.0f;
+        if (!(nearDistance > 0.0f)) {
+            nearDistance = kFallbackNear;
+        }
+        if (!(farDistance > nearDistance)) {
+            farDistance = nearDistance + kFallbackFar;
         }
 
+        pxr::GfVec2f clippingRange { nearDistance, farDistance };
+        usdCamera.CreateClippingRangeAttr().Set(clippingRange, usdTimeCode);
+
 #ifdef USD_CURVES_SUPPORTED
-        if (GetExportArgs().GetAnimationType()
+        // Splines mode cannot animate clippingRange. Warn only when the user has manual
+        // clip enabled, because that is the only path that can carry animated near/far
+        // values from Max's UI; the auto-clip path emits a single static range and never
+        // engaged the warning historically.
+        if (maxCamera->GetManualClip() != 0
+            && GetExportArgs().GetAnimationType()
                 != MaxUsd::USDSceneBuilderOptions::AnimationType::TimeSamples
             && time.IsFirstFrame()) {
             MaxUsd::Log::Warn(

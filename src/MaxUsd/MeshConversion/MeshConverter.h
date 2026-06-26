@@ -235,6 +235,27 @@ protected:
         bool                                          animated);
 
     /**
+     * \brief Ensures the channel-1 UV primvar (default "st") exists on the given USD mesh.
+     * If `ApplyMaxMapChannels` already authored channel 1's primvar, this is a no-op.
+     * Otherwise, generates a top-down (XY) planar projection of the vertex positions
+     * normalized to the mesh's bounding box and writes it as the channel-1 primvar with
+     * vertex interpolation, so any texture-bearing material bound to the mesh has a
+     * deterministic UV stream to sample. Logs a warning so the artist knows to enable
+     * 'Generate Mapping Coords.' on the source object or apply a UVW Map modifier for
+     * accurate UVs. See MAX-GEO-004 in doc/translation-mapping.md.
+     * \param maxMesh The Max mesh to read vertex positions from.
+     * \param mesh The target USD mesh.
+     * \param options Mesh conversion options (used to look up which primvar name channel
+     * 1 is configured to write).
+     * \param timeCode The time code at which to author the primvar.
+     */
+    static void EnsureFallbackStPrimvar(
+        MaxUsd::MeshFacade&             maxMesh,
+        pxr::UsdGeomMesh&               mesh,
+        const MaxMeshConversionOptions& options,
+        const pxr::UsdTimeCode&         timeCode);
+
+    /**
      * \brief Resolves the target channels for the primvars of the given mesh. This takes care of incompatibilities
      * and potential conflicts. Following a call to this method, we have a clear idea of what
      * channel will host the data of what primvar for a specific mesh.
