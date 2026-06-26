@@ -38,8 +38,16 @@ const VtDictionary& MaxMeshConversionOptions::GetDefaultDictionary()
     static std::once_flag once;
     std::call_once(once, []() {
         defaultDict[MaxUsdMaxMeshConversionOptions->version] = 1;
+        // MAX-GEO-001: the historical default of `AsPrimvar` authored only
+        // `primvars:normals` and left the `UsdGeomMesh.normals` schema
+        // attribute unset. Some consumers (ARKit Quick Look, certain Hydra
+        // delegate configurations, lightweight scene-graph viewers) read the
+        // schema attribute first and silently fall back to recomputed face
+        // normals when it is absent, missing the authored vertex/faceVarying
+        // values. `Both` authors normals to both locations so the export is
+        // maximally compatible without forcing power users to choose.
         defaultDict[MaxUsdMaxMeshConversionOptions->normalMode]
-            = static_cast<int>(NormalsMode::AsPrimvar);
+            = static_cast<int>(NormalsMode::Both);
         defaultDict[MaxUsdMaxMeshConversionOptions->meshFormat]
             = static_cast<int>(MeshFormat::FromScene);
         defaultDict[MaxUsdMaxMeshConversionOptions->primvarLayoutInference]
