@@ -711,6 +711,77 @@ bool MeshConverter::ApplyMaxNormals(
     pxr::UsdTimeCode                timeCode,
     bool                            animated)
 {
+    // MAX-GEO-001: dual-author mesh normals to BOTH primvars:normals AND
+    // UsdGeomMesh.normals when NormalsMode::Both is selected (the new
+    // default). The primvar keeps its inferred indexed layout; the schema
+    // attribute receives the FLATTENED form of the same data since
+    // UsdGeomMesh.normals has no companion :indices sidecar. Both carriers
+    // share the same interpolation token so any consumer reading either
+    // location sees the same logical normals.
+    //
+    // Surgical bounds (negative cases, ALL must reach this function
+    // without authoring the wrong combination of carriers -- enforced
+    // by the regression suite via
+    // src/Tests/Integration/export_options_test.ms ::
+    //     test_normals_option                       (state-shape per mode)
+    //     test_normals_both_mode_dual_carrier_parity (parity invariants)
+    // plus the doc-linked Python validator
+    // validate_dual_normals_surgical.py (8 cases + idempotence):
+    //
+    //   State-shape bounds (original MAX-GEO-001 fix, 1ac2d1b):
+    //   * NormalsMode::None        -- explicit opt-out, no normals
+    //     authored at all (early return below). A regression that
+    //     confused #none with #asAttribute (similar enum value) would
+    //     silently start authoring the schema attribute on opt-out.
+    //   * NormalsMode::AsPrimvar   -- explicit user opt-in to primvar
+    //     only. The schema attribute MUST stay unauthored even when
+    //     #both is the new default. A regression that widened
+    //     writeSchemaAttr to always-true would silently flip this
+    //     user's choice (and any pipeline that depends on
+    //     primvar-only authoring).
+    //   * NormalsMode::AsAttribute -- explicit user opt-in to schema
+    //     only. Symmetric companion to the above.
+    //   * NormalsMode::Both        -- the new default; both carriers
+    //     authored from the same source data.
+    //   * NormalCount() == 0       -- source mesh has no normals;
+    //     early return BEFORE either carrier is touched. A regression
+    //     that pre-created the primvar via UsdGeomPrimvarsAPI before
+    //     this check fired would leave an empty primvar attribute
+    //     authored (HasAuthoredValue() true, value empty) which is
+    //     worse than absence -- consumers treat it as "the artist
+    //     explicitly authored no normals" rather than "compute them".
+    //   * _checkWriteAttribute() returns false on an animated export
+    //     because nothing dirty at this timecode -- early return
+    //     preserved.
+    //
+    //   Dual-carrier parity invariants (reinforcement, this commit):
+    //   * BOTH branches share dataLayout.GetInterpolation() from a SINGLE
+    //     computation. A regression that recomputed the schema layout
+    //     independently (e.g. hardcoded faceVarying "for safety") would
+    //     silently produce two carriers that DISAGREE on interpolation.
+    //     The original commit promised: "Both carry the same
+    //     interpolation token (constant / vertex / faceVarying) so any
+    //     consumer reading either location sees the same logical
+    //     normals." -- the dual-carrier-parity regression test pins it.
+    //   * The schema branch FORCES schemaLayout's indexed=false (see the
+    //     explicit construction below). A regression that fed the
+    //     primvar's `indexed=true` layout to PopulateAttribute for the
+    //     schema attribute would either author an illegal
+    //     `normals:indices` sidecar (the schema attribute is not a
+    //     primvar) or, more subtly, write the indexed-unique values to
+    //     the schema attribute without the index map -- a consumer
+    //     reading the schema attribute would see the wrong number of
+    //     normals for the interpolation and either error or index
+    //     incorrectly.
+    //   * primvar->SetIndices is invoked ONLY on the primvar branch.
+    //     The schema branch passes nullptr for the primvar pointer
+    //     and never touches an indices array.
+    //
+    // A future refactor that widens any of these gates would silently
+    // corrupt the dual-carrier guarantee MAX-GEO-001 set up. Both the
+    // .ms regression tests and the Python validator name the specific
+    // bound they exercise, so a regression in any branch fails with a
+    // useful, localised error.
     const auto normalMode = options.GetNormalMode();
     if (normalMode == MaxMeshConversionOptions::NormalsMode::None) {
         return false;

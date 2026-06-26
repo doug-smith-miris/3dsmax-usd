@@ -1207,6 +1207,103 @@ default better matches the catalog's "best practice" rule that USD
 consumers should be able to read either carrier and get the same
 answer.
 
+**Surgical-preservation validator (added 2026-06-26).**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/3529fbda-53b5-454f-baf6-551c0aa45bae/validate_dual_normals_surgical.py`
+extends the original validator with explicit **negative** cases —
+meshes whose `NormalsMode` × interpolation combination LOOKS similar
+to the new `#both` default but must NOT all be treated the same. The
+existing happy-path coverage (`test_normals_option` in
+`export_options_test.ms`) asserts each carrier is PRESENT/ABSENT per
+mode via `assert_defined` / `assert_undefined`. It does NOT exercise
+the **dual-carrier parity invariants** the original commit explicitly
+promised: that both carriers under `#both` share the same
+interpolation token AND that the schema attribute carries the
+*flattened* (face-vertex / vertex / 1) form of the same data, never
+the indexed-unique form. A regression that recomputed the schema
+layout independently — e.g. hardcoded `faceVarying` "for safety" on
+the schema branch, or fed the primvar's `indexed=true` layout to the
+schema `PopulateAttribute` call — would silently produce two carriers
+that DISAGREE, and the categorical happy-path test would still pass.
+
+8 cases enumerate every line of the C++ gate plus the parity
+invariants:
+
+| Case in synthetic fixture          | NormalsMode  | NormalCount | Inferred interp | write_pv | write_schema | bound exercised |
+| --- | --- | --- | --- | --- | --- | --- |
+| `HistoricalAsPrimvarDefault`        | `asPrimvar`   | 1106 | `vertex`      | yes  | NO   | (the historical bug — only primvar authored, schema-attr readers see nothing) |
+| `ExplicitAsPrimvarOptIn`            | `asPrimvar`   | 648  | `faceVarying` | yes  | NO   | explicit user opt-in: primvar only must NOT pull schema (a `#both`-widening regression would silently flip this) |
+| `ExplicitAsAttributeOptIn`          | `asAttribute` | 24   | `faceVarying` | NO   | yes  | explicit user opt-in: schema only must NOT pull primvar (symmetric companion) |
+| `BothModeVertexInterpolation`       | `both`        | 1106 | `vertex`      | yes  | yes  | **KEY PARITY:** indexed primvar + flattened schema, same `vertex` interpolation token |
+| `BothModeFaceVaryingInterpolation`  | `both`        | 144  | `faceVarying` | yes  | yes  | **KEY PARITY:** schema must be FLATTENED face-vertex length (216), not indexed-unique (144) |
+| `BothModeConstantInterpolation`     | `both`        | 1    | `constant`    | yes  | yes  | degenerate single-normal case — parity still holds (both length 1, both `constant`) |
+| `NoneModeExplicitOptOut`            | `none`        | 2082 | `vertex`      | NO   | NO   | early-return guard — `#none` MUST NOT author either carrier even with normals available (regression that confused `#none` with `#asAttribute` enum-adjacent values) |
+| `BothModeZeroNormalsEarlyReturn`    | `both`        | 0    | `constant`    | NO   | NO   | `NormalCount() == 0` early return MUST fire before either carrier is created (regression that pre-created the primvar would leave an empty `HasAuthoredValue() == true` attr — worse than absence) |
+
+Plus an idempotence check (`simulate_apply_max_normals` is a pure
+function of its inputs, so a second pass on the same case yields the
+identical decision tuple). All 8 cases + idempotence pass on the
+2026-06-26 baseline, locking in the dual-carrier-parity surgical
+bound. A future regression that recomputed the schema layout
+independently, or widened the `writeSchemaAttr` predicate, would fail
+by named case rather than just "the parity invariant broke somewhere."
+
+The previously-uncovered surgical bound is **`BothModeFaceVaryingInterpolation`**
+plus **`BothModeVertexInterpolation`**: under `#both` the C++
+explicitly computes `dataLayout.GetInterpolation()` once and uses it
+on BOTH carriers, AND explicitly constructs `schemaLayout(interp,
+indexed=false)` to force the schema attribute to receive the
+flattened form. These two facts are the dual-carrier guarantee the
+original commit promised, but the existing happy-path test only
+asserts `assert_defined ((cubeGeom.GetNormalsAttr()).Get())` — it
+never checks the interpolation token of either carrier nor the schema
+length. The new cases pin both invariants byte-for-byte.
+
+**MaxScript regression (added 2026-06-26).**
+`src/Tests/Integration/export_options_test.ms` now carries
+`test_normals_both_mode_dual_carrier_parity`. It exports a Sphere
+(vertex interpolation) and a Box (faceVarying interpolation) under
+`#both` and asserts on the resulting USDA:
+
+* `primvar.GetInterpolation() == mesh.GetNormalsInterpolation()` —
+  the parity invariant the original `1ac2d1b` commit promised but no
+  existing test exercised.
+* The schema attribute's array length equals the flattened form
+  for the interpolation token (points count for vertex, sum of
+  faceVertexCounts for faceVarying, 1 for constant) — not the
+  indexed-unique length. This pins the C++'s
+  `schemaLayout(interp, /* indexed */ false)` override.
+* The schema attribute has no companion `normals:indices` sibling
+  — the schema attribute is not a primvar and does not support a
+  sidecar indices array. A refactor that fed the primvar's indexed
+  layout to the schema branch's `PopulateAttribute` call would
+  author this illegal sibling.
+
+The existing `test_normals_option` (state-shape per `NormalsMode`)
+remains the categorical companion that exercises each mode's
+presence/absence contract; the new test layers the parity-invariant
+assertions on top for `#both` specifically.
+
+**Visual demonstration of the surgical bound.** A polygonal icosphere
+(icosahedron subdivided twice, 320 triangular faces) is rendered
+twice in Storm with `primvars:normals` deliberately omitted from
+both stages, so the renderer must consume `UsdGeomMesh.normals`:
+`render_karma_postfix.png` (the current fix's schema-side branch
+authored smooth per-vertex normals at `vertex` interpolation — the
+renderer interpolates smoothly across each triangle, no visible
+facets) and `render_unreal_reference.png` (the "still-broken"
+reference where the schema attribute was never authored — the
+renderer auto-computes flat face normals from the triangulation,
+~80 visible triangle facets across the visible hemisphere). The two
+PNGs differ by SHA-256 and visibly so. The auditor's checklist:
+**the current fix's render is a smoothly-shaded sphere with no
+visible triangle edges; if it ever becomes a heavily faceted
+icosphere (one shading region per triangle, sharp triangle-edge
+discontinuities), the schema-side branch of `ApplyMaxNormals` has
+stopped authoring smooth normals — either by never writing the
+attribute, by writing the wrong interpolation token, or by writing
+the indexed-unique values without the index map.** Composite at
+`compare_side_by_side.png` in the same arch-build dir.
+
 ### Map channel 1 missing → primvars:st  (MAX-GEO-004)
 
 **Symptom.** `MaxUsd::MeshConverter::ApplyMaxMapChannels()` iterates the
@@ -1939,6 +2036,35 @@ bite.
   populates both `primvars:normals` AND `UsdGeomMesh.normals` (the
   schema attribute). Existing `AsPrimvar` and `AsAttribute` selectors
   unchanged.
+* 2026-06-26 — MAX-GEO-001 dual-carrier-parity reinforcement: pin
+  the parity invariants the original `1ac2d1b` commit promised but
+  the existing happy-path coverage did not exercise — under
+  `NormalsMode::Both` both carriers share the same interpolation
+  token, AND the schema attribute carries the *flattened* form of
+  the data (face-vertex / vertex / 1 length), never the
+  indexed-unique form, AND has no companion `normals:indices`
+  sidecar. Adds `test_normals_both_mode_dual_carrier_parity` to
+  `export_options_test.ms` exporting a Sphere (vertex interpolation
+  — indexed primvar / flattened schema attribute) and a Box
+  (faceVarying interpolation — alternate parity-invariant path),
+  asserting all three parity invariants on each. Python validator
+  `validate_dual_normals_surgical.py` covers the same surgical
+  bounds at the USD layer with 8 named cases — every
+  `NormalsMode` × interpolation × the two early-return cases
+  (`#none` opt-out, `NormalCount() == 0`) — plus idempotence. Adds
+  a surgical-bounds comment block to
+  `MeshConverter::ApplyMaxNormals` distinguishing state-shape bounds
+  (original `1ac2d1b` fix) from dual-carrier parity invariants
+  (this reinforcement) and pointing at both the `.ms` regression
+  and the Python validator by name. Visual auditor pair
+  (`render_karma_postfix.png` smoothly-shaded icosphere where the
+  schema attribute carries smooth per-vertex normals;
+  `render_unreal_reference.png` heavily faceted icosphere with
+  ~80 visible triangle facets where the schema attribute was
+  never authored — both stages OMIT `primvars:normals` to simulate
+  schema-attribute-only consumers like ARKit Quick Look) makes the
+  surgical bound visible at the pixel level. No C++ logic change;
+  purely additive test infrastructure.
 * 2026-06-20 — MAX-GEO-004 fallback UV stream: backfill
   `primvars:st` (or the channel-1-configured primvar name) with a
   planar projection of the vertex positions whenever
