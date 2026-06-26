@@ -71,6 +71,8 @@ Status legend:
 | GeomSubset name for the null / non-Multi / unnamed-slot fallback path | `mat_{maxScriptId}` (single material) / `mat_{maxScriptId}_{subMtlName}` (multi w/o slot name) | cosmetic normalization | (Mesh / GeomSubset prim name; not a shader nodedef) | `MaterialUtils::CreateSubsetName` is invoked AND (the bound material is null/non-Multi OR the Multi/Sub-Object slot name is empty) | MAX-GEO-003 | 2026-06-20 |
 | 3ds Max camera Near Clip / Far Clip values (every camera type, regardless of "Clip Manually") | `UsdGeomCamera.clippingRange` | bug normalization | (camera schema attribute; not a shader nodedef) | `CameraWriter::Write` is invoked AND the camera object resolves as a `GenCamera` -- the writer now authors `clippingRange` unconditionally from `GetClipDist(...)` rather than gating on `GetManualClip() != 0`, with degenerate values (≤ 0, NaN, far ≤ near) sanity-clamped to `(1.0, 1000.0)` in scene units | (this PR) | 2026-06-20 |
 | 3ds Max system unit (Customize > Units Setup > System Unit Setup) | `UsdStage` `metersPerUnit` layer metadata | observability hint | (stage layer metadata; not a shader nodedef) | `USDSceneBuilder::BuildStage` is creating a new stage AND `GetSystemUnitScale(UNITS_METERS)` rounded to `digits10` is NOT exactly 1.0. The metersPerUnit value is still authored faithfully (USD-correct); a `MaxUsd::Log::Warn` is emitted naming the value, the implied 1-unit-to-meter factor, the downstream consumers that assume meters (Karma at 1:1, ARKit / Quick Look, Miris asset ingest, glTF), and both workarounds (set Max units to meters before export; or post-scale + rewrite metersPerUnit). The bound: a scene already in meters (`stageScale == 1.0`) stays silent | MAX-UNIT-001 | 2026-06-26 |
+| 3ds Max Photometric / Physical light `.webFile` (when `distribution == WEB_DIST`) | `UsdLuxShapingAPI.shaping:ies:file` (an `SdfAssetPath` carrying the resolved-full-file-path of the .ies profile) | direct pairing | (light shaping API attribute; not a shader nodedef) | `PhotometricLightWriter::Write` is invoked, `distribution == WEB_DIST` AND `asset.GetId() != kInvalidId`. Two surgical bounds: (a) distribution != WEB_DIST -> NOT authored even if `.webFile` is set on source (gate fires on distribution first); (b) WEB_DIST AND asset id == kInvalidId -> NOT authored (no spurious empty path). Known TODO at `PhotometricLightWriter.cpp:277`: the path is absolute on the source machine; pack-and-go USDZ + IES bundle is not yet supported | MAX-LIT-002 | 2026-06-26 |
+| 3ds Max Photometric / Physical light Kelvin + RGB filter color (Light > Color > Kelvin toggle, kelvin spinner, filter swatch, RGB swatch) | `UsdLux.enableColorTemperatureAttr` + `colorTemperatureAttr` + `inputs:color` -- dichotomous: `useKelvin = true` writes the blackbody temperature + filter-only color; `useKelvin = false` writes the lightColor x filterColor combined product with the blackbody enable off | direct pairing | (UsdLux base-light schema; not a shader nodedef) | `PhotometricLightWriter::Write` is invoked, always (the dichotomy fires per-light per-export). Surgical bounds: (a) useKelvin -> enable=true + ct=clamped-K + color=filter (NOT lightColor combined; would double-tint the renderer's blackbody integrand); (b) !useKelvin -> enable=false + NO ct authored + color=lightColor*filter (intentionally lossy on round-trip); (c) out-of-range K -> clamped to [1000, 10000] with a one-shot Log::Warn that preserves the original value in the message | MAX-LIT-002 | 2026-06-26 |
 
 ## Notes per expression
 
@@ -1894,6 +1896,258 @@ by `stageScale` — but that's a separate workflow change with UI and
 binding implications, deliberately out of scope for this observability
 bite.
 
+### Photometric / Physical light `.webFile` → UsdLuxShapingAPI.shaping:ies:file  (MAX-LIT-002, IES branch)
+
+**Symptom (covered before the audit, but uncovered by the suite).**
+3ds Max Photometric (Free / Target) and Physical lights expose a
+`distribution` parameter with four values: ISOTROPIC (0), SPOTLIGHT (1),
+DIFFUSE (2), and WEB (3). When the artist picks WEB they can additionally
+pick a `.webFile` — an IESNA LM-63 profile that the renderer uses to
+modulate the light's far-field intensity distribution (the classic "IES
+profile" used in architectural visualisation: real fixtures shipped with
+manufacturer-supplied .ies files capturing their exact light
+distribution).
+
+`PhotometricLightWriter::Write` (lines 274–288, post-MAX-LIT-002 comment
+block) translates this directly to `UsdLuxShapingAPI.shaping:ies:file`:
+
+```cpp
+if (maxPhotometricLight->GetDistribution() == LightscapeLight::WEB_DIST) {
+    AssetUser asset = maxPhotometricLight->GetWebFile();
+    if (asset.GetId() != kInvalidId) {
+        pxr::UsdLuxShapingAPI usdLightShape(usdLightPrim);
+        pxr::SdfAssetPath assetFullPath(asset.GetFullFilePath().ToUTF8().data());
+        usdLightShape.CreateShapingIesFileAttr().Set(
+            assetFullPath, pxr::UsdTimeCode::Default());
+    }
+}
+```
+
+The translation is a **direct pairing**: the resolved IES file path
+flows verbatim into the `SdfAssetPath` Karma, Storm, Arnold's USD
+delegate, and Cycles' USD loader all honour. No transformation, no
+attribute renaming, no value clamping.
+
+**Why this audit pins it.** The existing happy-path suite
+(`export_light_test.ms`, lines 260, 364, 483, 616, 716, 873) toggles
+`distribution = 3` (web/IES) on every photometric light-type test —
+point / sphere / disk / line / cylinder / rectangle — but the tests
+NEVER set `.webFile`. They only assert that the right `UsdLux*` prim
+type is created (DiskLight under web-on-point, etc). The entire
+`shaping:ies:file` authoring branch is uncovered. A regression that:
+
+* Dropped the `asset.GetId() != kInvalidId` check — would emit
+  `shaping:ies:file = ""` and most renderers would silently fall back
+  to the disk light's default uniform pattern. Visually equivalent to
+  no IES authoring on Karma, but lethal for any consumer that
+  validates the asset path early (USDZ packagers, schema validators,
+  Omniverse asset-graph importers).
+* Always-authored `shaping:ies:file` when `.webFile` was non-empty
+  (regardless of distribution) — would produce a USD light that
+  paradoxically carries both a shape-driven distribution (a spot's
+  `shaping:cone:angle`, an isotropic sphere's omni emission) AND an
+  IES profile. Some renderers honour one and ignore the other,
+  producing source-renderer-dependent appearance.
+* Re-routed the path through some other resolver — would produce a
+  path string that no longer round-trips through `usdview`, `husk`,
+  or any pack-and-go tool.
+
+…would pass the existing suite because no test ever inspects
+`shaping:ies:file` on the resulting USD.
+
+**Bounds (where the gate conservatively does nothing):**
+
+* `distribution != WEB_DIST` — even if `.webFile` is set on the source
+  light (Max preserves the picked file across distribution toggles;
+  it is only ACTIVE while distribution == WEB_DIST), `shaping:ies:file`
+  MUST NOT be authored.
+* `distribution == WEB_DIST` AND `asset.GetId() == kInvalidId` (the
+  user picked web distribution but never selected a `.ies` file) —
+  `shaping:ies:file` MUST NOT be authored.
+
+**Known limitation (logged but not in scope for this audit).** The path
+is authored as the asset's resolved-full-file-path (absolute on the
+source machine). The TODO at `PhotometricLightWriter.cpp:277` flags
+this — a pack-and-go USDZ + IES bundle would need a separate pass to
+copy the .ies file alongside the .usd and rewrite the path to relative
+form. The audit's scope is to **lock in the current branch shape**;
+the pack-and-go improvement is tracked as a candidate mission.
+
+**Validator.**
+`/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/d0c69786-3afa-4669-a81c-47caab95e95b/validate_photometric_light_fidelity.py`
+mirrors the C++ decision at the USD-side level for BOTH the IES and
+Kelvin branches. 4 of its 8 cases pin the IES branch:
+
+| Case in synthetic fixture       | distribution | webFile asset valid | shaping:ies:file authored? | bound exercised |
+| --- | --- | --- | --- | --- |
+| `IsotropicNoIesAuthored`         | ISOTROPIC    | no   | no   | distribution != WEB_DIST short-circuits the gate |
+| `WebDistWithValidIesAsset`       | WEB_DIST     | yes  | yes (= path) | the happy path: both gates pass |
+| `WebDistWithoutWebFileSet`       | WEB_DIST     | NO   | no   | WEB_DIST + invalid asset id MUST suppress shaping:ies:file (no spurious empty path) |
+| `SpotDistAuthorsConeAngleNotIes` | SPOTLIGHT    | yes (but ignored) | no | even with .webFile populated, distribution=spot uses the cone-angle branch and ignores the IES asset entirely |
+
+Plus an idempotence check (the simulator is a pure function of its
+inputs). All cases pass on the 2026-06-26 baseline.
+
+**MaxScript regression.**
+`src/Tests/Integration/export_light_test.ms` now carries
+`photometric_light_ies_file_export_test`. It synthesizes a minimal
+IESNA LM-63 profile in the temp dir, creates a `Free_Point` light with
+`distribution = 3` (web/IES) AND `.webFile = <synthetic IES path>`,
+exports, and asserts `shaping:ies:file` is authored on the resulting
+USD light with a path containing the .ies filename. Then it
+re-exports the same light with `distribution = 0` (isotropic) and
+asserts `shaping:ies:file` is NOT authored — pinning the
+distribution-gate surgical bound. Then it creates a second
+`Free_Point` with `distribution = 3` but no `.webFile`, exports, and
+asserts `shaping:ies:file` is NOT authored — pinning the asset-id
+surgical bound.
+
+### Photometric / Physical light Kelvin + filter color → UsdLux color attrs  (MAX-LIT-002, Kelvin branch)
+
+**Symptom (covered before the audit, but uncovered by the suite).**
+3ds Max Photometric and Physical lights expose two parallel colour
+controls:
+
+* The **light colour** (Light > Color > RGB swatch) — an arbitrary RGB
+  tint multiplier.
+* The **filter colour** (Light > Color > Filter Color swatch) — a
+  second arbitrary RGB tint applied "after" the light colour to
+  simulate gels / filters.
+* A **Kelvin toggle** (Light > Color > Kelvin checkbox) that switches
+  the light colour from RGB to a blackbody-temperature value (the
+  spinner below).
+
+`PhotometricLightWriter::Write` (lines 481–535, post-MAX-LIT-002
+comment block) translates this dichotomously to UsdLux's
+`enableColorTemperatureAttr` + `colorTemperatureAttr` + `inputs:color`:
+
+```cpp
+if (maxPhotometricLight->GetUseKelvin()) {
+    colorTemperatureAttribute.Set(clamp(kelvin, 1000, 10000));    // (1)
+    if (originalKelvin != clamped) MaxUsd::Log::Warn(...);        // (2)
+    Point3 filter = maxPhotometricLight->GetRGBFilter(timeVal);
+    usdLightPrim.CreateColorAttr().Set(filter);                   // (3) filter ONLY
+} else {
+    Point3 combined = maxPhotometricLight->GetRGBColor(timeVal)
+                    * maxPhotometricLight->GetRGBFilter(timeVal);
+    usdLightPrim.CreateColorAttr().Set(combined);                 // (4) lightColor * filter
+}
+```
+
+Plus the first-frame setup at line ~239 that authors
+`enableColorTemperatureAttr = useKelvin`.
+
+The translation is a **direct pairing** for both halves of the
+dichotomy:
+
+* **useKelvin == true** → `enableColorTemperature = true`,
+  `colorTemperature = clamp(kelvin, 1000, 10000)`,
+  `inputs:color = filterColor` (the light's RGB component is
+  intentionally DROPPED because the spectrum is now driven by Kelvin;
+  the renderer multiplies `inputs:color` by the blackbody integrand,
+  so a non-white RGB would shift the hue away from the spectrum the
+  artist asked for).
+* **useKelvin == false** → `enableColorTemperature = false`,
+  `colorTemperature` NOT authored (the USD-spec default of 6500 K is
+  irrelevant because the enable flag is off),
+  `inputs:color = lightColor × filterColor` (the combined product —
+  intentionally lossy on round-trip, an importer cannot recover which
+  factor was the light and which was the filter, but matches the
+  renderer's expectation of a single RGB multiplier when no blackbody
+  is active).
+
+**Why this audit pins it.** The existing happy-path suite
+(`photometric_light_general_attributes_export_test`,
+`photometric_point_light_attributes_animation_export_test`) asserts
+that `enableColorTemperatureAttr` is true/false on certain mode
+toggles but NEVER:
+
+* the actual `colorTemperatureAttr` VALUE in static-frame export
+  (the animation test only checks values inside an animation range);
+* that `inputs:color` carries the FILTER COLOUR ONLY under
+  `useKelvin == true` (it would silently pass if a regression
+  authored `lightColor × filterColor` here too, because the test
+  doesn't compare against `lightColor`);
+* that `inputs:color` carries the COMBINED PRODUCT under
+  `useKelvin == false` (a regression that authored only one of the
+  two factors would pass);
+* that out-of-range Kelvin is CLAMPED to `[1000, 10000]` rather than
+  passed through (the renderer might silently extrapolate past spec
+  or reject the value entirely).
+
+A regression that flipped any of those branches would silently
+produce a USD light whose appearance diverges from the source Max
+scene — the existing happy-path tests would still pass.
+
+**Bounds (where the gate conservatively does nothing):**
+
+* `useKelvin == true`, `kelvin ∈ [1000, 10000]` — no clamp warning;
+  `colorTemperature` is authored verbatim.
+* `useKelvin == false` — `colorTemperatureAttr` is never created on
+  this branch (it would be wrong to author 6500 K as the "default" —
+  that's the renderer's default when enable is on, not when it's off).
+* The clamping is one-sided: a warning fires on clamp but the original
+  Max value is preserved in the message string (the artist can
+  re-tune by knowing what they asked for).
+
+**Validator.**
+The same `validate_photometric_light_fidelity.py` covers the Kelvin
+branch with 4 cases:
+
+| Case in synthetic fixture       | useKelvin | kelvin | filterColor | lightColor | enable | ct | inputs:color | bound exercised |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `KelvinEnabledFilterOnlyColor`   | true   | 3200  | (1.0, 0.6, 0.3) | (0.5, 0.2, 0.9) | true  | 3200  | (1.0, 0.6, 0.3) -- filter ONLY | the magenta lightColor must NOT contaminate inputs:color |
+| `KelvinDisabledCombinedColor`    | false  | (n/a) | (1.0, 0.8, 0.4) | (0.5, 1.0, 0.5) | false | NONE  | (0.5, 0.8, 0.2) -- combined | colorTemperatureAttr MUST NOT be authored; inputs:color MUST be the combined product |
+| `KelvinClampedHigh`              | true   | 12000 | (1, 1, 1)       | (1, 1, 1)       | true  | 10000 | (1, 1, 1) | clamp + one-shot warn |
+| `KelvinClampedLow`               | true   | 500   | (1, 1, 1)       | (1, 1, 1)       | true  | 1000  | (1, 1, 1) | symmetric clamp + one-shot warn |
+
+Plus the same idempotence check. All cases pass on the 2026-06-26
+baseline.
+
+**MaxScript regression.**
+`photometric_light_kelvin_filter_color_round_trip_test` (new in
+`export_light_test.ms`) constructs a `Free_Point` with
+`useKelvin = true`, `kelvin = 3200`, `rgb = magenta-ish`,
+`filterColor = warm orange`, exports, and asserts (a)
+`enableColorTemperatureAttr = true`, (b) `colorTemperatureAttr = 3200`,
+(c) `inputs:color` matches `filterColor / 255` channel-by-channel
+(NOT `lightColor × filterColor`). Then flips `useKelvin = false`,
+re-exports, and asserts (a) `enableColorTemperatureAttr = false`,
+(b) `inputs:color` matches `(lightColor × filterColor) / 255²`
+channel-by-channel (the combined product). Then flips `useKelvin =
+true` again with `kelvin = 12000` and asserts the exported
+`colorTemperatureAttr = 10000` (clamp); and `kelvin = 500` clamps to
+`1000`.
+
+**Visual demonstration of the surgical bound.** Two `UsdLuxDiskLight`s
+side-by-side, lighting a grey wall, each carrying `inputs:color =
+filterColor` and `enableColorTemperatureAttr = true` with
+`colorTemperatureAttr = 2700 K` (warm tungsten) on the left and
+`colorTemperatureAttr = 9000 K` (cool daylight) on the right.
+`render_karma_postfix.png` shows two clearly-distinct pools — warm
+orange on the left, cool azure on the right — the blackbody contrast
+reads as tungsten-vs-daylight at a glance.
+`render_unreal_reference.png` is the same scene with the
+`colorTemperatureAttr` and `enableColorTemperatureAttr` STRIPPED —
+the blackbody contribution is gone and the two pools collapse to
+faint near-neutral cream / pale-blue (just the subtle filter
+contribution survives). The auditor's checklist: **the current fix's
+render shows two distinct warm + cool pools; if both pools collapse
+to faint near-neutral tints, the Kelvin branch has regressed.** The
+composite at `compare_side_by_side.png` makes the contrast
+unambiguous; the two PNGs are SHA-256-distinct.
+
+**Retirement condition.** Not a workaround for an external bug — the
+existing code is correct. The dichotomy is permanent: `useKelvin`
+toggles the spectrum source between blackbody temperature (with
+filter) and explicit RGB (combined with filter), and the writer
+respects both branches. A future bite could improve the lossy
+round-trip on the `!useKelvin` branch (e.g. author
+`lightColor` as `inputs:color` and `filterColor` as
+`UsdLuxColorTemperatureFilter` schema once such a schema exists — the
+USD spec does not currently offer one). Until then, the combined
+product is the right call.
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -2215,3 +2469,57 @@ bite.
   SHA-256-distinct. Introduces a new "observability hint" Kind in
   the Status table for future export-time warnings that don't
   rewrite values.
+* 2026-06-26 — MAX-LIT-002 photometric-light fidelity audit: add the
+  first MAX-LIT entry to the mapping doc, covering BOTH the IES
+  profile authoring branch and the Kelvin / filter-color dichotomy in
+  `PhotometricLightWriter::Write`. The existing happy-path suite
+  (`export_light_test.ms`) toggles `distribution = 3` (web/IES) on
+  every photometric light-type test but never sets `.webFile`, so the
+  entire `shaping:ies:file` authoring branch is uncovered; it asserts
+  `enableColorTemperatureAttr` is true/false but never the
+  `colorTemperatureAttr` value in static-frame export, never the
+  filter-only color signal under `useKelvin == true`, never the
+  combined-product color signal under `useKelvin == false`, and never
+  the out-of-range Kelvin clamp. This audit pins all surgical bounds.
+  Adds two MaxScript regressions to `export_light_test.ms`:
+  `photometric_light_ies_file_export_test` (synthesizes a minimal
+  IESNA LM-63 profile in the temp dir, exports under `distribution =
+  WEB_DIST`, asserts `shaping:ies:file` is authored; re-exports under
+  `distribution = ISOTROPIC`, asserts it is NOT authored even though
+  `.webFile` is still set; constructs a second light under WEB_DIST
+  but no `.webFile`, asserts `shaping:ies:file` is NOT authored — all
+  three surgical bounds in the IES branch) and
+  `photometric_light_kelvin_filter_color_round_trip_test` (constructs
+  a light with `useKelvin = true`, magenta `rgb`, warm-orange
+  `filterColor`, kelvin=3200; asserts enable=true, ct=3200,
+  inputs:color = filter only — NOT the combined product; flips
+  `useKelvin = false`, asserts enable=false, no ct authored,
+  inputs:color = lightColor * filterColor combined; flips kelvin to
+  12000 and 500 and asserts clamp to 10000 and 1000 respectively).
+  Adds two surgical-bounds comment blocks to
+  `PhotometricLightWriter.cpp` — one over the WEB_DIST branch
+  enumerating the distribution and asset-id gates, one over the
+  Kelvin dichotomy enumerating both halves of the
+  `enable`/`colorTemperature`/`inputs:color` contract — each pointing
+  back to the named MaxScript regression and the Python validator.
+  Python validator
+  (`validate_photometric_light_fidelity.py`, 8 cases + idempotence)
+  mirrors the C++ decision over a synthetic fixture covering both
+  branches: 4 cases for the IES gate (isotropic-no-IES,
+  web-with-valid-asset, web-without-webFile, spot-authors-cone-not-IES)
+  and 4 for the Kelvin dichotomy (filter-only color, combined-product
+  color, clamp-high, clamp-low). Visual auditor pair
+  (`render_karma_postfix.png` two clearly-distinct pools — warm
+  orange 2700K + cool azure 9000K — on a grey wall, blackbody
+  contrast reads as tungsten-vs-daylight at a glance;
+  `render_unreal_reference.png` the same scene with
+  `colorTemperatureAttr` + `enableColorTemperatureAttr` stripped —
+  the blackbody contribution is gone and both pools collapse to
+  faint near-neutral cream / pale-blue from the residual filter
+  tint) makes the Kelvin surgical bound visible at the pixel level
+  (Karma 21.0.700's IES support varies, so the visual demonstration
+  focuses on the more reliably-renderable Kelvin observable; the
+  Python validator covers BOTH branches). No C++ logic change in
+  this bite — the audit is purely additive observability + test +
+  doc infrastructure that locks in the two existing surgical
+  guarantees.
