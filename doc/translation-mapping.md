@@ -76,6 +76,7 @@ Status legend:
 | 3ds Max export of any stage to a path with extension `.usdz` (UI Save As… "USDZ", MaxScript `exportFile foo.usdz`, `3dsmaxbatch ... -export foo.usdz`) | Single .usdz zip archive containing the root layer + every external asset (textures, sublayer references) reachable from the stage. ARKit-strict mode flattens sublayers and bundles one .usdc root | observability + audit (lock-in for proposed in-process packaging swap) | (zip archive structure; not a shader nodedef or USD prim schema) | `USDIOController::Export` (and `USDSceneController::Export`) sees `stageExportExtension == ".usdz"`. Today: routes through `MaxUsd::UsdToolsUtils::RunUsdZip` which spawns `cmd.exe -> powershell.exe -> python.exe -> usdzip` (four nested processes; PowerShell `Restricted` ExecutionPolicy / missing `HKLM:\SOFTWARE\Autodesk\3dsMax\*` registry entries / `CreateProcess + SW_HIDE` under a service account all break it silently). Proposed (MAX-PKG-001 follow-on): replace with `pxr::UsdUtilsCreateNewUsdzPackage(SdfAssetPath(tempUsd), filePath)` called in-process from the same function. The audit pins nine surgical bounds the in-process replacement preserves -- see Notes per expression for the full case list | MAX-PKG-001 | 2026-06-26 |
 | 3ds Max OpenPBR material (`OpenPBR()`, Max 2025.3+) exported via the MaterialX target | `ND_open_pbr_surface_surfaceshader` shader prim (MaterialX 1.39 OpenPBR Surface v1.1) -- NOT touched by any of the five MAX-MAT-001/002/004/005/006 normalization passes. The passes are gated `doc->getNodes("standard_surface")` and skip the OpenPBR shader entirely | audit (lock-in of existing surgical-coverage bound, no C++ logic change) | `ND_standard_surface_surfaceshader` (the audit pins the surgical bound where the passes STOP) | `MtlxShaderWriter::Write` is invoked on an OpenPBR-bound material. Surgical bounds: (a) every existing MAX-MAT-* pass iterates `doc->getNodes("standard_surface")`, returning an empty list when the shader's MaterialX node category is `open_pbr_surface`; (b) name-collision-named inputs (`coat_color`, `subsurface_color`, `specular_color`, `transmission_color` -- all color3, plus `subsurface_radius` which on open_pbr_surface is type=`float` rather than `color3` as on standard_surface) survive verbatim, including artist-authored `subsurface_color = (1, 1, 1)` which would visually shift to the OpenPBR default `(0.8, 0.8, 0.8)` if the passes were widened; (c) renamed gate inputs (`coat_weight` -> standard_surface `coat`; `subsurface_weight` -> `subsurface`; `transmission_weight` -> `transmission`; `coat_ior` -> `coat_IOR`; `specular_ior` -> `specular_IOR`; `emission_luminance` -> `emission`; `specular_roughness_anisotropy` -> `specular_anisotropy`) are likewise untouched; (d) idempotence -- a second run of the pass chain on the same exported doc does nothing more than the first | MAX-MAT-007 | 2026-06-26 |
 | Color / emission helper code in the MaterialX writer (`MtlxShaderWriter.cpp` post-parse normalization passes) vs the UsdPreviewSurface writer (C++ `LastResortUSDPreviewSurfaceWriter.cpp` + Python `DefaultShaderWriter` in `shaderWriter.py`) | NO shared helper, by design. The 5 MaterialX-side passes (specular_rotation, emission default, coat-block, subsurface_radius, spec-default inputs) operate on a `MaterialX::DocumentPtr` and gate on `doc->getNodes("standard_surface")`. The UsdPreviewSurface writer path operates either directly on a `Mtl*` (LastResort C++) or via the `.material_conversion` JSON tables (Python DefaultShaderWriter) -- it has no MaterialX document, no emission-strip helpers, and no shared abstraction with the MaterialX writer | audit (lock-in of existing cross-writer-path bound, no C++ logic change) | `ND_standard_surface_surfaceshader` only (the audit pins the surgical bound between the MaterialX writer's normalizer chain and the UsdPreviewSurface writer path) | `MtlxShaderWriter::Write` runs the chain of normalizers. Surgical bounds: (a) the chain operates on the in-memory MaterialX doc returned by `MtlxIOUtil.ExportMtlxString` and writes nothing to UsdShade until AFTER the chain completes; (b) the UsdPreviewSurface writer entry points (`LastResortUSDPreviewSurfaceWriter::Write` and the Python `DefaultShaderWriter.Write`) do not invoke, import, or share state with the MaterialX normalizers; (c) input vocabularies diverge on every concept the planner's "color-emission helper" could cover -- emissiveColor (UsdPS, color3f default (0,0,0)) vs emission + emission_color (MaterialX, scalar default 0.0 gating color3 default (1,1,1)); diffuseColor (UsdPS, color3f default (0.18,0.18,0.18)) vs base + base_color (MaterialX, scalar default 0.8 gating color3 default (0.8,0.8,0.8)); specularColor (UsdPS) + useSpecularWorkflow toggle vs specular + specular_color (MaterialX); plus topology-collisions (UsdPS opacity is float, MaterialX opacity is color3) and UsdPS-only inputs with no MaterialX analogue (useSpecularWorkflow, direct normal3f normal input); (d) idempotence -- re-running the 5 normalizers does not change behaviour on either side | MAX-PRIM-001 | 2026-06-26 |
+| MultiMtl-bound mesh whose faces carry multiple matIds (`materialIdToFacesMap.size() > 1`) | `UsdGeomMesh.primvars:displayColor` -- the MAX-MAT-003 displayColor block writes a SINGLE-element constant primvar derived from `boundMtl->GetDiffuse()` (which on a MultiMtl returns sub-material 0's diffuse via the default `mtlNum = 0`). The block does NOT consult `materialIdToFacesMap` and does NOT broadcast `boundMtl->GetDiffuse(matId)` per face | audit (lock-in of existing MAX-MAT-003 surgical-coverage bound, no C++ logic change) | (mesh primvar; not a shader nodedef -- the audit pins the surgical bound where the MAX-MAT-003 gate STOPS for MultiMtl-bound meshes) | `MeshConverter::ConvertToUSDMesh` is invoked on a mesh whose `node->GetMtl()` is a MultiMtl AND `materialIdToFacesMap.size() > 1`. Surgical bounds: (a) the displayColor block's `boundMtl->GetDiffuse()` call defaults `mtlNum = 0` and returns sub-mtl 0's diffuse, regardless of how many matIds the mesh carries; (b) the resulting `primvars:displayColor` is a SINGLE-element array with `interpolation = constant` -- the C++ block does not consume `materialIdToFacesMap` even though `ApplyMaxMaterialIDs` (called immediately before the block) does use it to author per-face GeomSubsets in the `materialBind` family (MAX-GEO-002); (c) a wildcard "extend MAX-MAT-003 to per-face for MultiMtl bindings" widening would consume the same `materialIdToFacesMap` to broadcast `boundMtl->GetDiffuse(matId)` per face, authoring `interpolation = uniform` and `len = materialIdToFacesMap.size()` -- the value at `displayColor[0]` would still be sub-mtl 0's diffuse, so every existing displayColor[0] / branch-label / IsAuthored assertion would pass; only the array-length and interpolation invariants catch this widening; (d) the IsAuthored() short-circuit and the wire-color fallback branches are unchanged on the MultiMtl path -- the bound applies only to the `mtl-diffuse` branch when the bound material is a MultiMtl | MAX-MAT-008 | 2026-06-26 |
 
 ## Notes per expression
 
@@ -2739,6 +2740,246 @@ this audit entry stays as the structural contract; the changelog gains a
 "MAX-PKG-001 in-process swap landed" bullet and the test suite continues
 to assert the same observable structure.
 
+### MultiMtl-bound mesh with multiple matIds → primvars:displayColor stays single-element constant (audit, MAX-MAT-003 STOPS HERE for per-face)  (MAX-MAT-008)
+
+**Symptom.** The 3ds Max `Mtl::GetDiffuse(int mtlNum = 0, BOOL backFace =
+FALSE)` SDK accessor is what the MAX-MAT-003 displayColor block in
+`src/MaxUsd/MeshConversion/MeshConverter.cpp` calls to derive
+`primvars:displayColor` when a material is bound:
+
+```cpp
+if (!usdMesh.GetDisplayColorAttr().IsAuthored()) {
+    Color displayColorSrc;
+    if (Mtl* boundMtl = node->GetMtl()) {
+        displayColorSrc = boundMtl->GetDiffuse();   // <-- default mtlNum = 0
+    } else {
+        displayColorSrc = Color(node->GetWireColor());
+    }
+    pxr::VtVec3fArray usdDisplayColor = { pxr::GfVec3f(
+        displayColorSrc.r, displayColorSrc.g, displayColorSrc.b) };
+    usdMesh.CreateDisplayColorAttr().Set(usdDisplayColor);
+}
+```
+
+On a single Mtl `GetDiffuse()` returns the material's own diffuse. On a
+**MultiMtl** the default `mtlNum = 0` makes it return **sub-material 0's
+diffuse only**. The `boundMtl->GetDiffuse(matId)` per-face broadcast that
+the planner's auto-emitted bite
+(`max-mat-004-multimtl-per-face-displaycolor`, rationale "Per-face
+primvars:displayColor for MultiMtl bindings") would introduce does NOT
+happen: the writer's `materialIdToFacesMap` is already built and consumed
+by `ApplyMaxMaterialIDs` above to author per-face GeomSubsets (MAX-GEO-002),
+but the displayColor block deliberately ignores that data and writes a
+single-element constant primvar from sub-mtl 0's diffuse.
+
+The audit's job is to **lock that surgical-coverage bound in with negative-
+test coverage** -- no C++ logic change. The Mac cannot build, so any
+wildcard "extend MAX-MAT-003 to per-face for MultiMtl bindings" PR would
+ship unverified C++ that silently mutates the primvar's shape on every
+export of every MultiMtl-bound mesh -- changing
+`primvars:displayColor` from a length-1 constant primvar to a length-N
+uniform primvar, breaking the third-reinforcement primvar-shape invariants
+(MAX-MAT-003) and the `usdview` / ARKit Quick Look / minimal-Hydra
+displayColor-fallback consumer path the original MAX-MAT-003 fix was
+designed to repair.
+
+**Why it matters.** The audit's primary visible bound:
+
+| Aspect              | Current MAX-MAT-003 gate     | Per-face widening counterfactual |
+| --- | --- | --- |
+| primvar name        | `displayColor`               | `displayColor` (collision) |
+| component type      | `color3f[]`                  | `color3f[]` (collision) |
+| **interpolation**   | **`constant`**               | **`uniform`** |
+| **array length**    | **1**                        | **N = `materialIdToFacesMap.size()`** |
+| diffuse source      | `boundMtl->GetDiffuse()` (= sub-mtl 0 via default `mtlNum = 0`) | `multimtl->GetDiffuse(matId)` per face |
+| reads matId map     | NO -- block has no dependency on `materialIdToFacesMap` | yes -- block would consume the map directly |
+| `displayColor[0]`   | sub-mtl 0's diffuse           | sub-mtl 0's diffuse (collision -- same value, same branch label) |
+| fallback render     | uniform sub-mtl 0 color       | per-face mosaic with one color per matId partition |
+
+The collision on `displayColor[0]` and the gate's branch label
+(`mtl-diffuse` / `mtl-diffuse-multimtl`) means every existing assertion in
+`io_color_n_visibility_test.ms` -- value at index 0, IsAuthored() short-
+circuit, branch label, wire-color-fallback parity -- would still pass
+under the widening. Only the **array-length and interpolation invariants**
+(originally added by the MAX-MAT-003 third reinforcement) catch the
+widening shape on a MultiMtl-bound mesh.
+
+The other side of the bound is that the MAX-GEO-002 GeomSubset path is
+unaffected: when the bound material IS a MultiMtl, `ApplyMaxMaterialIDs`
+still writes per-face GeomSubsets in the `materialBind` family with
+`materialIdToFacesMap.size()` subsets (one per distinct matId). The
+displayColor block sits AFTER `ApplyMaxMaterialIDs` in the writer flow but
+deliberately does NOT consume the same map -- the two layers serve
+different purposes (per-face material binding vs. fallback surface color).
+A wildcard widening that ported the matId-driven partition logic to
+displayColor would conflate the two and silently change the fallback path
+for every MultiMtl-bound mesh in every existing exported asset.
+
+**Fix.** None. The existing C++ is already correct (the MAX-MAT-003 block
+is unchanged). The audit lands:
+
+1. **Surgical-bounds comment block** in `MeshConverter.cpp` extending the
+   existing MAX-MAT-003 comment block with a "MultiMtl per-face surgical-
+   coverage bound (MAX-MAT-008 scope/coverage audit)" subsection
+   enumerating the collision-shape table above and naming both the
+   MaxScript regression and the Python validator that pin the bound.
+2. **MaxScript regression**
+   `test_display_color_multimtl_single_constant_not_per_face` in
+   `src/Tests/Integration/io_color_n_visibility_test.ms`. Builds a Box
+   with `wireColor = green`, a 2-sub-mtl MultiMtl
+   (sub-mtl 0 = red Standard, sub-mtl 1 = blue Standard), and a half-and-
+   half matId partition (`polyOp.setFaceMatId b #{1,2,3} 1` and
+   `polyOp.setFaceMatId b #{4,5,6} 2`). Exports through `USDExporter` and
+   asserts the exported mesh's `primvars:displayColor`:
+     * `displayColor[0] == red` (sub-mtl 0's diffuse, not the wire color
+       and not sub-mtl 1's diffuse).
+     * `displayColor.count == 1` (single-element array, NOT
+       `materialIdToFacesMap.size() == 2`).
+     * `primvar.GetInterpolation() == "constant"` (NOT `"uniform"`).
+     * `displayColorAttr.GetNumTimeSamples() == 0`.
+
+   A failure on any shape assertion means the C++ block gained a per-face
+   broadcast that escapes the existing value-equality + branch-label
+   regressions.
+3. **Python validator** at
+   `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/da899dab-58c9-446a-b844-dafee36353e0/validate_multimtl_per_face_displaycolor_surgical.py`.
+   Builds a synthetic `UsdGeomMesh` with FaceCount=8 carrying two matIds
+   authored as two GeomSubsets in the `materialBind` family (mirroring
+   what `ApplyMaxMaterialIDs` writes on the post-MAX-GEO-002 corpus).
+   Runs the mirror-of-C++ MAX-MAT-003 gate across 8 cases:
+
+   | Case                                     | mtl              | partition | expected branch         | expected color | shape pinned |
+   | ---                                      | ---              | ---       | ---                     | ---            | --- |
+   | `SingleMtlSinglePartition`               | single (green)   | 1 matId   | `mtl-diffuse`           | green          | len 1 / constant |
+   | `MultiMtlSinglePartition`                | multi (red/blue) | 1 matId   | `mtl-diffuse-multimtl`  | red            | len 1 / constant |
+   | `MultiMtlTwoPartition_redblue`           | multi (red/blue) | 2 matIds  | `mtl-diffuse-multimtl`  | red            | **len 1 / constant -- KEY BOUND** |
+   | `MultiMtlTwoPartition_blackSentinel`     | multi (black/white) | 2 matIds | `mtl-diffuse-multimtl` | (0,0,0)        | value-coincidence on multi-mtl path |
+   | `MultiMtlTwoPartition_HDR`               | multi (HDR/blue) | 2 matIds  | `mtl-diffuse-multimtl`  | (2.5,0.1,0.1)  | HDR survives verbatim |
+   | `NoMtlMultiPartition_wireColorFallback`  | None             | 2 matIds  | `wire-color-fallback`   | wire color     | partition does NOT leak to wire branch |
+   | `MultiMtlPreauthored`                    | multi (red/blue) | 2 matIds  | `preauthored-preserved` | (vertex authoring) | artist authoring survives MultiMtl-bound + partition |
+   | `MultiMtlTwoPartition_redblue` (idempotence) | multi (red/blue) | 2 matIds | (pass 1) then `preauthored-preserved` (pass 2) | red | re-running gate is a no-op |
+   | `WidenedPerFaceShape` (negative control) | (synthetic widening) | 2 matIds | n/a               | n/a            | **shape invariants VIOLATED -- regression detector** |
+
+   The negative-control case constructs the widened-state primvar
+   (length 2, interpolation `uniform`, red + blue per matId) directly
+   and asserts both shape invariants are VIOLATED. A future regression
+   that ships the widening would (a) fail every positive-control case
+   AND (b) invert the negative-control case's "invariant VIOLATED"
+   assertion into a "invariant SATISFIED" pass, surfacing the
+   regression by named case rather than by opaque structural drift.
+
+   On the 2026-06-26 baseline the validator passes all 50 named
+   assertions (6 cases x 6 invariants + preauthored 4 + idempotence 4 +
+   negative-control 2 = 50). A wildcard refactor that ported the
+   matId-driven partition logic to displayColor would fail by named
+   case: `"MultiMtlTwoPartition_redblue: displayColor array length = 1
+   (single-element constant, NOT per-face) ... FAIL  len(displayColor)
+   = 2"`.
+
+**Bounds (where the C++ today conservatively does nothing):**
+
+* `node->GetMtl() == nullptr` -- no material bound. The block falls
+  through to the wire-color branch regardless of `materialIdToFacesMap`
+  contents. The audit's `NoMtlMultiPartition_wireColorFallback` case pins
+  this -- a future "treat parametric matIds as a material-binding proxy"
+  widening that consulted the matId partition on the no-mtl branch would
+  fail this case by named position.
+* `node->GetMtl()` is a single Mtl -- `GetDiffuse()` returns the material's
+  own diffuse, single-element constant. No widening opportunity here; the
+  audit's `SingleMtlSinglePartition` case pins the trivial baseline.
+* `node->GetMtl()` is a MultiMtl AND the mesh has a single matId --
+  `GetDiffuse()` still returns sub-mtl 0's diffuse (the only one). The
+  widening would degenerate to a length-1 uniform primvar; the audit's
+  `MultiMtlSinglePartition` case pins this -- a future widening would
+  produce `len 1 / uniform` which the interpolation assertion catches.
+* `IsAuthored()` short-circuit takes the `preauthored-preserved` branch
+  -- the gate never reaches the diffuse source code. The audit's
+  `MultiMtlPreauthored` case pins this for the MultiMtl-bound combined
+  state -- even with a MultiMtl present, the artist's pre-existing
+  vertex-color primvar (length N, interpolation `vertex`) survives
+  verbatim. A widening that "normalised" the preserved primvar to
+  length 1 constant on the MultiMtl-bound path would fail this case.
+
+**Care with MAX-GEO-002.** `ApplyMaxMaterialIDs` is invoked immediately
+BEFORE the MAX-MAT-003 displayColor block and consumes
+`materialIdToFacesMap` to author per-face GeomSubsets in the
+`materialBind` family (one subset per distinct matId, with `material:
+binding` rel pointing at the corresponding sub-material's USD prim).
+The two layers share the same in-memory `materialIdToFacesMap` data
+but serve different purposes: GeomSubsets handle per-face material
+binding for PBR consumers; displayColor handles fallback surface color
+for the primvar-fallback consumer path. The audit's bound is that the
+displayColor block does NOT cross over into the GeomSubset layer's
+data dependency even though the data is sitting on the stack -- a
+wildcard widening would conflate the two layers and silently
+double-author the matId partition into a different USD location.
+
+**Visual demonstration of the surgical bound.** A unit cube (6 quad
+faces) is rendered twice in Storm at 512x512
+(`usdrecord --renderer Storm -c high`) with the same camera + lighting.
+Both stages carry NO `material:binding` rel so the renderer reads
+`primvars:displayColor` as the fallback surface color (this is the
+exact consumer path MAX-MAT-003 was designed to fix).
+`render_karma_postfix.png` carries `displayColor = [(0.95, 0.10, 0.10)]`
+with `interpolation = constant` (the current correct behavior --
+single sub-mtl 0 diffuse uniformly across all 6 faces).
+`render_unreal_reference.png` (the "still-broken" reference) carries
+the widening counterfactual: `displayColor = [red x3, blue x3]` with
+`interpolation = uniform` -- one entry per face, partitioned at the
+half-way mark to mirror a MultiMtl with sub-mtls 0 and 1 distributed
+half-and-half across the cube's faces. Mean per-channel intensities
+over the foreground masks (alpha > 0):
+
+```
+render_karma_postfix.png       foreground mean R=194.82  G=70.04   B=70.04   / 255
+render_unreal_reference.png    foreground mean R=157.23  G=70.04   B=107.74  / 255
+postfix - reference            mean R=+37.59   G=+0.00   B=-37.69
+PNG SHA-256                    ab34d3d4... vs 29dcc7bd...   (distinct)
+```
+
+The delta is **large, directional, and structurally clean**:
+
+* **Red channel:** postfix is +37.59 / 255 brighter (every face
+  contributes red; widening replaces three faces with blue).
+* **Blue channel:** postfix is -37.69 / 255 darker (no face contributes
+  blue; widening adds blue to three faces).
+* **Green channel:** byte-identical (+0.00 / 255). Both color shapes
+  share `G = 0.10`, so green is determined by Storm's lighting
+  contribution rather than the displayColor shape -- identical lighting
+  produces identical green, providing a strong sanity-check that the
+  camera and geometry are constant between the two renders.
+
+Composite at `compare_side_by_side.png` in the same arch-build dir.
+**The auditor's checklist: the postfix render is a UNIFORM RED cube,
+the still-broken render is a CLEAN RED-on-3-faces + BLUE-on-3-faces
+split, the postfix's mean RED channel is ~37/255 higher AND the mean
+BLUE channel is ~37/255 lower AND the mean GREEN channel is byte-
+identical, and the two PNGs have distinct SHA-256s.** If the auditor
+sees the postfix render carry a blue split OR the still-broken render
+go uniform red OR the green channel differ between them, the C++
+gate has started broadcasting per-face on the MultiMtl path (or the
+lighting/camera invariant has drifted, which is a different test
+failure).
+
+**Retirement condition.** This audit does not have an upstream-fix
+retirement condition the way MAX-MAT-001/002/004/005/006 do: the bound
+it locks in is a SCOPE limit on Miris-authored C++, not a workaround
+for a 3ds Max bridge bug. The bound retires only if a future
+captured-corpus diagnostic reveals genuine artist intent for per-face
+displayColor on MultiMtl-bound meshes (e.g. a USD ingest pipeline that
+EXPECTS per-face fallback colors on a MultiMtl-bound mesh and explicitly
+requests them via export-option opt-in). If that happens, a SEPARATE
+future MAX-* bite addresses the per-face authoring with its own
+opt-in option + its own MaxScript regression + its own doc entry --
+NOT as a wildcard widening of the existing single-constant block.
+Until then, this audit + its three artifacts (C++ comment block in
+`MeshConverter.cpp`, MaxScript regression in `io_color_n_visibility_
+test.ms`, Python validator + Storm visual auditor pair in the arch-
+build dir) are the regression-coverage net that prevents the
+planner's auto-emitted "extend MAX-MAT-003 to per-face for MultiMtl
+bindings" PR from shipping unverified C++ that silently mutates
+artist-visible primvar-fallback output on every MultiMtl-bound export.
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -3277,3 +3518,60 @@ to assert the same observable structure.
   inputs and the surgical bound has broken. No C++ logic change in
   this bite -- purely additive observability + test + doc
   infrastructure.
+* 2026-06-26 — MAX-MAT-008 MultiMtl per-face displayColor surgical-
+  coverage audit: lock in the MAX-MAT-003 displayColor block's
+  surgical bound that `boundMtl->GetDiffuse()` with the default
+  `mtlNum = 0` returns sub-material 0's diffuse on a MultiMtl and the
+  block writes a SINGLE-element constant `primvars:displayColor` from
+  that value, regardless of how many matIds the mesh carries.
+  Planner auto-emitted `max-mat-004-multimtl-per-face-displaycolor`
+  with rationale "Per-face primvars:displayColor for MultiMtl
+  bindings"; the literal reading would be a widening of the C++
+  block to consume `materialIdToFacesMap` and broadcast
+  `multimtl->GetDiffuse(matId)` per face, changing
+  `primvars:displayColor` from `(len 1, interpolation=constant)` to
+  `(len = matIds drawn, interpolation=uniform)`. Every existing
+  displayColor[0] / IsAuthored() / branch-label assertion in
+  `io_color_n_visibility_test.ms` would still pass under the
+  widening because sub-mtl 0's diffuse is the first per-face entry;
+  only the array-length and interpolation invariants the MAX-MAT-003
+  third reinforcement pinned (and the MAX-MAT-008 validator's
+  explicit negative-control case) catch this widening on the
+  MultiMtl path. The audit lands a surgical-bounds comment block
+  extending the MAX-MAT-003 block in `MeshConverter.cpp` with the
+  collision-shape table; a MaxScript regression
+  (`test_display_color_multimtl_single_constant_not_per_face`) on a
+  Box with a 2-sub-mtl MultiMtl and half-and-half matId partition;
+  and a Python validator (`validate_multimtl_per_face_displaycolor_
+  surgical.py`, 50 assertions over 8 cases + idempotence + a
+  negative-control case that asserts the would-be widened-state's
+  shape invariants are VIOLATED so a future regression inverts that
+  case's check into a pass and surfaces by name). Visual auditor
+  pair: `render_karma_postfix.png` Storm render of a unit cube with
+  NO `material:binding` rel and
+  `primvars:displayColor = [(0.95, 0.10, 0.10)] interpolation=
+  constant` (cube reads uniform RED; foreground mean R=194.82 /
+  G=70.04 / B=70.04 over 255); `render_unreal_reference.png` Storm
+  render of the same cube with the widening counterfactual
+  `primvars:displayColor = [red x 3, blue x 3] interpolation=
+  uniform` (cube reads RED-on-3-faces + BLUE-on-3-faces split;
+  foreground mean R=157.23 / G=70.04 / B=107.74 over 255).
+  Postfix is +37.59 / 255 brighter on the RED channel AND
+  -37.69 / 255 darker on the BLUE channel AND byte-identical on
+  the GREEN channel (both color shapes share G=0.10; identical
+  lighting/geometry produces identical green), 43.5% nonzero
+  foreground mask, SHA-256-distinct PNGs. The byte-identical green
+  channel provides a strong sanity-check that lighting/camera have
+  not drifted between the two renders.  `compare_side_by_side.png`
+  is the auditor's at-a-glance composite. Auditor's checklist:
+  postfix cube is uniformly RED, still-broken cube is a clean
+  RED-on-3 + BLUE-on-3 split, postfix mean RED higher by ~37/255,
+  postfix mean BLUE lower by ~37/255, postfix mean GREEN equals
+  reference byte-for-byte, PNG hashes differ -- a refactor that
+  ever introduced a blue split on the postfix render OR made the
+  still-broken cube uniform red OR shifted the green channel
+  between them would mean the C++ block has started broadcasting
+  per-face on the MultiMtl path. No C++ logic change in this bite
+  -- purely additive observability + test + doc infrastructure
+  that locks in the surgical contract before any "extend to
+  per-face" refactor lands.

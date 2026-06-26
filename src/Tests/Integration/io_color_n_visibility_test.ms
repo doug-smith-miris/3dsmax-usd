@@ -471,6 +471,98 @@ struct io_color_n_visibility_test
         assert_equal 0 (displayColorAttr.GetNumTimeSamples()) message:"Unexpected displayColor time sample count on mtl-diffuse branch: must be 0 (a single default-time value), not a time-sampled animation."
     ),
 
+    -- MAX-MAT-008 SCOPE/COVERAGE AUDIT: when a node has a MultiMtl bound
+    -- AND the mesh carries multiple matIds across its faces, the MAX-MAT-003
+    -- displayColor block writes a SINGLE-element constant primvar derived
+    -- from sub-material 0's diffuse (Mtl::GetDiffuse() with the default
+    -- argument mtlNum = 0). The C++ block intentionally does NOT consult
+    -- materialIdToFacesMap and does NOT broadcast GetDiffuse(matId)
+    -- per face -- a per-face widening would be a wildcard refactor that
+    -- silently mutates the primvar's shape (interpolation goes from
+    -- "constant" to "uniform"; array length goes from 1 to
+    -- materialIdToFacesMap.size()), changing the fallback render output
+    -- for every consumer on the primvar-fallback path (minimal Hydra
+    -- delegates, ARKit Quick Look, usdview's displayColor overlay).
+    --
+    -- The companion Python validator
+    -- validate_multimtl_per_face_displaycolor_surgical.py mirrors the
+    -- gate at the USD layer over 8 cases plus a negative-control case
+    -- that constructs the would-be widened primvar directly and asserts
+    -- the shape invariants are VIOLATED. This MaxScript test pins the
+    -- canonical case (Box + 2-sub-mtl MultiMtl + half-and-half matId
+    -- partition) at the export level so a C++ regression that escapes
+    -- the Python mirror still fails inside Max.
+    --
+    -- A future regression that switched the C++ block to per-face would
+    -- still satisfy displayColor[0] == sub-material 0's diffuse (the
+    -- existing test_display_color_uses_material_diffuse_when_bound
+    -- and test_display_color_primvar_shape_invariants_on_gate_write
+    -- assertions). Only the array-length and interpolation invariants
+    -- below catch that widening shape on a MultiMtl-bound mesh.
+    function test_display_color_multimtl_single_constant_not_per_face = (
+        testFilePath = output_prefix + "test_display_color_multimtl_single_constant_not_per_face.usd"
+        local b = box name:"box"
+        convertToPoly b
+        -- Wireframe color: green. Sub-mtl 0: red. Sub-mtl 1: blue.
+        -- A wildcard "extend to per-face for MultiMtl" widening would
+        -- author red on the face-0 partition and blue on the face-1
+        -- partition; the current gate authors red across the whole mesh
+        -- because Mtl::GetDiffuse() returns sub-mtl 0's diffuse.
+        b.wireColor = Color 0 255 0
+
+        local multiSub = multiSubMaterial numsubs:2
+        multiSub.numSubs = 2
+        local matRed = Standard name:"sub_red"
+        matRed.diffuse = Color 255 0 0
+        multiSub.materialList[1] = matRed
+        local matBlue = Standard name:"sub_blue"
+        matBlue.diffuse = Color 0 0 255
+        multiSub.materialList[2] = matBlue
+        b.material = multiSub
+
+        -- Split the Box's 6 faces in half: faces 1,2,3 -> matId 1 (red),
+        -- faces 4,5,6 -> matId 2 (blue). This produces a
+        -- materialIdToFacesMap.size() == 2 partition inside the writer,
+        -- which a per-face widening would consume to broadcast both
+        -- diffuses; the current gate must ignore the partition.
+        polyOp.setFaceMatId b #{1, 2, 3} 1
+        polyOp.setFaceMatId b #{4, 5, 6} 2
+
+        USDExporter.ExportFile testFilePath exportOptions:exportOptions
+
+        stage = pyUsd.Stage.Open(testFilePath)
+        prim = pyUsdGeom.Gprim.Get stage ("/" + b.name)
+        local mesh = pyUsdGeom.Mesh(prim)
+        local displayColorAttr = mesh.GetDisplayColorAttr()
+        local dispColor = displayColorAttr.Get()
+
+        -- Value invariant: displayColor[0] must be sub-material 0's
+        -- diffuse (red), NOT the wireframe color (green) and NOT a
+        -- per-face value derived from the matId partition.
+        local rgb = dispColor[1]
+        assert_equal 1 rgb[1] message:"Unexpected displayColor[0], should be sub-material 0's diffuse (red) -- the MAX-MAT-003 gate calls Mtl::GetDiffuse() with the default mtlNum = 0, not a per-matId broadcast."
+        assert_equal 0 rgb[2] message:"Unexpected displayColor[1], should be sub-material 0's diffuse (red), not the wireframe color (green) and not sub-material 1's diffuse (blue)."
+        assert_equal 0 rgb[3] message:"Unexpected displayColor[2], should be sub-material 0's diffuse (red), not sub-material 1's diffuse (blue)."
+
+        -- Primvar-shape invariants on the MultiMtl path. A widening
+        -- that consumed materialIdToFacesMap to broadcast
+        -- multiSub->GetDiffuse(matId) per face would have:
+        --   * len(displayColor) == materialIdToFacesMap.size() (here, 2
+        --     with a half-and-half split; in general, between 1 and
+        --     the number of distinct matIds on the mesh).
+        --   * interpolation == "uniform" (one entry per face).
+        -- The first reinforcement's value-and-branch assertions would
+        -- still pass (displayColor[0] is still red, the gate still
+        -- took the mtl-diffuse branch). Only these shape invariants
+        -- catch the widening on the MultiMtl-bound mesh.
+        assert_equal 1 dispColor.count message:"Unexpected displayColor array length on MultiMtl-bound mesh: must be a single-element constant primvar, not a per-matId broadcast (a wildcard 'extend MAX-MAT-003 to per-face for MultiMtl' widening would write len = materialIdToFacesMap.size())."
+        local primvarApi = pyUsdGeom.PrimvarsAPI(prim)
+        local primvar = primvarApi.GetPrimvar("displayColor")
+        local interpolation = primvar.GetInterpolation()
+        assert_equal "constant" interpolation message:"Unexpected displayColor interpolation on MultiMtl-bound mesh: must be \"constant\", not \"uniform\" (a per-face widening would set interpolation=\"uniform\" with one entry per matId)."
+        assert_equal 0 (displayColorAttr.GetNumTimeSamples()) message:"Unexpected displayColor time sample count on MultiMtl-bound mesh: must be 0 (a single default-time value), not a time-sampled animation."
+    ),
+
     function teardown = (
     ),
 
@@ -483,7 +575,8 @@ struct io_color_n_visibility_test
         test_display_color_still_uses_wire_color_when_no_material,
         test_display_color_preserves_authored_when_material_bound,
         test_display_color_preserves_default_looking_authored_value_when_material_bound,
-        test_display_color_primvar_shape_invariants_on_gate_write)
+        test_display_color_primvar_shape_invariants_on_gate_write,
+        test_display_color_multimtl_single_constant_not_per_face)
 )
 
 runUsdTestFixture io_color_n_visibility_test (getThisScriptFilename())

@@ -337,12 +337,81 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
             //     symmetrically across vertex, faceVarying, constant
             //     len=1, and time-sampled cases.
             //
+            //   MultiMtl per-face surgical-coverage bound (MAX-MAT-008
+            //   scope/coverage audit, this commit):
+            //   * boundMtl->GetDiffuse() with the default argument
+            //     mtlNum = 0 returns sub-material 0's diffuse on a
+            //     MultiMtl. The gate intentionally does NOT consult
+            //     materialIdToFacesMap and does NOT broadcast
+            //     boundMtl->GetDiffuse(matId) per face -- the resulting
+            //     primvars:displayColor stays SINGLE-element constant
+            //     regardless of how many matIds the mesh carries. The
+            //     downstream call site materialIdToFacesMap.size() ==
+            //     N is already consumed by ApplyMaxMaterialIDs above to
+            //     author per-face GeomSubsets (MAX-GEO-002); the
+            //     displayColor block deliberately does NOT take a
+            //     dependency on that data.
+            //   * A wildcard "extend MAX-MAT-003 to per-face for
+            //     MultiMtl bindings" widening would author
+            //     primvars:displayColor with interpolation=uniform and
+            //     length = materialIdToFacesMap.size(), one
+            //     boundMtl->GetDiffuse(matId) call per matId. Every
+            //     existing displayColor[0] / IsAuthored() / branch-
+            //     label assertion in io_color_n_visibility_test.ms
+            //     would still pass (the first entry is still sub-mtl
+            //     0's diffuse, the IsAuthored() gate still fires the
+            //     mtl-diffuse-multimtl branch, the value at index 0 is
+            //     unchanged). Only the array-length and interpolation
+            //     invariants from the third reinforcement (and the
+            //     MAX-MAT-008 validator's negative-control case below)
+            //     catch this widening.
+            //   * The audit's collision shape pinned by the validator
+            //     in this commit:
+            //
+            //       Aspect              | Current gate          | Per-face widening
+            //       --------------------|-----------------------|------------------
+            //       primvar name        | displayColor          | displayColor
+            //       component type      | color3f               | color3f
+            //       interpolation       | constant              | uniform
+            //       array length        | 1                     | N (matIds drawn)
+            //       diffuse source      | GetDiffuse(0)         | GetDiffuse(matId) per face
+            //       reads matId map     | NO                    | yes
+            //       fallback render     | uniform sub-mtl 0     | per-face mosaic
+            //
+            //   * The accompanying MaxScript regression
+            //     test_display_color_multimtl_single_constant_not_per_face
+            //     in src/Tests/Integration/io_color_n_visibility_test.ms
+            //     pins this bound at the export level: a Box with a
+            //     2-sub-mtl MultiMtl bound (red + blue) and matIds
+            //     split half-and-half across its 6 faces must export
+            //     with primvars:displayColor of length 1,
+            //     interpolation=constant, value = red (sub-mtl 0's
+            //     diffuse). A regression that switched the C++ block
+            //     to per-face would fail this test by named case
+            //     (length 6, interpolation uniform).
+            //   * The accompanying Python validator
+            //     validate_multimtl_per_face_displaycolor_surgical.py
+            //     mirrors the gate at the USD layer over 8 cases
+            //     (single-mtl/single-partition, multi-mtl/single-
+            //     partition, multi-mtl/two-partition red+blue,
+            //     multi-mtl/two-partition black sentinel, multi-mtl/
+            //     two-partition HDR, no-mtl/multi-partition wire-
+            //     color fallback, multi-mtl pre-authored preservation,
+            //     idempotence) plus a NEGATIVE-CONTROL case that
+            //     constructs the would-be widened-state primvar
+            //     directly and asserts the shape invariants
+            //     (length==1, interpolation==constant) are VIOLATED --
+            //     so a future regression that ships the widening
+            //     inverts the negative-control case's check into a
+            //     pass and surfaces by name.
+            //
             // A future refactor that widens any of these gates would
             // silently corrupt artist-authored displayColor or substitute
             // the wrong source. Both the .ms surgical tests and the
-            // three Python validators name the specific bound they
-            // exercise, so a regression in any branch fails with a
-            // useful, localised error.
+            // four Python validators (state-shape, value-coincidence,
+            // primvar-shape, and MultiMtl per-face surgical-coverage)
+            // name the specific bound they exercise, so a regression in
+            // any branch fails with a useful, localised error.
             if (!usdMesh.GetDisplayColorAttr().IsAuthored()) {
                 Color displayColorSrc;
                 if (Mtl* boundMtl = node->GetMtl()) {
