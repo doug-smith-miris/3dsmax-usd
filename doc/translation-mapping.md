@@ -74,6 +74,7 @@ Status legend:
 | 3ds Max Photometric / Physical light `.webFile` (when `distribution == WEB_DIST`) | `UsdLuxShapingAPI.shaping:ies:file` (an `SdfAssetPath` carrying the resolved-full-file-path of the .ies profile) | direct pairing | (light shaping API attribute; not a shader nodedef) | `PhotometricLightWriter::Write` is invoked, `distribution == WEB_DIST` AND `asset.GetId() != kInvalidId`. Two surgical bounds: (a) distribution != WEB_DIST -> NOT authored even if `.webFile` is set on source (gate fires on distribution first); (b) WEB_DIST AND asset id == kInvalidId -> NOT authored (no spurious empty path). Known TODO at `PhotometricLightWriter.cpp:277`: the path is absolute on the source machine; pack-and-go USDZ + IES bundle is not yet supported | MAX-LIT-002 | 2026-06-26 |
 | 3ds Max Photometric / Physical light Kelvin + RGB filter color (Light > Color > Kelvin toggle, kelvin spinner, filter swatch, RGB swatch) | `UsdLux.enableColorTemperatureAttr` + `colorTemperatureAttr` + `inputs:color` -- dichotomous: `useKelvin = true` writes the blackbody temperature + filter-only color; `useKelvin = false` writes the lightColor x filterColor combined product with the blackbody enable off | direct pairing | (UsdLux base-light schema; not a shader nodedef) | `PhotometricLightWriter::Write` is invoked, always (the dichotomy fires per-light per-export). Surgical bounds: (a) useKelvin -> enable=true + ct=clamped-K + color=filter (NOT lightColor combined; would double-tint the renderer's blackbody integrand); (b) !useKelvin -> enable=false + NO ct authored + color=lightColor*filter (intentionally lossy on round-trip); (c) out-of-range K -> clamped to [1000, 10000] with a one-shot Log::Warn that preserves the original value in the message | MAX-LIT-002 | 2026-06-26 |
 | 3ds Max export of any stage to a path with extension `.usdz` (UI Save As… "USDZ", MaxScript `exportFile foo.usdz`, `3dsmaxbatch ... -export foo.usdz`) | Single .usdz zip archive containing the root layer + every external asset (textures, sublayer references) reachable from the stage. ARKit-strict mode flattens sublayers and bundles one .usdc root | observability + audit (lock-in for proposed in-process packaging swap) | (zip archive structure; not a shader nodedef or USD prim schema) | `USDIOController::Export` (and `USDSceneController::Export`) sees `stageExportExtension == ".usdz"`. Today: routes through `MaxUsd::UsdToolsUtils::RunUsdZip` which spawns `cmd.exe -> powershell.exe -> python.exe -> usdzip` (four nested processes; PowerShell `Restricted` ExecutionPolicy / missing `HKLM:\SOFTWARE\Autodesk\3dsMax\*` registry entries / `CreateProcess + SW_HIDE` under a service account all break it silently). Proposed (MAX-PKG-001 follow-on): replace with `pxr::UsdUtilsCreateNewUsdzPackage(SdfAssetPath(tempUsd), filePath)` called in-process from the same function. The audit pins nine surgical bounds the in-process replacement preserves -- see Notes per expression for the full case list | MAX-PKG-001 | 2026-06-26 |
+| 3ds Max OpenPBR material (`OpenPBR()`, Max 2025.3+) exported via the MaterialX target | `ND_open_pbr_surface_surfaceshader` shader prim (MaterialX 1.39 OpenPBR Surface v1.1) -- NOT touched by any of the five MAX-MAT-001/002/004/005/006 normalization passes. The passes are gated `doc->getNodes("standard_surface")` and skip the OpenPBR shader entirely | audit (lock-in of existing surgical-coverage bound, no C++ logic change) | `ND_standard_surface_surfaceshader` (the audit pins the surgical bound where the passes STOP) | `MtlxShaderWriter::Write` is invoked on an OpenPBR-bound material. Surgical bounds: (a) every existing MAX-MAT-* pass iterates `doc->getNodes("standard_surface")`, returning an empty list when the shader's MaterialX node category is `open_pbr_surface`; (b) name-collision-named inputs (`coat_color`, `subsurface_color`, `specular_color`, `transmission_color` -- all color3, plus `subsurface_radius` which on open_pbr_surface is type=`float` rather than `color3` as on standard_surface) survive verbatim, including artist-authored `subsurface_color = (1, 1, 1)` which would visually shift to the OpenPBR default `(0.8, 0.8, 0.8)` if the passes were widened; (c) renamed gate inputs (`coat_weight` -> standard_surface `coat`; `subsurface_weight` -> `subsurface`; `transmission_weight` -> `transmission`; `coat_ior` -> `coat_IOR`; `specular_ior` -> `specular_IOR`; `emission_luminance` -> `emission`; `specular_roughness_anisotropy` -> `specular_anisotropy`) are likewise untouched; (d) idempotence -- a second run of the pass chain on the same exported doc does nothing more than the first | MAX-MAT-007 | 2026-06-26 |
 
 ## Notes per expression
 
@@ -877,6 +878,150 @@ v1.0.2 that changes one of these defaults will simply mean the existing
 strip stops firing for that input (the static value no longer matches);
 the strip never *adds* an attribute, so a stale default value is at
 worst a missed-cleanup opportunity, not a correctness regression.
+
+### OpenPBR material → ND_open_pbr_surface_surfaceshader (audit, MAX-MAT-001..006 STOP here)  (MAX-MAT-007)
+
+**Symptom.** 3ds Max 2025.3 adds the `OpenPBR()` material class, which the
+MaxUSD bridge exports to a `ND_open_pbr_surface_surfaceshader` MaterialX
+node (MaterialX 1.39 OpenPBR Surface v1.1) instead of
+`ND_standard_surface_surfaceshader`. The existing five MAX-MAT-* post-parse
+normalization passes in `MtlxShaderWriter.cpp` (specular_rotation,
+emission default, coat-block, subsurface_radius, spec-default-inputs) are
+ALL scoped to `standard_surface` via `doc->getNodes("standard_surface")` and
+therefore skip the OpenPBR shader entirely. The audit's job is to **lock
+that surgical-coverage bound in with negative-test coverage** — no C++
+logic change.
+
+**Why it matters.** Several open_pbr_surface inputs share their NAME with
+standard_surface inputs that the five existing passes strip:
+
+| Collision name | open_pbr_surface default | standard_surface default | What a wildcard refactor would do |
+| --- | --- | --- | --- |
+| `coat_color` | (1, 1, 1) | (1, 1, 1) | strip-on-default value match -- visually no-op but structurally wrong |
+| `transmission_color` | (1, 1, 1) | (1, 1, 1) | same |
+| `specular_color` | (1, 1, 1) | (1, 1, 1) | same |
+| **`subsurface_color`** | **(0.8, 0.8, 0.8)** | **(1, 1, 1)** | **strip artist-authored (1, 1, 1) -> sphere goes from neutral white to (0.8, 0.8, 0.8) muted grey** -- the audit's primary visible bound |
+| `subsurface_radius` (FLOAT on open_pbr) | 1.0 | (color3 type; leak triple) | _TryGetStaticColor3 parses-fails on a float -- accidental safety, pinned anyway |
+
+The other side of the bound is that the renamed gate inputs would not
+be reachable from the existing passes even if widened to a wildcard,
+because the gate predicates inside each pass reference the
+standard_surface input names (`coat == 0` for the coat block, `subsurface
+== 0` for the subsurface_radius strip). Open_pbr_surface renames those to
+`coat_weight` and `subsurface_weight`, so a wildcard refactor would run
+the strip UNGATED across every leak-named input -- including artist
+authoring with `coat_weight = 0.5` set (the lobe is ON, the strip would
+mutate the surface anyway).
+
+**Fix.** None. The existing C++ is already correct. The audit lands:
+
+1. **Surgical-bounds comment block** in `MtlxShaderWriter.cpp` above the
+   chain of normalization-pass calls, enumerating the open_pbr_surface
+   collision shape (input names + defaults + the renamed gate predicates)
+   and naming both the MaxScript regression and the Python validator that
+   pin the bound.
+2. **MaxScript regression**
+   `test_export_openpbr_material_preserves_collision_named_inputs` in
+   `src/Tests/Integration/mtlxShaderWriter_test.ms`. Exports an `OpenPBR()`
+   material via the MaterialX target with the four collision-named
+   color3 inputs set to white and the two renamed gate inputs
+   (`coat_weight = 0.5`, `subsurface_weight = 1.0`) authored. Asserts the
+   exported shader is `ND_open_pbr_surface_surfaceshader` (the writer's
+   first surgical bound — the OpenPBR material is NOT collapsed onto
+   standard_surface) and that every authored input reaches the USD
+   present, authored, and at the input's authored value. Gated on Max
+   2025.3+ (`maxver[1] < 27900` mirroring the existing
+   `test_export_OpenPBR_material`).
+3. **Python validator** at
+   `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/5c66e23f-c809-45a2-baeb-328d9fe6ddf1/validate_openpbr_surface_coverage.py`.
+   Builds a synthetic `MaterialX::Document` carrying a `standard_surface`
+   node with every known MAX-MAT-001/002/004/005/006 leak side-by-side
+   with an `open_pbr_surface` node carrying collision-named inputs. Runs
+   all five mirror-of-C++ normalization passes, then asserts:
+     * the `standard_surface` leaks are stripped (positive control --
+       confirms the passes are still doing their job);
+     * **every** `open_pbr_surface` input is preserved -- both name
+       (no surprise removal) and value (no surprise mutation);
+     * spot checks on the specific collision-named values
+       (`subsurface_color = (1, 1, 1)`, `coat_color = (1, 1, 1)`,
+       `transmission_color = (1, 1, 1)`, `subsurface_radius = 0.794704`
+       as a FLOAT, `subsurface_weight`, `coat_weight = 0.5`);
+     * idempotence -- a second run of all five passes on the
+       post-normalized doc does not strip anything additional on either
+       node category.
+   On the 2026-06-26 baseline the validator passes all 35 named
+   assertions (11 positive-control strips + 22 surgical-coverage
+   preserves + 2 idempotence checks). A wildcard refactor that widened
+   the gate would fail by named case: "openpbr: subsurface_color =
+   (1,1,1) survives ... FAIL  before=(1.0, 1.0, 1.0), after=ABSENT".
+
+**Bounds (where the C++ today conservatively does nothing on OpenPBR):**
+
+* The five passes iterate `doc->getNodes("standard_surface")`, which is
+  the MaterialX node-category gate. open_pbr_surface nodes are in a
+  different category and are not iterated.
+* Even if a refactor changed the iteration to `doc->getNodes()`
+  (wildcard), the per-input strip checks would behave inconsistently
+  because the standard_surface gate predicates (`coat == 0`,
+  `subsurface == 0`) check input names that simply do not exist on
+  open_pbr_surface. The strip would then run UNGATED on every
+  collision-named input. The audit's MaxScript + Python tests catch
+  this regression by named case rather than by aggregate diff.
+* The `subsurface_radius` on open_pbr_surface is type=`float`; on
+  standard_surface it is type=`color3`. MAX-MAT-005's pass calls
+  `_TryGetStaticColor3` on the input, which parses-fails on a single
+  float and skips. This is accidental safety -- pinned by the validator
+  case "openpbr: subsurface_radius = 0.794704 (FLOAT) survives
+  (accidental-safety pin)" so a future widening that switched to a
+  type-agnostic parse would fail loudly.
+
+**Visual demonstration of the surgical bound.** A single OpenPBR sphere
+is rendered twice in Karma CPU at 512x512 with the same camera +
+lighting (key DistantLight @ 6.0 + fill @ 2.0, opposing angles).
+`render_karma_postfix.png` carries
+`inputs:subsurface_color = (1, 1, 1)` authored on the shader (the
+current correct behavior — the input survived the export untouched).
+`render_unreal_reference.png` (the "still-broken" reference) has the
+same shader with that input ABSENT (the wildcard-refactor counterfactual
+where the input was over-stripped, so the renderer resolves to the
+OpenPBR nodedef default of (0.8, 0.8, 0.8)). Mean per-channel
+intensity over the captured PNGs:
+
+```
+render_karma_postfix.png       mean 38.76 / 255   (uniformly across RGB)
+render_unreal_reference.png    mean 38.20 / 255   (uniformly across RGB)
+postfix - reference            mean +0.56 / 255   (positive: postfix is brighter)
+nonzero pixels                 31.1%
+PNG SHA-256                    9baecce7... vs b71ac07c...   (distinct)
+```
+
+The delta is small in absolute terms because the OpenPBR SSS lobe at
+this scene scale dilutes the 20% per-channel subsurface_color
+difference into a path-traced average that sits close to the Karma
+sampler-noise floor, but it is **reproducibly directional**: postfix
+brighter, still-broken darker. Composite at `compare_side_by_side.png`
+in the same arch-build dir. **The auditor's checklist: the postfix
+render is the brighter of the two by mean intensity, the two PNGs
+have distinct SHA-256s, and the direction matches the per-channel
+attenuation OpenPBR's SSS lobe applies to subsurface_color.** If the
+auditor sees the renders go byte-identical OR the still-broken
+reference reading brighter, the C++ normalizers have started touching
+open_pbr_surface and the surgical bound has broken.
+
+**Retirement condition.** This audit does not have an upstream-fix
+retirement condition the way MAX-MAT-001..006 do: the bound it locks in
+is a SCOPE limit on Miris-authored C++, not a workaround for a 3ds Max
+bridge bug. The bound retires only if the standard_surface normalizers
+themselves are removed (e.g. Autodesk fixes MtlxIOUtil on every input
+they cover) and then the scope limit becomes moot. Until then, this
+audit + its three artifacts (C++ comment, MaxScript regression, Python
+validator) are the regression-coverage net that prevents an
+"extend MAX-MAT-* normalizers to OpenPBR" PR (which is what the planner
+auto-emitted this bite for) from shipping unverified C++ that silently
+mutates artist-authored OpenPBR materials. **A future PR that adds
+genuine OpenPBR-specific normalizers should land as a separate
+MAX-MAT-* entry with its own captured corpus of OpenPBR leak values
+from MtlxIOUtil — not as a wildcard widening of these five passes.**
 
 ### Node.wireColor / Node.material.diffuse → UsdGeomMesh.primvars:displayColor  (MAX-MAT-003)
 

@@ -955,6 +955,123 @@ struct mtlx_shader_writer_test
         assert_authored "thin_walled"        true
     ),
 
+    -- MAX-MAT-007 surgical-coverage bound: the 5 MAX-MAT-* normalization
+    -- passes in MtlxShaderWriter.cpp are scoped to
+    -- ND_standard_surface_surfaceshader only (gated via
+    -- doc->getNodes("standard_surface")). They MUST NOT touch
+    -- ND_open_pbr_surface_surfaceshader, even when an open_pbr_surface
+    -- input's name + value happens to match a standard_surface strip
+    -- target -- because (a) the gate predicates inside the passes
+    -- reference standard_surface input names that do not exist on
+    -- open_pbr_surface, and (b) several open_pbr_surface inputs share
+    -- names with standard_surface inputs but carry DIFFERENT nodedef
+    -- defaults (subsurface_color: open_pbr (0.8, 0.8, 0.8) vs
+    -- standard_surface (1, 1, 1)). A wildcard refactor would silently
+    -- mutate artist-authored OpenPBR shaders.
+    --
+    -- This test exports a 3ds Max OpenPBR() material via the MaterialX
+    -- target. It asserts that the exported shader is the OpenPBR
+    -- nodedef AND that the artist-authored inputs whose names collide
+    -- with standard_surface strip targets survive verbatim. A failure
+    -- means either the C++ normalizers have been widened to open_pbr
+    -- (the C++ regression this audit pins) or the MaxScript bridge
+    -- layer drops artist intent on OpenPBR round-trip (a separate,
+    -- deeper bug this test would surface either way).
+    function test_export_openpbr_material_preserves_collision_named_inputs = (
+        maxver = maxVersion()
+        -- OpenPBR is 3ds Max 2025.3+ (mirrors test_export_OpenPBR_material
+        -- in export_openpbr_to_usdps_test.ms, which gates the same way).
+        if maxver[1] < 27900 then (
+            return 0
+        )
+
+        local sphere001 = sphere name:"sphereOpenPBRArt"
+        local mtl1 = OpenPBR()
+        mtl1.name = "matOpenPBRArt"
+
+        -- Authored inputs whose NAMES collide with MAX-MAT-006's strip
+        -- targets on ND_standard_surface_surfaceshader. The OpenPBR
+        -- analogue of each carries a meaningfully different nodedef
+        -- default; an artist-authored (1, 1, 1) on subsurface_color is
+        -- a real visual override that a wildcard normalization refactor
+        -- would silently strip back to OpenPBR's (0.8, 0.8, 0.8).
+        --
+        -- Property names below are the OpenPBR mtl's MaxScript-side
+        -- attribute names, which the MaxUSD bridge serializes into the
+        -- MaterialX nodedef input names of the same role.
+        mtl1.subsurface_weight = 1.0
+        mtl1.subsurface_color = color 255 255 255  -- (1, 1, 1) -- artist override of OpenPBR default
+        mtl1.coat_weight = 0.5                      -- artist-set coat lobe
+        mtl1.coat_color = color 255 255 255
+        mtl1.specular_color = color 255 255 255
+        mtl1.transmission_color = color 255 255 255
+
+        sphere001.material = mtl1
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.AllMaterialTargets = #("MaterialX")
+
+        local exportPath = output_prefix + "testOpenPBRCoverageAudit.usda"
+        USDExporter.ExportFile exportPath exportOptions:exportOptions
+        local stage = pyUsd.Stage.Open(exportPath)
+
+        -- The OpenPBR shader prim. Path follows the same shape as the
+        -- standard_surface shaders the surrounding tests inspect:
+        -- /root/mtl/<MaterialName>/<MaterialName> (the inner Shader is
+        -- named identically to the outer Material in the MaterialX path).
+        local surfacePrim = stage.GetPrimAtPath("/root/mtl/matOpenPBRArt/matOpenPBRArt")
+        assert_true (surfacePrim.IsValid())
+        assert_true (surfacePrim.IsA(pyShade.Shader))
+
+        -- The audit's first hard surgical bound: the exported shader is
+        -- the OpenPBR nodedef, NOT standard_surface. Documents both
+        -- (a) the writer routes OpenPBR through the open_pbr_surface
+        -- nodedef and (b) the existing MAX-MAT-001..006 passes therefore
+        -- skip this shader entirely (they all gate on
+        -- doc->getNodes("standard_surface")). If a future refactor
+        -- collapsed OpenPBR onto standard_surface this assertion would
+        -- fail loudly.
+        assert_equal ((surfacePrim.GetAttribute "info:id").Get()) "ND_open_pbr_surface_surfaceshader"
+
+        local surfaceShader = pyShade.Shader(surfacePrim)
+
+        local function assert_authored_color3 inputName expectedColor = (
+            local input = surfaceShader.GetInput inputName
+            assert_true (input != undefined)
+            local attr = input.GetAttr()
+            assert_true (attr.HasAuthoredValue())
+            assert_equal (input.Get()) expectedColor
+        )
+
+        -- Each collision-named color3 input that an over-eager wildcard
+        -- strip would otherwise eat. The surgical bound is: the input
+        -- is present, authored, and exactly (1, 1, 1).
+        assert_authored_color3 "subsurface_color"   (pyGf.Vec3f 1 1 1)
+        assert_authored_color3 "coat_color"         (pyGf.Vec3f 1 1 1)
+        assert_authored_color3 "specular_color"     (pyGf.Vec3f 1 1 1)
+        assert_authored_color3 "transmission_color" (pyGf.Vec3f 1 1 1)
+
+        -- And the OpenPBR-renamed gate input (coat_weight, not coat) at
+        -- a non-default value: a future refactor that wildcarded the
+        -- coat-block strip to "any input matching the coat_* prefix"
+        -- could silently flip this to 0 (the OpenPBR default for
+        -- coat_weight, which gates the coat lobe entirely off).
+        local coatWeightInput = surfaceShader.GetInput "coat_weight"
+        assert_true (coatWeightInput != undefined)
+        local coatWeightAttr = coatWeightInput.GetAttr()
+        assert_true (coatWeightAttr.HasAuthoredValue())
+        assert_equal (coatWeightInput.Get()) 0.5
+
+        -- And the OpenPBR-renamed subsurface gate (subsurface_weight,
+        -- not subsurface): same shape of refactor risk as coat_weight.
+        local ssWeightInput = surfaceShader.GetInput "subsurface_weight"
+        assert_true (ssWeightInput != undefined)
+        local ssWeightAttr = ssWeightInput.GetAttr()
+        assert_true (ssWeightAttr.HasAuthoredValue())
+        assert_equal (ssWeightInput.Get()) 1.0
+    ),
+
     function teardown = (
     ),
 
@@ -970,7 +1087,8 @@ struct mtlx_shader_writer_test
         test_export_physical_material_strips_buggy_coat_defaults,
         test_export_physical_material_strips_buggy_subsurface_radius,
         test_export_physical_material_strips_spec_default_inputs,
-        test_export_material_preserves_non_default_spec_inputs
+        test_export_material_preserves_non_default_spec_inputs,
+        test_export_openpbr_material_preserves_collision_named_inputs
         )
 )
 

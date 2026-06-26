@@ -1055,6 +1055,47 @@ void MtlxShaderWriter::Write()
         return;
     }
 
+    // MAX-MAT-007 surgical-coverage bound (audit, no logic change): every
+    // pass below is scoped to `ND_standard_surface_surfaceshader` ONLY,
+    // gated by `doc->getNodes("standard_surface")`. They MUST NOT be
+    // widened to a wildcard or to `open_pbr_surface`. Reasons:
+    //   * `open_pbr_surface` (MaterialX 1.39, OpenPBR Surface v1.1) has a
+    //     different input vocabulary -- `coat` -> `coat_weight`,
+    //     `subsurface` -> `subsurface_weight`, `coat_IOR` -> `coat_ior`,
+    //     `specular_IOR` -> `specular_ior`, `specular_anisotropy` ->
+    //     `specular_roughness_anisotropy`, `emission` -> `emission_luminance`,
+    //     etc. Several gating predicates inside the passes below
+    //     (`coat == 0`, `subsurface == 0`) reference standard_surface input
+    //     names that simply do not exist on open_pbr_surface; the strip
+    //     would then run UNGATED on every leak-named input.
+    //   * Some open_pbr_surface inputs DO share their name with
+    //     standard_surface inputs (`coat_color`, `subsurface_color`,
+    //     `transmission_color`) but carry DIFFERENT nodedef defaults
+    //     (open_pbr `subsurface_color` default = (0.8, 0.8, 0.8); the
+    //     standard_surface default this file's MAX-MAT-006 list strips
+    //     against is (1, 1, 1)). A wildcard refactor would silently strip
+    //     an artist-authored `subsurface_color = (1, 1, 1)` from an
+    //     open_pbr_surface shader, reverting it to the OpenPBR-default
+    //     darker grey -- a visible appearance change.
+    //   * The OpenPBR `subsurface_radius` input is a `float` (1.0 default);
+    //     the standard_surface input of the same name is a `color3`. A
+    //     wildcard refactor on MAX-MAT-005's pass would call
+    //     `_TryGetStaticColor3` on a float input and currently fail safe
+    //     (parse returns false), but that is accidental safety, not a
+    //     designed bound.
+    // Negative test coverage pinning this bound:
+    //   * `src/Tests/Integration/mtlxShaderWriter_test.ms` ::
+    //     `test_export_openpbr_material_preserves_collision_named_inputs`
+    //     -- exports an OpenPBR() material via MaterialX and asserts the
+    //     collision-named inputs survive verbatim (gated on Max 2025.3+).
+    //   * Python validator
+    //     `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+    //     5c66e23f-c809-45a2-baeb-328d9fe6ddf1/
+    //     validate_openpbr_surface_coverage.py` -- runs all five passes
+    //     on a synthetic doc with a standard_surface AND an
+    //     open_pbr_surface side-by-side, asserts the standard_surface
+    //     leak inputs are stripped and the open_pbr_surface inputs are
+    //     untouched, including idempotence.
     _NormalizeStandardSurfaceSpecularRotation(mtlxDoc);
     _NormalizeStandardSurfaceEmissionDefault(mtlxDoc);
     _NormalizeStandardSurfaceCoatDefaults(mtlxDoc);
