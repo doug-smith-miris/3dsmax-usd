@@ -79,6 +79,7 @@ Status legend:
 | MultiMtl-bound mesh whose faces carry multiple matIds (`materialIdToFacesMap.size() > 1`) | `UsdGeomMesh.primvars:displayColor` -- the MAX-MAT-003 displayColor block writes a SINGLE-element constant primvar derived from `boundMtl->GetDiffuse()` (which on a MultiMtl returns sub-material 0's diffuse via the default `mtlNum = 0`). The block does NOT consult `materialIdToFacesMap` and does NOT broadcast `boundMtl->GetDiffuse(matId)` per face | audit (lock-in of existing MAX-MAT-003 surgical-coverage bound, no C++ logic change) | (mesh primvar; not a shader nodedef -- the audit pins the surgical bound where the MAX-MAT-003 gate STOPS for MultiMtl-bound meshes) | `MeshConverter::ConvertToUSDMesh` is invoked on a mesh whose `node->GetMtl()` is a MultiMtl AND `materialIdToFacesMap.size() > 1`. Surgical bounds: (a) the displayColor block's `boundMtl->GetDiffuse()` call defaults `mtlNum = 0` and returns sub-mtl 0's diffuse, regardless of how many matIds the mesh carries; (b) the resulting `primvars:displayColor` is a SINGLE-element array with `interpolation = constant` -- the C++ block does not consume `materialIdToFacesMap` even though `ApplyMaxMaterialIDs` (called immediately before the block) does use it to author per-face GeomSubsets in the `materialBind` family (MAX-GEO-002); (c) a wildcard "extend MAX-MAT-003 to per-face for MultiMtl bindings" widening would consume the same `materialIdToFacesMap` to broadcast `boundMtl->GetDiffuse(matId)` per face, authoring `interpolation = uniform` and `len = materialIdToFacesMap.size()` -- the value at `displayColor[0]` would still be sub-mtl 0's diffuse, so every existing displayColor[0] / branch-label / IsAuthored assertion would pass; only the array-length and interpolation invariants catch this widening; (d) the IsAuthored() short-circuit and the wire-color fallback branches are unchanged on the MultiMtl path -- the bound applies only to the `mtl-diffuse` branch when the bound material is a MultiMtl | MAX-MAT-008 | 2026-06-26 |
 | 3ds Max legacy light classes that inherit `LightObject` but NOT `LightscapeLight` (`Omnilight` = `OMNI_LIGHT_CLASS_ID`; `Skylight` = `SKYLIGHT_CLASS_ID`; legacy `Target_Spot` / `Free_Spot` = `SPOT_LIGHT_CLASS_ID`; legacy `Target_Direct` / `Free_Direct` = `DIR_LIGHT_CLASS_ID`; mr_Sky, Daylight environment lights, etc.) | NO `UsdLux*` prim authored -- the writer-registry's only general-purpose light writer (`PhotometricLightWriter`) gates on `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)`, returns `ContextSupport::Unsupported` for every non-LightscapeLight, and `MaxUsdPrimWriterRegistry::FindWriter` returns nullptr (no other registered writer claims a `LightObject`). The light is silently dropped from the exported stage: no prim, no error, no warning | audit (lock-in of existing writer-registry surgical-coverage bound, no C++ logic change) | (UsdLux schema; not a shader nodedef -- the audit pins the writer-registry's bottom bound for lights) | `PhotometricLightWriter::CanExport` is invoked AND `!exportArgs.GetTranslateLights() || !object->IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)`. Surgical bounds: (a) the LIGHTSCAPE_LIGHT_CLASS branch returns `ContextSupport::Fallback` so in-scope photometric / physical lights are authored as the correct `UsdLuxDiskLight` / `UsdLuxRectLight` / `UsdLuxSphereLight` / `UsdLuxCylinderLight` per `GetPrimType` -- the positive control proves this still fires; (b) every non-LightscapeLight LightObject (legacy Omnilight, Skylight, Spot, Direct, etc.) returns Unsupported AND no other registered writer claims the LightObject category -- silent drop. A wildcard widening that returned `Fallback` for every LightObject and stamped out default UsdLuxSphereLight / UsdLuxDomeLight without per-class attribute translation would author spurious extra lights at every legacy light position (e.g. an Omnilight that was turned OFF / set to multiplier 0 / set to a non-default attenuation/color in Max would silently appear as a unit-intensity SphereLight in USD); (c) the `exportArgs.GetTranslateLights()` short-circuit fires BEFORE the class-id gate -- a user who disables light export sees the same nullptr for every light type, including in-scope photometrics; (d) `IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)` is safely callable on non-light Objects (returns false) so the gate is well-behaved across all node types | MAX-LIT-001 | 2026-06-26 |
 | Color-space metadata across all three USD-shading writer paths: `MtlxShaderWriter::_SetInputValue` (color3/color4 inputs + filename-on-image-color-output inputs); `set_bitmap_scale_bias_sourcecolorspace` in `usd_material_writer.py` (every UsdUVTexture); `LastResortUSDPreviewSurfaceWriter::Write` (Color3f diffuseColor value, no UsdUVTexture) | Three divergent conventions, one per writer: MaterialX path authors `colorSpace` USD metadata on the UsdShade input attribute IFF `_TypeSupportsColorSpace(input)` is true AND `getActiveColorSpace()` is non-empty; UsdPreviewSurface Python writer authors `sourceColorSpace = "raw"` as a TOKEN INPUT on every baked UsdUVTexture (hardcoded with TODO retirement condition); LastResort C++ writer authors NEITHER colorSpace nor sourceColorSpace -- `diffuseColor` is linear by UsdPreviewSurface spec when authored as a Color3f value | audit (lock-in of existing cross-writer color-space surgical-coverage bound, no C++ logic change) | (multiple: `colorSpace` USD metadata on UsdShade input attrs for MaterialX shaders; `sourceColorSpace` TOKEN INPUT on UsdUVTexture for baked UsdPreviewSurface paths; no colorSpace anywhere on the LastResort value-only path) | `_SetInputValue` is invoked AND `_TypeSupportsColorSpace(input)` is true AND `getActiveColorSpace()` is non-empty -- the MaterialX path propagates; `set_bitmap_scale_bias_sourcecolorspace` is invoked on a baked UsdUVTexture -- always hardcoded "raw" pending TODO retirement; `LastResortUSDPreviewSurfaceWriter::Write` is invoked -- value-only, no UsdUVTexture, no colorSpace by UsdPreviewSurface spec. Surgical bounds: (a) `_TypeSupportsColorSpace` accepts ONLY color3/color4 typed inputs OR filename inputs on image nodes with color3/color4 output -- every other input type (float, vector3, matrix, etc.) MUST NEVER receive colorSpace metadata even when the MaterialX active color space resolves to a non-empty name; (b) `if (!colorSpace.empty())` short-circuit -- empty active color space MUST NOT cause `SetColorSpace(TfToken(""))` because that creates authored-empty metadata distinct from no-metadata-at-all; (c) hardcoded `sourceColorSpace = "raw"` is the acknowledged-incomplete UsdPreviewSurface bound -- retirement requires a future MAX-MAT-* that consults `from_tex.bitmap.gamma` and adds an sRGB-gamma test case to `export_texture_test.py`; (d) LastResort writer authors NO UsdUVTexture child AND NO `colorSpace` metadata on `diffuseColor` -- per UsdPreviewSurface spec, the value is linear by definition | MAX-MAT-009 | 2026-06-26 |
+| Two or more 3ds Max nodes that share one Object (USD-instance pair) but each Node has a different `.material` assignment (per-instance material override). Special case: at least one of the divergent materials is a MultiMtl whose Object carries per-face matIds (`ApplyMaxMaterialIDs` has authored `materialBind`-family GeomSubsets on the prototype child) | THREE override-structure carriers, one per surgical branch: (a) USD instancing PRESERVED (`IsInstanceable() == true`) with per-instance MaterialBindingAPI authored on the local instance prim spec (non-MultiMtl divergence, or MultiMtl-without-subsets divergence -- Branches B and C of the four-branch decision tree); (b) USD instancing BROKEN (`SetInstanceable(false)`) + the prototype's `materialBind`-family GeomSubsets COPIED to an override-child Mesh prim under the divergent instance with `customData[3dsmax:matId]` preserved across the copy + each copied subset bound to the divergent MultiMtl's sub-material (Branch D, the per-instance MultiMtl override case that requires breaking instancing because USD subset bindings on the prototype apply to every instance); (c) MtlSwitcher container materials authored as `UsdShade.Material` with `shadingVariant` UsdVariantSet of N internal-references (variant-sets export style, Branch E) OR single `AddInternalReference` to the active material with no variant set (active-only / 1-variant-fallback, Branch F) OR bare `UsdShade.Material` prim with no references and no variant set (empty switcher, Branch G) | audit (lock-in of existing four-Branches-A/B/C/D + three-Branches-E/F/G override-structure surgical-coverage bound, no C++ logic change) | (multiple non-shader USD constructs: `pxr::Usd.Prim.SetInstanceable`; `pxr::UsdGeom.Subset` + `customData[3dsmax:matId]`; `pxr::UsdShade.MaterialBindingAPI`; `pxr::Usd.VariantSet` (`shadingVariant`); `pxr::Usd.Prim.GetReferences().AddInternalReference`) | `_AddInstancePrimsToMaterialMap` is invoked AND `prototype.GetInstances()` returns >=2 instances. Surgical bounds: (a) sameMaterialForAllInstances == true -> KEEP instancing, bind on the inheritance-base prim's child (Branch A); (b) different non-MultiMtl materials -> KEEP instancing, per-instance MaterialBindingAPI on the instance prim's local spec (Branch B); (c) different MultiMtl, NO subsets on the prototype child -> KEEP instancing, per-instance MaterialBindingAPI via `customData[3dsmax:matId]` lookup (Branch C); (d) different MultiMtl, subsets DO exist on the prototype child -> `BreakInstancingAndCopySubset` runs: `SetInstanceable(false)` + subset copy with matId customData preserved + rebind copied subsets to divergent MultiMtl's sub-mtls (Branch D, the data-loss vector the audit primarily pins). Plus three switcher-shape bounds: (e) AsVariantSets >=2 variants -> `shadingVariant` UsdVariantSet authored with one internal-reference per variant (Branch E); (f) ActiveMaterialOnly OR 1-variant AsVariantSets fallback -> NO variant set, single `AddInternalReference` to active material (Branch F); (g) empty switcher -> warn + early-return, bare Material prim, NO variant set, NO references (Branch G) | MAX-MAT-010 | 2026-06-26 |
 
 ## Notes per expression
 
@@ -3571,6 +3572,333 @@ new MaxScript test case in `export_texture_test.py` exercising an
 sRGB-gamma diffuse map. Until that bite lands, the hardcoded "raw"
 is the surgical bound.
 
+### Material-instance / Multi-Mtl override-structure fidelity (audit, four-branch decision tree + three-shape MtlSwitcher writer STOP HERE) (MAX-MAT-010)
+
+**Symptom.** The 3ds Max -> USD exporter has TWO file paths that
+together preserve per-instance material override structure when
+multiple Max nodes share one Object (USD-instance pair) but each
+Node carries a different `.material` assignment:
+
+1. **`src/MaxUsd/Translators/ShadingUtils.cpp::_AddInstancePrimsToMaterialMap`**
+   -- the four-branch decision tree that picks how to author
+   material bindings when several USD instances share a single
+   prototype:
+
+       Branch A -- sameMaterialForAllInstances == true
+         -> KEEP instancing; bind on the inheritance-base prim's
+            child (the prototype's master mesh). USD composition
+            propagates the binding to every instance.
+
+       Branch B -- different materials, non-MultiMtl
+         -> KEEP instancing; per-instance MaterialBindingAPI on
+            the instance prim's local spec. The override-side
+            opinion wins at composition time over the prototype's.
+
+       Branch C -- different materials, MultiMtl, NO subsets on
+                   the prototype's child (single-matId case)
+         -> KEEP instancing;
+            `_AddPrimWithMultiMaterialtoMaterialMap` takes the
+            no-subset sub-branch and looks up the matching
+            sub-material via `customData[3dsmax:matId]` on the
+            prototype child, binding the result on the instance
+            prim's path.
+
+       Branch D -- different materials, MultiMtl, subsets DO exist
+                   on the prototype's child
+         -> BREAK instancing via `BreakInstancingAndCopySubset`:
+            `instancePrim.SetInstanceable(false)`, then copy the
+            prototype's `materialBind`-family GeomSubsets onto a
+            new override-child Mesh prim under the divergent
+            instance with `customData[3dsmax:matId]` preserved,
+            then rebind each copied subset to the divergent
+            MultiMtl's sub-material. This is the KEY bound the
+            audit pins; a regression here silently DROPS per-
+            instance MultiMtl overrides on every export.
+
+2. **`src/translators/MtlSwitcherWriter.cpp::Write` / `::PostWrite`**
+   + **`src/translators/MultiMaterialUtils.cpp::DiscoverMaterialIDsAndCreateBundles`**
+   -- the parallel switcher-driven path that turns a Max 2024+
+   `MaterialSwitcher` (`MATERIAL_SWITCHER_CLASS_ID`) into a
+   `UsdShade.Material` carrying THREE override-structure shapes:
+
+       Branch E -- AsVariantSets export style, >=2 variants
+         -> author a `shadingVariant` UsdVariantSet on the switcher
+            material prim; for each candidate material, AddVariant
+            + SetVariantSelection + AddInternalReference inside the
+            variant edit context, then default the selection to the
+            active material's variantName. MultiMtl-nested-in-
+            switcher cases run `BindPlaceholderMatsToGeom` +
+            `BindVariantBundleToMat` to author per-MatID placeholder
+            material prims that get referenced INTO each variant.
+
+       Branch F -- ActiveMaterialOnly OR 1-variant AsVariantSets
+                   fallback (the constructor's
+                   `variantMaterials.size() == 1` short-circuit)
+         -> NO variant set; single `AddInternalReference` to the
+            active material at the switcher material level.
+
+       Branch G -- empty switcher (`variantMaterials.empty()`)
+         -> emit `MaxUsd::Log::Warn` describing the empty switcher
+            AND early-return. Bare `UsdShade.Material` prim
+            remains; NO variant set authored, NO references
+            authored. The Material prim itself MUST be defined
+            (the writer-registry path creates it before `Write()`
+            runs); the empty short-circuit deliberately does NOT
+            author placeholder references.
+
+The planner auto-emitted `material-instance-override-fidelity` with
+severity High and rationale "Preserve Max sub-material / multi-
+material override structure as USD MaterialX nodegraph +
+references" without a captured corpus of mistranslations on this
+fork (the existing diagnostic corpus is single-mesh / single-
+material, no instance-divergence, no switcher containers). The
+literal reading would be a "unify override handling" refactor
+collapsing the four ShadingUtils branches and the three
+MtlSwitcher branches onto a single helper.
+
+**Why it matters.** Each branch's behavior is correct for its own
+input shape, but the seven shapes DIVERGE on every axis a unification
+refactor would have to bridge:
+
+| Concept | Branch A (same-mtl-all) | Branch B (diff-non-Multi) | Branch C (diff-Multi-no-subsets) | Branch D (diff-Multi-with-subsets) | Branch E (switcher AsVariantSets >=2) | Branch F (switcher single) | Branch G (switcher empty) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Instancing preserved | YES (bind on prototype) | YES (bind on instance) | YES (matId via customData) | **NO -- BROKEN** (KEY bound) | N/A (no instancing) | N/A | N/A |
+| Authoring point | Prototype child mesh | Instance prim local spec | Instance prim local spec | Override-child Mesh prim under instance | Variant edit context inside `shadingVariant` set | Switcher material prim directly | (none -- bare prim) |
+| Reference shape | `material:binding` rel to material prim | `material:binding` rel to material prim | `material:binding` rel via `customData[3dsmax:matId]` | `material:binding` rel on COPIED subsets under override-child mesh | `AddInternalReference` inside each variant + per-MatID placeholder material prims (if MultiMtl-nested) | Single `AddInternalReference` to active material | (none -- bare prim) |
+| Variant set | (none -- not a switcher) | (none -- not a switcher) | (none -- not a switcher) | (none -- not a switcher) | `shadingVariant` UsdVariantSet, 1 variant per candidate | (none) | (none) |
+| Subset copy | (none) | (none) | (none -- no subsets to copy) | **REQUIRED** with matId customData preserved | (only inside Branch D nested inside switcher's MultiMtl case) | (only inside Branch D nested inside switcher's MultiMtl case) | (none) |
+| Failure mode of a wildcard widening | "Always break instancing" bloats every stage with N-times the master meshes -- USD instancing optimization lost | "Always break instancing" or "always author on instance" both bloat stages with extra structural noise the asset didn't need | "Always break instancing" causes a subset-copy that has nothing to copy -- crashes or empty-subset desync | **Dropping `BreakInstancingAndCopySubset` silently LOSES per-instance MultiMtl overrides -- data-loss vector** | Authoring references OUTSIDE the variant edit context collapses every candidate onto a single composition layer, losing variant semantics | Authoring an empty 1-variant `shadingVariant` set bloats single-material switcher exports + creates "select one of one" UX downstream tools can't act on | Authoring placeholder references on the empty case either creates composition-time errors (unresolvable paths) or silently binds every empty switcher to a sentinel default material the Max source never intended |
+
+The seven branches serve three different USD primitives
+(instancing-preserving vs instancing-breaking on the prim-instancing
+axis; per-instance MaterialBindingAPI vs variant set on the override-
+carrier axis; reference target = material prim vs reference target =
+placeholder material prim on the switcher-MultiMtl-nested axis). A
+wildcard "unify override handling" refactor that ported any one
+branch's shape to the others would either:
+
+* silently drop USD instancing on the common case (regressing
+  Branches A/B/C onto Branch D's instancing-broken shape);
+* silently drop per-instance MultiMtl overrides on the data-loss
+  case (regressing Branch D onto Branch A/B/C's no-break shape and
+  losing the divergent MultiMtl's sub-material binding entirely);
+* silently bloat every single-material switcher into a 1-variant
+  variant set (regressing Branch F onto Branch E's variant-set
+  shape); or
+* silently bind every empty switcher to a sentinel default
+  (regressing Branch G onto Branch F's single-reference shape).
+
+**Fix.** None. The existing C++ code is already correct (the four-
+branch decision tree in `_AddInstancePrimsToMaterialMap`, the
+parallel instance-break path in `DiscoverMaterialIDsAndCreateBundles`,
+and the three-shape switcher writer all preserve their own surgical
+bound). The audit lands:
+
+1. **Surgical-bounds comment block** at three sites:
+   * `ShadingUtils.cpp` above `_AddInstancePrimsToMaterialMap` --
+     enumerates the four Branches A/B/C/D with the action taken on
+     each, the surgical bound preserved, the data-loss / bloat /
+     desync failure modes a widening would introduce, and the
+     validator case mapping.
+   * `MultiMaterialUtils.cpp` above `DiscoverMaterialIDsAndCreateBundles`
+     -- enumerates the two Switcher-Branches (A and D) that mirror
+     the parent decision tree under a switcher context, plus the
+     two-file-split rationale (why the switcher pipeline can't
+     share the per-instance-binding path with the non-switcher
+     pipeline -- bundle creation needs the subset-copy to happen
+     INLINE before matID-set discovery downstream).
+   * `MtlSwitcherWriter.cpp` above `Write()` -- enumerates the three
+     switcher-shape Branches E/F/G with the action taken, the
+     surgical bound preserved, the failure modes a widening would
+     introduce, and the validator case mapping. Plus the nested-
+     Multi "directly connected to an object" precondition that
+     gates whether the function runs at all.
+
+2. **MaxScript regression** `test_material_instance_override_fidelity_audit`
+   in `src/Tests/Integration/export_instance_test.ms`. Builds two
+   Boxes with `create_clone <box1> #instance "box2"` (USD instance
+   pair) and assigns DIFFERENT MultiMtls to each (`box1.material =
+   multiA_red_blue`, `box2.material = multiB_green_yellow`, both
+   with half-and-half matId partitions). Exports through
+   `USDExporter` and asserts:
+   * **Surgical bound 1 / Branch A control** -- `/box1` keeps
+     instancing (`IsInstanceable() == True`). A regression that
+     turned this assertion would mean the writer has started
+     always-breaking instancing on every divergent-material case,
+     regressing the entire four-branch tree onto a single "always
+     break" shape.
+   * **Surgical bound 2 / Branch D KEY bound** -- `/box2` has
+     `IsInstanceable() == False` (the `SetInstanceable(false)` from
+     `BreakInstancingAndCopySubset` landed). If this assertion
+     fails, the C++ has dropped the instancing-break and per-
+     instance MultiMtl overrides are being silently LOST on every
+     export -- the data-loss vector this audit primarily pins.
+   * **Surgical bound 3 / override prim authored** -- `/box2`
+     carries an override-child Mesh prim that hosts the copied
+     subsets (the `BreakInstancingAndCopySubset` step (ii) -- a
+     mesh prim must exist under the divergent instance to anchor
+     the per-instance bindings).
+   * **Surgical bound 4 / customData preserved** -- the
+     `MaterialBindingAPI.GetMaterialBindSubsets()` on the override-
+     child mesh returns TWO subsets each carrying
+     `customData[3dsmax:matId]` preserved across the
+     `BreakInstancingAndCopySubset` copy. The `SubsetInfo` ctor's
+     +1/-1 round-trip keeps the matId value byte-identical with
+     the prototype's.
+
+3. **Python validator** at
+   `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/1a92bee3-23b8-4465-93cf-122a6758ad16/validate_material_instance_override_surgical.py`.
+   Builds a synthetic USD stage mirroring exactly what the C++
+   code paths produce across all seven branches in ONE fixture,
+   then asserts each branch's invariant by named case + a final
+   `CrossPath_Divergence` simultaneous-invariants case + an
+   idempotence check:
+
+   | Case in synthetic fixture | Surgical bound exercised |
+   | --- | --- |
+   | `SameMaterial_KeepInstancing` | Branch A -- two instances both `IsInstanceable() == True`, prototype carries the shared binding on its own local spec; per-instance spec MUST NOT author a local `material:binding` relationship |
+   | `DifferentMaterial_NonMulti` | Branch B -- both instances `IsInstanceable() == True`; divergent instance carries a per-instance `material:binding` rel on its own local spec to the divergent material; non-divergent instance does NOT author a local rel |
+   | `DifferentMaterial_MultiNoSubsets` | Branch C -- both instances `IsInstanceable() == True`; prototype carries `customData[3dsmax:matId]` for the no-subset MultiMtl-resolution path; divergent instance carries per-instance `material:binding` on its own local spec |
+   | `DifferentMaterial_MultiWithSubsets` | Branch D (KEY bound) -- non-divergent instance `IsInstanceable() == True`; divergent instance `IsInstanceable() == False`; override-child mesh prim under divergent instance hosts COPIED subsets (named matching the prototype's: `mat_1`, `mat_2`) with `customData[3dsmax:matId]` preserved (1 and 2) and original indices preserved ([0,1,2] and [3,4,5]); each copied subset is bound to the divergent MultiMtl's sub-material |
+   | `Switcher_VariantSets_TwoMaterials` | Branch E -- `shadingVariant` UsdVariantSet authored with one variant per candidate material; each variant's edit context adds an `AddInternalReference` to the matching material prim; active variant default is preserved |
+   | `Switcher_ActiveOnly_OneMaterial` | Branch F -- NO variant set authored; single `AddInternalReference` to active material via the switcher material's `GetPrim().GetReferences()` |
+   | `Switcher_Empty_NoVariantSet` | Branch G -- bare `UsdShadeMaterial` prim, NO variant set, NO internal references, but the Material prim itself MUST exist (the writer-registry creates it before `Write()` runs and the empty short-circuit deliberately does NOT delete it) |
+   | `CrossPath_Divergence` | All seven branches preserve their own convention simultaneously on the same fixture -- a unification refactor that bridged any two branches would either break their own conventions (caught by per-branch cases above) OR violate the simultaneous-invariants assertion here |
+
+   Plus an idempotence check (a second pass over the same fixture
+   yields identical PASS state on all 8 cases). All 8 cases +
+   idempotence pass on the 2026-06-26 baseline against pxr.Usd
+   0.25.5, locking in the cross-branch surgical bound. A future
+   regression that widened any of the seven branches would fail by
+   named case.
+
+**Bounds (where the C++ today conservatively does nothing):**
+
+* `_AddInstancePrimsToMaterialMap`'s `sameMaterialForAllInstances`
+  gate fires on a per-prototype basis. The walk over
+  `instancePrims.begin() + 1` is short-circuit-friendly (one
+  divergent instance flips the bit). Every divergent-instance
+  branch (B/C/D) authors only on the divergent instances; non-
+  divergent instances inherit silently from the prototype. The
+  gate does NOT widen to a "per-instance authoring on every
+  instance" shape even when convenient -- the same-material case
+  is the common case and the optimization matters.
+* The `MultiMtl* multiMaterial = dynamic_cast<MultiMtl*>(material)`
+  cast in Branches B vs C/D is exact -- a non-MultiMtl that
+  happens to expose `IsMultiMtl() == true` via a custom Mtl
+  subclass would still hit Branch B because the cast returns
+  nullptr. The audit pins the cast as the divergence gate.
+* `BreakInstancingAndCopySubset` is invoked ONLY when the prototype
+  child carries non-empty `materialBind`-family subsets. The
+  no-subset MultiMtl case (Branch C) intentionally does NOT break
+  instancing -- there's nothing to copy, and the no-subset
+  sub-branch in `_AddPrimWithMultiMaterialtoMaterialMap` resolves
+  the matId via the prototype's customData. A widening that ran
+  the break unconditionally on every MultiMtl divergence would
+  produce empty override-child Mesh prims with no subsets, which
+  USD composition would happily author but downstream consumers
+  would misread as "no per-instance override".
+* The `MtlSwitcherWriter` constructor's
+  `variantMaterials.size() == 1 && AsVariantSets` short-circuit
+  (lines 43-46) silently rewrites the export style to
+  `ActiveMaterialOnly` so Branch E never authors a 1-variant
+  `shadingVariant` set. This is deliberate: a 1-variant variant
+  set is a UI/UX anti-pattern downstream variant-aware tools
+  cannot meaningfully act on.
+* `MtlSwitcherWriter::Write`'s empty-switcher short-circuit
+  (lines 51-58, with the post-MAX-MAT-010 comment block) emits a
+  `Log::Warn` BEFORE the early-return. The warning is observability
+  for the artist; the early-return is the writer-side contract
+  that no further authoring happens. The bare Material prim that
+  the writer-registry pre-defined remains so downstream tools
+  that walked the prim before `Write()` ran see a valid (if empty)
+  Material -- the empty short-circuit does not retroactively
+  delete the prim.
+
+**Visual demonstration of the surgical bound.** Two concrete cube
+meshes (`/Box_1`, `/Box_2`) side-by-side at worldspace +/-0.75 on X,
+each carrying TWO `materialBind`-family `UsdGeomSubset`s mirroring a
+3ds Max MultiMtl-bound half-and-half matId partition. The postfix
+stage authors `/Box_2`'s subsets bound to GREEN + YELLOW (the
+per-instance override LANDED); the still-broken stage authors
+`/Box_2`'s subsets bound to RED + BLUE (the override was LOST;
+`/Box_2` silently inherits the prototype's bindings). Lit by two
+`UsdLuxDistantLight`s and rendered in Karma CPU at 512x373 via
+`usdrecord --renderer "Karma CPU"`.
+
+`render_karma_postfix.png` (the current correct behavior): the
+LEFT half of the frame (BOX_1) reads RED on the front-three faces
+and BLUE on the top three; the RIGHT half (BOX_2) reads GREEN on
+the front-three faces and YELLOW on the top three -- the per-
+instance override is observable as a distinct color shape on the
+divergent instance. Measured per-half foreground channel means
+over the visible cube pixels in each frame half:
+
+```
+POSTFIX  LEFT half  (BOX_1 red+blue):       R= 48.21  G= 20.26  B= 23.76
+POSTFIX  RIGHT half (BOX_2 GREEN+YELLOW):   R= 24.10  G= 50.12  B= 25.87
+PNG SHA-256                                 3fac6743...
+```
+
+`render_unreal_reference.png` (the "override silently lost"
+wildcard-refactor counterfactual): `/Box_2`'s subsets are bound to
+the same RED+BLUE materials as `/Box_1`. Both halves of the frame
+read red-on-front + blue-on-top -- the frame is effectively
+mirror-symmetric about the vertical center, two red-and-blue cubes:
+
+```
+STILL-BROKEN LEFT half  (BOX_1 red+blue, SAME):           R= 48.21  G= 20.25  B= 23.76
+STILL-BROKEN RIGHT half (BOX_2 red+blue, OVERRIDE LOST):  R= 48.23  G= 20.26  B= 23.74
+PNG SHA-256                                               817aef25...
+```
+
+Directional delta (postfix - still-broken):
+
+```
+LEFT half  (lighting/camera invariant control):  dR= -0.00  dG= +0.00  dB= +0.00
+RIGHT half (override-induced color shift):       dR=-24.14  dG=+29.87  dB= +2.12
+```
+
+The LEFT-half delta is ~0 on every channel because BOX_1's
+bindings are identical in both renders -- this is the
+lighting/camera/sampling invariant control that confirms the
+fixture itself hasn't drifted between renders. The RIGHT-half
+delta is **large, monotone, and directional**: R drops by ~24/255
+(red replaced by green), G rises by ~30/255 (green is the
+dominant color on BOX_2's front faces), B is approximately
+constant (~+2/255; both blue and yellow have moderate B). PNGs are
+SHA-256-distinct. Composite at `compare_side_by_side.png`.
+**Auditor's checklist: the postfix's RIGHT box reads visibly
+GREEN + YELLOW while the still-broken's RIGHT box reads RED +
+BLUE; both renders' LEFT boxes read RED + BLUE identically; the
+RIGHT-half delta is monotone (R drops, G rises, B holds) with no
+chromatic shift; the LEFT-half delta is bytewise zero; the two
+PNGs have distinct SHA-256s.** A refactor that ever made the
+postfix RIGHT box read red+blue OR made the still-broken RIGHT
+box read green+yellow OR introduced a non-zero LEFT-half delta
+would mean either per-instance override preservation has
+regressed (the bound MAX-MAT-010 locks in has broken) or the
+fixture itself drifted between renders.
+
+**Retirement condition.** This audit does not have an upstream-fix
+retirement condition. The bound it locks in is a SCOPE limit on
+Miris-authored C++: the four-branch decision tree in
+`_AddInstancePrimsToMaterialMap` + the parallel instance-break
+path in `DiscoverMaterialIDsAndCreateBundles` + the three-shape
+switcher writer in `MtlSwitcherWriter` stay distinct and each
+preserves its own surgical bound. Retirement requires a SEPARATE
+future MAX-MAT-* bite (with its own captured corpus, MaxScript
+regression, doc entry, and validator) that genuinely needs to
+unify any two of the seven branches -- not a wildcard widening of
+the existing scope. A specific known retirement candidate: an
+opt-in option (`exportOptions.preserveInstancingOnDivergentMultiMtl
+= false`) that swaps Branch D's `BreakInstancingAndCopySubset` for
+a "duplicate the prototype's mesh data on the divergent instance"
+shape, useful for downstream consumers that strictly reject
+non-instanceable prims; that swap is a separate concern with its
+own audit shape and would land alongside the existing audit, NOT
+as a replacement for it.
+
 ## Expressions with no MaterialX equivalent
 
 | Source (3ds Max) | Why no equivalent | Behavior in current fork |
@@ -4423,4 +4751,117 @@ is the surgical bound.
   (the specific known retirement work being the gamma-consultation
   swap in `set_bitmap_scale_bias_sourcecolorspace`); until then, the
   three divergent conventions are the documented, locked-in
+  behaviour.
+* 2026-06-26 — MAX-MAT-010 material-instance / Multi-Mtl
+  override-structure fidelity audit: introduce the MAX-MAT-010
+  entry to the mapping doc, locking in the four-branch decision
+  tree in `_AddInstancePrimsToMaterialMap` + the parallel
+  instance-break path in `DiscoverMaterialIDsAndCreateBundles` +
+  the three switcher-shape branches in `MtlSwitcherWriter` that
+  together preserve Max sub-material / multi-material override
+  structure on the USD layer. The planner auto-emitted
+  `material-instance-override-fidelity` (severity High, rationale
+  "Preserve Max sub-material / multi-material override structure
+  as USD MaterialX nodegraph + references") without a captured
+  corpus of per-instance override mistranslations. **Why the
+  wildcard widening would be wrong**: each branch's behavior is
+  correct for its own input shape, but the seven shapes diverge
+  on every axis a "unify override handling" refactor would have
+  to bridge -- instancing-preserving (Branches A/B/C) vs
+  instancing-breaking (Branch D); per-instance MaterialBindingAPI
+  (Branches B/C) vs variant set (Branch E) on the override-
+  carrier axis; reference target = material prim (Branches E/F)
+  vs reference target = placeholder material prim (Branch E
+  nested-MultiMtl case) on the switcher-MultiMtl-nested axis.
+  Collapsing any two would either drop USD instancing on the
+  common case (regressing A/B/C onto D's shape, bloating every
+  exported stage), drop per-instance MultiMtl overrides on the
+  data-loss case (regressing Branch D onto A/B/C's no-break
+  shape, the KEY data-loss vector this audit primarily pins),
+  bloat single-material switcher exports with a 1-variant
+  `shadingVariant` set (regressing Branch F onto Branch E), or
+  silently bind every empty switcher to a sentinel default
+  (regressing Branch G onto Branch F). Surgical-bounds comment
+  block added to three sites:
+  `ShadingUtils.cpp::_AddInstancePrimsToMaterialMap` (enumerates
+  Branches A/B/C/D with action, surgical bound, failure mode of
+  a wildcard widening, and validator case mapping);
+  `MultiMaterialUtils.cpp::DiscoverMaterialIDsAndCreateBundles`
+  (enumerates the Switcher-Branches A + D that mirror the parent
+  decision tree under a switcher context, plus the two-file-split
+  rationale -- why the switcher pipeline cannot share the per-
+  instance-binding path with the non-switcher pipeline); and
+  `MtlSwitcherWriter.cpp::Write` (enumerates the three switcher-
+  shape Branches E/F/G with action, surgical bound, failure mode,
+  and validator case mapping). New MaxScript regression
+  `test_material_instance_override_fidelity_audit` added to
+  `src/Tests/Integration/export_instance_test.ms`: builds two
+  Boxes with `create_clone <box1> #instance "box2"` (USD instance
+  pair) and assigns DIFFERENT MultiMtls (red+blue on box1,
+  green+yellow on box2, both half-and-half matId partitions);
+  exports through `USDExporter` and asserts `/box1.IsInstanceable()
+  == True` (Branch A control), `/box2.IsInstanceable() == False`
+  (Branch D KEY bound -- the `BreakInstancingAndCopySubset`
+  landed), an override-child Mesh prim exists under `/box2`
+  hosting the copied subsets, the MaterialBindingAPI returns
+  exactly TWO copied subsets in the materialBind family, and
+  each subset carries `customData[3dsmax:matId]` preserved across
+  the copy. Python validator `validate_material_instance_override_surgical.py`
+  (8 named cases + idempotence: `SameMaterial_KeepInstancing`,
+  `DifferentMaterial_NonMulti`, `DifferentMaterial_MultiNoSubsets`,
+  `DifferentMaterial_MultiWithSubsets`,
+  `Switcher_VariantSets_TwoMaterials`,
+  `Switcher_ActiveOnly_OneMaterial`, `Switcher_Empty_NoVariantSet`,
+  `CrossPath_Divergence`) builds a synthetic USD stage that
+  simultaneously mirrors all seven branches and asserts each
+  branch's invariant by named case + a final cross-branch
+  simultaneous-invariants assertion. All 8 cases + idempotence
+  pass on the 2026-06-26 baseline against pxr.Usd 0.25.5. Karma
+  CPU visual auditor pair (`render_karma_postfix.png` /
+  `render_unreal_reference.png` / `compare_side_by_side.png`)
+  uses two concrete cube meshes side-by-side: BOX_1 always reads
+  red on front-three faces + blue on top-three; BOX_2 reads
+  GREEN + YELLOW when the per-instance override LANDED (postfix)
+  and red + blue when the override was LOST (still-broken). Per-
+  half foreground means: postfix LEFT (BOX_1 red+blue)
+  R=48.21/G=20.26/B=23.76 and postfix RIGHT (BOX_2 GREEN+YELLOW)
+  R=24.10/G=50.12/B=25.87; still-broken LEFT
+  R=48.21/G=20.25/B=23.76 (BYTE-IDENTICAL to postfix LEFT) and
+  still-broken RIGHT (BOX_2 red+blue, OVERRIDE LOST)
+  R=48.23/G=20.26/B=23.74. Directional delta (postfix -
+  still-broken): LEFT-half dR/dG/dB = (-0.00, +0.00, +0.00) --
+  the lighting/camera invariant control; RIGHT-half dR/dG/dB =
+  (-24.14, +29.87, +2.12) -- the override-induced color shift,
+  monotone and structured (R drops, G rises, B holds, no
+  chromatic shift). PNGs are SHA-256-distinct (`3fac6743...` vs
+  `817aef25...`). Unlike MAX-MAT-007's SSS-lobe-diluted ~0.56/255
+  delta this is a **large, monotone, directional** signal because
+  the toggled per-instance binding swaps between two color pairs
+  that share G as the primary differentiator. Auditor's
+  checklist: **the postfix's RIGHT box reads visibly GREEN +
+  YELLOW while the still-broken's RIGHT box reads RED + BLUE;
+  both renders' LEFT boxes read identically; the RIGHT-half
+  delta is monotone with R drops + G rises + B holds; the LEFT-
+  half delta is bytewise zero; the two PNGs have distinct
+  SHA-256s**. A refactor that ever made the postfix RIGHT box
+  read red+blue OR made the still-broken RIGHT box read
+  green+yellow OR introduced a non-zero LEFT-half delta would
+  mean either per-instance override preservation has regressed
+  (the bound MAX-MAT-010 locks in has broken) or the fixture
+  itself drifted between renders. No C++ logic change in this
+  bite -- purely additive observability + test + doc
+  infrastructure that locks in the surgical contract before any
+  "unify override handling" refactor lands. Retires the day a
+  SEPARATE future MAX-MAT-* genuinely needs to unify any two of
+  the seven branches with its own captured corpus + its own
+  MaxScript regression + its own doc entry; a specific known
+  retirement candidate is the
+  `exportOptions.preserveInstancingOnDivergentMultiMtl = false`
+  opt-in that swaps Branch D's `BreakInstancingAndCopySubset` for
+  a "duplicate the prototype's mesh data on the divergent
+  instance" shape (useful for downstream consumers that strictly
+  reject non-instanceable prims) -- that swap is a separate
+  concern with its own audit shape and would land ALONGSIDE the
+  existing audit, NOT as a replacement for it. Until then, the
+  seven-branch decision tree is the documented, locked-in
   behaviour.

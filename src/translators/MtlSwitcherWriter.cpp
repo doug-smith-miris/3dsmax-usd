@@ -46,6 +46,95 @@ MtlSwitcherWriter::MtlSwitcherWriter(
     }
 }
 
+// -----------------------------------------------------------------------------
+// MAX-MAT-010 surgical-coverage bound (material-instance / Multi-Mtl
+// override-structure fidelity audit, 2026-06-26).
+//
+// `MtlSwitcherWriter::Write` (this function) and `::PostWrite` (below)
+// together translate a Max 2024+ Material Switcher (the
+// MATERIAL_SWITCHER_CLASS_ID node, which carries N candidate
+// materials with an active selection) into a UsdShade.Material
+// override-structure carrier. The shape that lands depends on three
+// surgical branches:
+//
+//   Switcher-Branch E (`exportStyle == AsVariantSets` AND
+//                      `variantMaterials.size() >= 2`)
+//     * Action: author a `shadingVariant` UsdVariantSet on the
+//       material prim; for each candidate material, AddVariant +
+//       SetVariantSelection + AddInternalReference inside the
+//       variant edit context, then default the variant selection
+//       to the active material's variantName. When any candidate
+//       is a MultiMtl, BindPlaceholderMatsToGeom + BindVariantBundleToMat
+//       run to author per-MatID placeholder material prims (one per
+//       matID per variant) which are referenced into each variant
+//       via the variant edit context.
+//     * Surgical bound: variant set AUTHORED with N variants, ONE
+//       internal-reference per variant pointing at the matching
+//       material prim. A widening that authored references OUTSIDE
+//       the variant edit context would collapse all candidate
+//       references onto the same composition layer, losing the
+//       variant set semantics that downstream tools (variants UI,
+//       round-trip importers) rely on.
+//     * Validator case: `Switcher_VariantSets_TwoMaterials`.
+//
+//   Switcher-Branch F (`exportStyle == ActiveMaterialOnly` OR
+//                      `exportStyle == AsVariantSets` falls back
+//                      via the constructor's
+//                      `variantMaterials.size() == 1` short-circuit)
+//     * Action: NO variant set. Single AddInternalReference to the
+//       active material at the switcher material level. When the
+//       active material is a MultiMtl, BindPlaceholderMatsToGeom
+//       + BindVariantBundleToMat run on the singleton bundle.
+//     * Surgical bound: variant set NEVER authored on the single-
+//       variant case. A widening that authored an empty (1-variant)
+//       `shadingVariant` set would bloat single-material stages
+//       and present a "select one of one" UX that downstream
+//       variant-aware tooling cannot meaningfully act on.
+//     * Validator case: `Switcher_ActiveOnly_OneMaterial`.
+//
+//   Switcher-Branch G (`variantMaterials.empty()` -- the source
+//                       Material Switcher node had no sub-materials
+//                       assigned)
+//     * Action: emit `MaxUsd::Log::Warn` describing the empty
+//       switcher AND early-return. The UsdShadeMaterial prim
+//       remains as the writer-registry pre-defined empty prim;
+//       NO variant set authored, NO internal references authored.
+//     * Surgical bound: warn-only short-circuit; bare Material
+//       prim left behind. A widening that "authored a placeholder
+//       reference anyway" on the empty case would create
+//       composition-time errors when the placeholder's target
+//       path doesn't resolve, OR worse, would silently bind every
+//       empty switcher to a sentinel default material that the
+//       Max source scene never intended.
+//     * Validator case: `Switcher_Empty_NoVariantSet`.
+//
+// The three switcher-shape branches are MUTUALLY EXCLUSIVE per
+// MtlSwitcher node. The two-style enum
+// (USDSceneBuilderOptions::MtlSwitcherExportStyle) chooses between
+// E and F at the per-switcher level; the empty short-circuit fires
+// before the style enum is consulted. Plus the nested-MultiMtl
+// "directly connected to an object" precondition (lines 93-102
+// below in this function): if the switcher has a Multi/Sub-Object
+// material dependency AND the switcher itself is nested inside
+// another shader tree (not directly bound to a geom prim's
+// MaterialBindingAPI), the function warns and aborts, leaving the
+// switcher material prim empty -- the analog of Branch G for the
+// nested-Multi case.
+//
+// See also:
+//   * `src/MaxUsd/Translators/ShadingUtils.cpp::_AddInstancePrimsToMaterialMap`
+//     for the parent Branches A/B/C/D that decide whether the
+//     switcher's instance-side bindings are authored on the
+//     prototype or per-instance with instancing broken.
+//   * `src/translators/MultiMaterialUtils.cpp::DiscoverMaterialIDsAndCreateBundles`
+//     for the variant-set companion of Branch D that runs INSIDE
+//     this writer's `hasMultiSubDependency` true sub-branch.
+//   * Validator:
+//     /Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+//       1a92bee3-23b8-4465-93cf-122a6758ad16/
+//       validate_material_instance_override_surgical.py
+//   * Visual auditor pair in the same arch-build dir.
+// -----------------------------------------------------------------------------
 void MtlSwitcherWriter::Write()
 {
     if (variantMaterials.empty()) {
