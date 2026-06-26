@@ -52,6 +52,7 @@
 #include <maxscript/maxwrapper/mxsobjects.h>
 
 #include <Shlwapi.h>
+#include <cmath>
 #include <memory>
 #include <modstack.h>
 #include <stack>
@@ -247,6 +248,66 @@ void USDSceneBuilder::Build(
         stageScale = MaxUsd::MathUtils::RoundToSignificantDigit(
             stageScale, std::numeric_limits<float>::digits10);
         pxr::UsdGeomSetStageMetersPerUnit(stage, stageScale);
+
+        // MAX-UNIT-001 — surface scene-unit divergence at export time.
+        //
+        // SetStageMetersPerUnit above faithfully copies the source scene's
+        // system unit into the layer's `metersPerUnit` metadata: 0.0254 for
+        // inches (3ds Max's default), 0.01 for cm, 0.001 for mm, 1.0 for
+        // meters. That is USD-correct. The problem is silent downstream
+        // scale: most consumers either ignore `metersPerUnit` and treat
+        // scene units as their own default (often meters), or are spec'd
+        // to require meters outright. The artist working in inches has no
+        // signal at export time that their asset will render at 1/39th of
+        // its intended footprint in:
+        //   * Houdini Karma at default 1:1 (scene-units interpreted as m),
+        //   * ARKit / Quick Look (assumes m),
+        //   * Miris asset ingest (per docs.miris.com/preparing-assets/usd-
+        //     guidelines: metersPerUnit must equal 1; scene must measure
+        //     between 1 cm^3 and 100 km^3),
+        //   * glTF importers (m).
+        //
+        // The two real fixes both live outside the exporter — change the
+        // Max scene's system unit before export, or post-scale the root
+        // prim's xformOp:scale and re-author `metersPerUnit`. Both are
+        // documented below in the warning text. The exporter's job is to
+        // make the divergence observable, not to silently choose one.
+        //
+        // Surgical bound — the warning fires only when the rounded scale
+        // is NOT exactly 1.0. A scene already authored in meters carries
+        // metersPerUnit=1.0 and matches every downstream assumption, so
+        // no warning is needed.
+        //
+        // Negative cases the gate must reject (covered by the
+        // validate_meters_per_unit_warning_surgical.py validator and the
+        // testMetersUnitsDoesNotWarn / testInchesUnitsWarns MaxScript
+        // regressions):
+        //   * stageScale == 1.0 exactly (meters) — no warning.
+        //   * stageScale == 1.0 within float-rounding tolerance — no
+        //     warning (defensive — the rounding step above already snaps
+        //     to digits10 so an exact compare would also work).
+        //   * isNewStage == false — exporting into an existing stage; the
+        //     metersPerUnit value comes from the existing stage, not
+        //     from Max system units, so the warning would be misleading.
+        //     Already enforced structurally by sitting inside the
+        //     `if (isNewStage)` block.
+        if (std::abs(stageScale - 1.0) > 1e-9) {
+            MaxUsd::Log::Warn(
+                "Scene system units are not meters: USD 'metersPerUnit' "
+                "will be authored as {0} (1 Max unit = {0} m). Downstream "
+                "USD consumers that assume meter scale (Houdini Karma at "
+                "default 1:1, ARKit / Quick Look, Miris asset ingest "
+                "[metersPerUnit must equal 1], glTF importers) will see "
+                "the exported scene rescaled by a factor of {0} from its "
+                "3ds Max footprint. To export at meter scale, set "
+                "Customize > Units Setup > System Unit Setup to meters "
+                "before exporting (3ds Max rescales the geometry to "
+                "preserve physical sizes); or post-scale the root prim's "
+                "xformOp:scale by {0} in the exported USD and rewrite "
+                "metersPerUnit to 1.0. See doc/translation-mapping.md "
+                "(MAX-UNIT-001) for the full rationale.",
+                stageScale);
+        }
 
         if (timeConfig.IsAnimated()) {
             // In 3dsMax, one tick is defined as 1/4800th of a second.
@@ -1229,6 +1290,28 @@ MaxUsd::PrimDefVectorPtr USDSceneBuilder::ProcessNode(
 
                 } else {
 
+                    // [MAX-ANIM-001] transform animation time-sampled
+                    // export bound (lock-in only, no logic change). The
+                    // gate below FORCES TimeSamples on two non-Curves
+                    // paths: (a) `nodeTarget` (lookat) -- the lookat
+                    // depends on the target's worldspace transform at
+                    // sample time, which is not resolvable from a
+                    // serialized TsSpline alone, so the curves path
+                    // cannot represent it; (b) `!isValidController` --
+                    // List / PRS without keys / Expose / Linkage
+                    // controllers cannot serialize as curves either.
+                    // A refactor that simplified the gate to a plain
+                    // `animType == TimeSamples` would silently drop
+                    // BOTH of those cases onto the Curves path, where
+                    // they ship empty `xformOp:transform` attrs on the
+                    // affected prims (no curve to serialize). See the
+                    // central [MAX-ANIM-001] block in
+                    // `src/MaxUsd/Translators/AnimExportTask.cpp::Execute`
+                    // and the validator cases
+                    // `Animated_Xform_TimeSamples` /
+                    // `Static_Xform_NoTimeSamples` /
+                    // `CrossWriter_Divergence` in
+                    // `validate_animation_time_sampled_surgical.py`.
                     bool exportCurves = false;
                     bool exportTimeSamples = false;
 #if PXR_VERSION > 2505

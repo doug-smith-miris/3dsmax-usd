@@ -36,7 +36,542 @@
 
 #include <MaterialXFormat/XmlIo.h>
 
+#include <cmath>
+#include <sstream>
+
 PXR_NAMESPACE_OPEN_SCOPE
+
+namespace {
+
+// Returns the static float value of a MaterialX input if it is not connected.
+// On a connection (node/nodegraph/output), reports the input as "not statically known".
+bool _TryGetStaticFloat(const MaterialX::InputPtr& input, float& outValue)
+{
+    if (!input) {
+        return false;
+    }
+    if (input->hasNodeName() || input->hasNodeGraphString() || input->hasOutputString()) {
+        return false;
+    }
+    const std::string& valStr = input->getValueString();
+    if (valStr.empty()) {
+        return false;
+    }
+    try {
+        outValue = std::stof(valStr);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// Returns the static boolean value of a MaterialX input if it is not
+// connected. MaterialX serializes booleans as "true"/"false" (case-sensitive
+// per the spec); we accept the canonical forms only so an off-spec value
+// does not silently parse as false. Returns false (the "not statically
+// known" signal, not a value) on connection, empty string, or any other
+// token.
+bool _TryGetStaticBool(const MaterialX::InputPtr& input, bool& outValue)
+{
+    if (!input) {
+        return false;
+    }
+    if (input->hasNodeName() || input->hasNodeGraphString() || input->hasOutputString()) {
+        return false;
+    }
+    const std::string& valStr = input->getValueString();
+    if (valStr == "true") {
+        outValue = true;
+        return true;
+    }
+    if (valStr == "false") {
+        outValue = false;
+        return true;
+    }
+    return false;
+}
+
+// Parses a MaterialX color3 value string ("r, g, b" or "r g b") when the
+// input is not connected. Tolerates commas, semicolons, and whitespace
+// between components so we read whatever the MaterialX serializer wrote.
+// Returns false on a connection, on a value string with fewer/more than 3
+// numeric components, or on any parse failure.
+bool _TryGetStaticColor3(
+    const MaterialX::InputPtr& input,
+    float (&outValue)[3])
+{
+    if (!input) {
+        return false;
+    }
+    if (input->hasNodeName() || input->hasNodeGraphString() || input->hasOutputString()) {
+        return false;
+    }
+    const std::string& valStr = input->getValueString();
+    if (valStr.empty()) {
+        return false;
+    }
+    // Replace any non-numeric separators with spaces so a single istringstream
+    // walk extracts the three components regardless of MaterialX serialization
+    // style.
+    std::string normalized;
+    normalized.reserve(valStr.size());
+    for (char c : valStr) {
+        if (c == ',' || c == ';' || c == '\t' || c == '\n') {
+            normalized.push_back(' ');
+        } else {
+            normalized.push_back(c);
+        }
+    }
+    std::istringstream iss(normalized);
+    int parsed = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (!(iss >> outValue[i])) {
+            return false;
+        }
+        ++parsed;
+    }
+    // Reject trailing tokens (e.g. a fourth component) so we don't silently
+    // accept color4 strings as color3.
+    std::string trailing;
+    if (iss >> trailing) {
+        return false;
+    }
+    return parsed == 3;
+}
+
+// MAX-MAT-002 workaround: 3ds Max's MtlxIOUtil bridge emits emission = 1.0
+// paired with emission_color = (0, 0, 0) on every standard_surface node,
+// regardless of whether the source PhysicalMaterial authored any emission.
+// The MaterialX standard_surface nodedef defaults are emission = 0.0 and
+// emission_color = (1, 1, 1). The buggy pair multiplies to (0, 0, 0) so it
+// has no visual effect, but it is semantically wrong: any downstream
+// override that bumps emission_color away from black would unexpectedly
+// turn emission on at full strength. Strip both inputs when they exactly
+// match the buggy pattern so the exported USD falls back to the nodedef
+// defaults (which also evaluate to zero emission, with the right meaning).
+// Connected inputs and any non-matching values are left untouched.
+//
+// Surgical bounds (negative cases, ALL must leave the inputs untouched --
+// enforced by the regression suite via
+// src/Tests/Integration/mtlxShaderWriter_test.ms ::
+//     test_export_material_preserves_intentional_emission
+//     test_export_material_preserves_single_channel_dark_emission
+// plus the doc-linked Python validators
+// validate_emission_normalize_surgical.py (state-shape bounds) and
+// validate_emission_normalize_tolerance_bounds.py (numeric-band bounds)):
+//
+//   State-shape bounds (first reinforcement, caf9633):
+//   * emission is statically not 1.0 -- artist-authored scalar.
+//   * emission_color is statically not (0, 0, 0) -- artist-authored colour.
+//   * Either input is connected (carries a procedural value).
+//   * One half of the pair is absent -- the bug is the pair, not either
+//     half on its own.
+//   * The shader is not a standard_surface (id != ND_standard_surface_*).
+//
+//   Numeric-band bounds (second reinforcement, this commit):
+//   * emission outside [1.0 - 1e-6, 1.0 + 1e-6] -- the tolerance is
+//     per-spec (`std::fabs(emissionValue - 1.0f) > 1e-6f`) and must not
+//     be widened "to be more forgiving with float noise". Cases at
+//     1.0 + 1e-3 (must preserve) and 1.0 + 1e-7 (must strip) pin both
+//     sides of the band.
+//   * emission_color check is per-component (max-abs), NOT magnitude --
+//     a single non-zero channel like (0.05, 0, 0) is artist intent for
+//     a dark-channel glow even though ||c|| is tiny. A magnitude-based
+//     refactor would silently over-strip these. Cases at (1e-7,)*3
+//     (must strip) and (0.05, 0, 0) (must preserve) pin both behaviours.
+//   * The connection check on emission (the FIRST input read) is the
+//     symmetric companion of the ConnectedColor case the first
+//     reinforcement already covers -- both halves of the static-input
+//     requirement are exercised.
+//
+// A future refactor that widens any of these gates would silently start
+// eating artist-authored emission. Both the .ms surgical tests and the
+// two Python validators name the specific bound they exercise, so a
+// regression in any branch fails with a useful, localised error.
+void _NormalizeStandardSurfaceEmissionDefault(const MaterialX::DocumentPtr& doc)
+{
+    if (!doc) {
+        return;
+    }
+    for (const auto& node : doc->getNodes("standard_surface")) {
+        auto emissionInput = node->getInput("emission");
+        auto emissionColorInput = node->getInput("emission_color");
+        if (!emissionInput || !emissionColorInput) {
+            continue;
+        }
+        float emissionValue = 0.f;
+        if (!_TryGetStaticFloat(emissionInput, emissionValue)) {
+            continue;
+        }
+        if (std::fabs(emissionValue - 1.0f) > 1e-6f) {
+            continue;
+        }
+        float emissionColor[3] = { 0.f, 0.f, 0.f };
+        if (!_TryGetStaticColor3(emissionColorInput, emissionColor)) {
+            continue;
+        }
+        if (std::fabs(emissionColor[0]) > 1e-6f
+            || std::fabs(emissionColor[1]) > 1e-6f
+            || std::fabs(emissionColor[2]) > 1e-6f) {
+            continue;
+        }
+        node->removeInput("emission");
+        node->removeInput("emission_color");
+    }
+}
+
+// MAX-MAT-004 workaround: 3ds Max's MtlxIOUtil bridge emits an opinionated
+// coat-block preset on every standard_surface node, regardless of the source
+// PhysicalMaterial. The four spurious inputs are
+//
+//     coat_IOR             = 1.52   (nodedef default = 1.5)
+//     coat_affect_color    = 0.5    (nodedef default = 0.0)
+//     coat_affect_roughness= 0.5    (nodedef default = 0.0)
+//     coat_roughness       = 0.0    (nodedef default = 0.1)
+//
+// They are visually inert on the corpus because the bridge correctly authors
+// coat = 0.0, and the coat lobe is gated by that scalar inside the
+// standard_surface BSDF. The bug surfaces the moment ANY downstream override
+// flips coat above zero (a USD overlay, a variant, a re-export with a coat
+// value, a round-trip importer that resolves coat from another source):
+// every coat_*-derived computation then silently inherits Max's opinionated
+// profile rather than the MaterialX nodedef defaults, producing a glossier,
+// higher-IOR, partially color-shifting clearcoat the artist never authored.
+//
+// Strip each of the four inputs independently when it matches the buggy
+// hard-coded value (tolerant of float noise), is not connected to anything,
+// AND coat is provably zero (absent OR statically 0.0). A connected coat
+// could carry a runtime non-zero value, so we conservatively keep the entire
+// block in that case. A statically non-zero coat means the lobe is active
+// and the values are observable -- keep them as authored. An input that has
+// been explicitly overridden away from the leak value is treated as
+// intentional and preserved.
+void _NormalizeStandardSurfaceCoatDefaults(const MaterialX::DocumentPtr& doc)
+{
+    if (!doc) {
+        return;
+    }
+    for (const auto& node : doc->getNodes("standard_surface")) {
+        // Gate: coat must be provably zero (absent counts as the nodedef
+        // default of 0.0).
+        if (auto coatInput = node->getInput("coat")) {
+            float coatValue = 0.f;
+            if (!_TryGetStaticFloat(coatInput, coatValue)) {
+                // Connected or unparseable -- could be non-zero at runtime.
+                continue;
+            }
+            if (std::fabs(coatValue) > 1e-6f) {
+                // Statically non-zero coat: lobe is active, values matter.
+                continue;
+            }
+        }
+
+        // Per-input independent strip. Each tuple: (input name, leak value).
+        // coat_roughness's leak value is 0.0; the input is still spurious
+        // because the nodedef default (0.1) is what every other tool will
+        // observe when the input is absent.
+        struct LeakInput {
+            const char* name;
+            float       leakValue;
+        };
+        static constexpr LeakInput kLeakInputs[] = {
+            { "coat_IOR",              1.52f },
+            { "coat_affect_color",     0.5f },
+            { "coat_affect_roughness", 0.5f },
+            { "coat_roughness",        0.0f },
+        };
+        for (const auto& leak : kLeakInputs) {
+            auto input = node->getInput(leak.name);
+            if (!input) {
+                continue;
+            }
+            float value = 0.f;
+            if (!_TryGetStaticFloat(input, value)) {
+                continue;
+            }
+            if (std::fabs(value - leak.leakValue) > 1e-6f) {
+                continue;
+            }
+            node->removeInput(leak.name);
+        }
+    }
+}
+
+// MAX-MAT-005 workaround: 3ds Max's MtlxIOUtil bridge emits
+// subsurface_radius = (0.794704, 0.531734, 0.292854) on every standard_surface
+// node, regardless of whether the source PhysicalMaterial has any subsurface
+// scattering enabled. The triple is the canonical Pixar/Christophe-Hery
+// caucasian-skin SSS radius (RGB attenuation distances tuned for human skin);
+// the MaterialX standard_surface nodedef default for subsurface_radius is
+// (1, 1, 1), a neutral white. The bridge also (correctly) authors
+// subsurface = 0.0, which gates the SSS lobe entirely out of the BSDF, so
+// the leak is visually inert on the captured corpus.
+//
+// The bug surfaces the moment any downstream context flips subsurface above
+// zero: a USD overlay / variant / re-export that enables SSS on any of these
+// materials silently inherits Max's opinionated skin-tone scattering rather
+// than the neutral nodedef default. A red plastic, a blue ceramic, a gold
+// metal — every material would scatter as if it were skin once SSS is
+// activated, because the bridge stamped the same skin radius on all of them
+// and nothing else in the document records that the artist never authored it.
+//
+// Strip subsurface_radius when it matches the buggy hard-coded triple
+// (tolerant of float noise), is not connected, AND subsurface is provably
+// zero (absent OR statically 0.0). A connected subsurface could carry a
+// runtime non-zero value, so the input is preserved in that case. A
+// statically non-zero subsurface means the lobe is active and the radius is
+// observable -- keep it as authored. A subsurface_radius that has been
+// explicitly overridden away from the leak triple is treated as intentional
+// and preserved.
+void _NormalizeStandardSurfaceSubsurfaceRadiusDefault(const MaterialX::DocumentPtr& doc)
+{
+    if (!doc) {
+        return;
+    }
+    // Bridge's hard-coded skin SSS radius. The values are stored as 32-bit
+    // floats in the MaterialX document, so the comparison uses a small
+    // epsilon to absorb the round-trip from the maxUsd findings_evidence
+    // triple (0.794704020023346, 0.531733989715576, 0.292854011058807) to
+    // whatever single-precision form ended up in the document.
+    static constexpr float kLeakRadius[3] = { 0.794704f, 0.531734f, 0.292854f };
+    static constexpr float kRadiusEpsilon = 1e-4f;
+
+    for (const auto& node : doc->getNodes("standard_surface")) {
+        // Gate: subsurface must be provably zero (absent counts as the
+        // nodedef default of 0.0).
+        if (auto subsurfaceInput = node->getInput("subsurface")) {
+            float subsurfaceValue = 0.f;
+            if (!_TryGetStaticFloat(subsurfaceInput, subsurfaceValue)) {
+                // Connected or unparseable -- could be non-zero at runtime.
+                continue;
+            }
+            if (std::fabs(subsurfaceValue) > 1e-6f) {
+                // Statically non-zero subsurface: lobe is active, radius
+                // matters.
+                continue;
+            }
+        }
+
+        auto radiusInput = node->getInput("subsurface_radius");
+        if (!radiusInput) {
+            continue;
+        }
+        float radius[3] = { 0.f, 0.f, 0.f };
+        if (!_TryGetStaticColor3(radiusInput, radius)) {
+            continue;
+        }
+        if (std::fabs(radius[0] - kLeakRadius[0]) > kRadiusEpsilon
+            || std::fabs(radius[1] - kLeakRadius[1]) > kRadiusEpsilon
+            || std::fabs(radius[2] - kLeakRadius[2]) > kRadiusEpsilon) {
+            // User authored a different radius -- preserve.
+            continue;
+        }
+        node->removeInput("subsurface_radius");
+    }
+}
+
+// MAX-MAT-001 workaround: 3ds Max's MtlxIOUtil bridge emits
+// specular_rotation = 0.25 on every standard_surface node, regardless of the
+// source PhysicalMaterial's anisotropy settings. The MaterialX standard_surface
+// nodedef defaults specular_rotation to 0.0, and the value has no visual effect
+// when specular_anisotropy is zero. Strip the spurious value so the exported
+// USD matches the nodedef default for the common (anisotropy == 0) case.
+// Inputs that are connected, non-zero, or carry a non-0.25 authored value are
+// left untouched.
+//
+// Surgical bounds (negative cases, ALL must leave the input untouched --
+// enforced by the regression suite via
+// src/Tests/Integration/mtlxShaderWriter_test.ms ::
+//     test_export_material_preserves_intentional_specular_rotation
+// plus the doc-linked Python validator
+// validate_specular_rotation_surgical.py):
+//   * specular_anisotropy is statically non-zero -- anisotropy is on, so
+//     the rotation IS observable in the BSDF. This is the
+//     brushed-steel-with-rotation case: rotation = 0.25 byte-for-byte
+//     matches the leak, but stripping it would silently rewrite the
+//     artist's authored streak orientation. KEY GAP the original
+//     a377982 commit promised but did not land coverage for.
+//   * specular_anisotropy is connected -- runtime value unknown,
+//     conservatively assume the lobe may be active and keep the rotation.
+//   * specular_rotation is connected -- carries a procedural rotation
+//     that this static gate cannot reason about.
+//   * specular_rotation is statically not 0.25 -- artist authored an
+//     explicit non-leak rotation, even when anisotropy happens to be off
+//     in the current document.
+//   * The shader is not a standard_surface -- out of scope for this pass.
+//
+// A future refactor that widens any of these gates (most likely the
+// anisotropy-zero check, since it is the only "is the rotation
+// observable?" predicate) would silently start eating artist-authored
+// rotation on anisotropic shaders. Both the .ms surgical test and the
+// Python validator name the specific bound they exercise, so a
+// regression in any branch fails with a useful, localised error.
+void _NormalizeStandardSurfaceSpecularRotation(const MaterialX::DocumentPtr& doc)
+{
+    if (!doc) {
+        return;
+    }
+    for (const auto& node : doc->getNodes("standard_surface")) {
+        auto rotationInput = node->getInput("specular_rotation");
+        if (!rotationInput) {
+            continue;
+        }
+        float rotationValue = 0.f;
+        if (!_TryGetStaticFloat(rotationInput, rotationValue)) {
+            continue;
+        }
+        // Match the buggy 3ds Max hardcoded value (0.25), tolerant of float noise.
+        if (std::fabs(rotationValue - 0.25f) > 1e-6f) {
+            continue;
+        }
+        // Only strip when specular_anisotropy is provably zero (or absent).
+        // If anisotropy is connected, the user may genuinely want a rotation,
+        // so we conservatively keep the input.
+        auto anisotropyInput = node->getInput("specular_anisotropy");
+        if (anisotropyInput) {
+            float anisotropyValue = 0.f;
+            if (!_TryGetStaticFloat(anisotropyInput, anisotropyValue)) {
+                continue;
+            }
+            if (std::fabs(anisotropyValue) > 1e-6f) {
+                continue;
+            }
+        }
+        node->removeInput("specular_rotation");
+    }
+}
+
+// MAX-MAT-006 workaround: 3ds Max's MtlxIOUtil bridge authors 13 inputs on
+// every ND_standard_surface_surfaceshader at their MaterialX nodedef-default
+// value, regardless of whether the source PhysicalMaterial set them. The 13
+// inputs and their bridge-emitted == nodedef-default values:
+//
+//     base                 = 1.0      coat_color           = (1, 1, 1)
+//     coat                 = 0.0      specular_color       = (1, 1, 1)
+//     diffuse_roughness    = 0.0      subsurface_color     = (1, 1, 1)
+//     specular             = 1.0      transmission_color   = (1, 1, 1)
+//     subsurface           = 0.0      thin_walled          = false
+//     subsurface_scale     = 1.0
+//     transmission         = 0.0
+//     transmission_depth   = 0.0
+//
+// Values match the ND_standard_surface_surfaceshader v1.0.1 defaults shipped
+// with MaterialX 1.39 (the version bundled with Max 2027's MtlxIOUtil and
+// with Houdini 21.0.700's library). On the 6-material diagnostic corpus the
+// 13 inputs are authored on every shader at these exact values, contributing
+// 78 redundant attribute writes (~30% of the per-material standard_surface
+// attribute count). Visually inert — the renderer would resolve absent
+// inputs to the same nodedef defaults — but they bloat layer size, obscure
+// which inputs the artist actually set, and make usddiff reports harder to
+// read.
+//
+// Strip each input independently when:
+//   * The input is present on a standard_surface node.
+//   * The input is not connected (static value only).
+//   * The static value exactly matches the nodedef default (tolerant of
+//     float noise on numeric types; exact "true"/"false" string match on
+//     thin_walled).
+//
+// After strip the input falls through to the nodedef default — same
+// semantics, less noise.
+//
+// Surgical bounds (where the fix conservatively does nothing):
+//   * The input is connected to a node, nodegraph, or output -- carries a
+//     runtime value the static comparison cannot reason about; keep.
+//   * The static value differs from the nodedef default -- artist or DCC
+//     intent; keep.
+//   * The shader is not a standard_surface -- out of scope for this pass.
+//   * The input is absent -- already at the default; nothing to do.
+//
+// Care taken with the four other MtlxIOUtil leaks normalized in this file:
+// MAT-001 specular_rotation, MAT-002 emission/emission_color, MAT-004
+// coat_IOR/coat_affect_color/coat_affect_roughness/coat_roughness, MAT-005
+// subsurface_radius. Their bridge-leaked values DIFFER from the nodedef
+// defaults and are stripped by their own dedicated passes BEFORE this one;
+// MAT-006's 13-input list is intentionally disjoint from them. After all
+// five passes run in order, a default PhysicalMaterial roundtrips through
+// the bridge with zero redundantly-authored standard_surface inputs --
+// every input either carries an artist-set non-default value or is absent.
+void _StripStandardSurfaceSpecDefaultInputs(const MaterialX::DocumentPtr& doc)
+{
+    if (!doc) {
+        return;
+    }
+    struct FloatDefault {
+        const char* name;
+        float       value;
+    };
+    struct Color3Default {
+        const char* name;
+        float       value[3];
+    };
+    // ND_standard_surface_surfaceshader v1.0.1 defaults (MaterialX 1.39
+    // bxdf/standard_surface.mtlx). v1.0.1 overrides v1.0.0 on `base`
+    // (0.8 -> 1.0) and `base_color` ((1,1,1) -> (0.8,0.8,0.8)); base_color
+    // is not in this list because its default has been a non-neutral grey
+    // since the override, and artists virtually always author a color.
+    static constexpr FloatDefault kFloatDefaults[] = {
+        { "base",               1.0f },
+        { "coat",               0.0f },
+        { "diffuse_roughness",  0.0f },
+        { "specular",           1.0f },
+        { "subsurface",         0.0f },
+        { "subsurface_scale",   1.0f },
+        { "transmission",       0.0f },
+        { "transmission_depth", 0.0f },
+    };
+    static constexpr Color3Default kColor3Defaults[] = {
+        { "coat_color",         { 1.0f, 1.0f, 1.0f } },
+        { "specular_color",     { 1.0f, 1.0f, 1.0f } },
+        { "subsurface_color",   { 1.0f, 1.0f, 1.0f } },
+        { "transmission_color", { 1.0f, 1.0f, 1.0f } },
+    };
+    static constexpr float kFloatEpsilon = 1e-6f;
+
+    for (const auto& node : doc->getNodes("standard_surface")) {
+        for (const auto& leak : kFloatDefaults) {
+            auto input = node->getInput(leak.name);
+            if (!input) {
+                continue;
+            }
+            float value = 0.f;
+            if (!_TryGetStaticFloat(input, value)) {
+                continue;
+            }
+            if (std::fabs(value - leak.value) > kFloatEpsilon) {
+                continue;
+            }
+            node->removeInput(leak.name);
+        }
+        for (const auto& leak : kColor3Defaults) {
+            auto input = node->getInput(leak.name);
+            if (!input) {
+                continue;
+            }
+            float value[3] = { 0.f, 0.f, 0.f };
+            if (!_TryGetStaticColor3(input, value)) {
+                continue;
+            }
+            if (std::fabs(value[0] - leak.value[0]) > kFloatEpsilon
+                || std::fabs(value[1] - leak.value[1]) > kFloatEpsilon
+                || std::fabs(value[2] - leak.value[2]) > kFloatEpsilon) {
+                continue;
+            }
+            node->removeInput(leak.name);
+        }
+        // thin_walled is the lone boolean in the 13. Nodedef default is
+        // false; strip only when the input is statically false (true means
+        // the artist asked for thin-walled refraction).
+        if (auto thinInput = node->getInput("thin_walled")) {
+            bool value = false;
+            if (_TryGetStaticBool(thinInput, value) && !value) {
+                node->removeInput("thin_walled");
+            }
+        }
+    }
+}
+
+} // namespace
 
 bool _IsWellFormedPath(const fs::path& p)
 {
@@ -225,6 +760,78 @@ void _ConnectToNodeGraph(
 }
 
 // Sets the value of a USD input based on a MaterialX input.
+//
+// MAX-MAT-009 surgical-coverage bound (audit, no logic change): the
+// `colorSpace` USD metadata is propagated from MaterialX
+// `input->getActiveColorSpace()` IFF BOTH:
+//   (a) `_TypeSupportsColorSpace(input)` returns true -- which by its
+//       definition above is exclusively: a `color3` or `color4` typed
+//       input, OR a `filename` typed input on an image node whose
+//       parent's nodedef output is `color3` / `color4`. EVERY OTHER
+//       input type (float, integer, vector2/3/4, matrix22/33/44,
+//       boolean, string) returns false from the predicate and MUST
+//       NOT receive `colorSpace` metadata even if the source MaterialX
+//       authored one. A widened predicate that accepted float / vector3
+//       inputs would author garbage `colorSpace` USD metadata on
+//       inputs USD's UsdShade does not interpret as color, polluting
+//       downstream tooling that scans for color-space tagging.
+//   (b) `colorSpace.empty()` is false -- the MaterialX active color
+//       space resolution succeeded with a concrete name. An empty
+//       active color space (no `colorspace` attribute on the input,
+//       on the parent node, on the document, AND no nodedef-default
+//       color space) MUST be treated as "no opinion authored" and
+//       MUST NOT cause `usdInput.GetAttr().SetColorSpace(TfToken(""))`
+//       to be called. Stripping the guard would author a TfToken("")
+//       metadata which is observably different from no-metadata-at-all
+//       at the USD attribute layer (`GetColorSpace()` returns ""
+//       for both states, but `HasAuthoredColorSpace()` differs).
+//
+// The audit's primary visible bound (visual auditor pair): a
+// `standard_surface.base_color = (0.5, 0.5, 0.5)` with
+// `colorSpace = "srgb_texture"` renders DARKER than the same value
+// with NO `colorSpace` metadata, because Karma applies the inverse
+// EOTF on the sRGB-tagged input (`pow(0.5, 2.2) ~= 0.218`). A
+// wildcard widening that stripped the `colorSpace`-propagation guards
+// would make both planes render the same un-tagged grey; the
+// renderer would diverge from artist intent on appearance alone.
+//
+// Cross-writer-path divergence (extends MAX-PRIM-001's writer-
+// separation audit to the color-space concern): this MaterialX path
+// authors `colorSpace` USD metadata on UsdShade input attributes; the
+// UsdPreviewSurface Python writer
+// (`src/ApplicationPlugins/usd-component/Contents/scripts/materials/
+// usd_material_writer.py::set_bitmap_scale_bias_sourcecolorspace`)
+// authors `sourceColorSpace` as a TOKEN INPUT on UsdUVTexture with a
+// HARDCODED "raw" value (with TODO -- see that function); the
+// LastResort C++ writer
+// (`src/MaxUsd/Translators/LastResortUSDPreviewSurfaceWriter.cpp`)
+// authors NEITHER, because it produces a `diffuseColor` Color3f
+// value with no UsdUVTexture child (per UsdPreviewSurface spec,
+// `diffuseColor` authored as a value is linear by definition). No
+// shared color-space helper exists or should exist between the
+// three writers -- a unification would have to bridge USD attribute
+// metadata, the UsdUVTexture token-input convention, and a
+// no-tag-by-spec value path simultaneously.
+//
+// Negative test coverage pinning this bound:
+//   * `src/Tests/Integration/mtlxShaderWriter_test.ms` ::
+//     `test_export_material_preserves_color_space_metadata_on_color3_inputs`
+//     -- imports a synthetic MaterialX doc whose color3 input
+//     carries `colorspace="srgb_texture"` and asserts the exported
+//     USD attribute has `colorSpace = "srgb_texture"` metadata,
+//     while sibling float inputs (specular_roughness etc.) have
+//     NO `colorSpace` metadata.
+//   * Python validator
+//     `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+//     a247e60f-cc09-4449-987c-3a7ecaaa88da/
+//     validate_color_space_roundtrip_surgical.py` -- builds a
+//     synthetic USD stage mirroring all three writers' outputs,
+//     asserts 10 named cases enumerating each surgical bound:
+//     Color3WithSRGB, Color3NoColorSpace, FloatInputWithSRGB,
+//     Color4WithSRGB, FilenameOnImageColor3,
+//     FilenameOnImageVector3, BakedDiffuseMap_sourceColorSpace_raw,
+//     BakedNormalMap_scale_bias, LastResort_no_colorSpace_anywhere,
+//     CrossWriter_divergence. Plus idempotence.
 void _SetInputValue(const MaterialX::InputPtr& input, UsdShadeInput& usdInput)
 {
     usdInput.Set(UsdMtlxGetUsdValue(input));
@@ -519,6 +1126,170 @@ void MtlxShaderWriter::Write()
         TF_WARN("Error reading MaterialX document: %s", e.what());
         return;
     }
+
+    // MAX-MAT-007 surgical-coverage bound (audit, no logic change): every
+    // pass below is scoped to `ND_standard_surface_surfaceshader` ONLY,
+    // gated by `doc->getNodes("standard_surface")`. They MUST NOT be
+    // widened to a wildcard or to `open_pbr_surface`. Reasons:
+    //   * `open_pbr_surface` (MaterialX 1.39, OpenPBR Surface v1.1) has a
+    //     different input vocabulary -- `coat` -> `coat_weight`,
+    //     `subsurface` -> `subsurface_weight`, `coat_IOR` -> `coat_ior`,
+    //     `specular_IOR` -> `specular_ior`, `specular_anisotropy` ->
+    //     `specular_roughness_anisotropy`, `emission` -> `emission_luminance`,
+    //     etc. Several gating predicates inside the passes below
+    //     (`coat == 0`, `subsurface == 0`) reference standard_surface input
+    //     names that simply do not exist on open_pbr_surface; the strip
+    //     would then run UNGATED on every leak-named input.
+    //   * Some open_pbr_surface inputs DO share their name with
+    //     standard_surface inputs (`coat_color`, `subsurface_color`,
+    //     `transmission_color`) but carry DIFFERENT nodedef defaults
+    //     (open_pbr `subsurface_color` default = (0.8, 0.8, 0.8); the
+    //     standard_surface default this file's MAX-MAT-006 list strips
+    //     against is (1, 1, 1)). A wildcard refactor would silently strip
+    //     an artist-authored `subsurface_color = (1, 1, 1)` from an
+    //     open_pbr_surface shader, reverting it to the OpenPBR-default
+    //     darker grey -- a visible appearance change.
+    //   * The OpenPBR `subsurface_radius` input is a `float` (1.0 default);
+    //     the standard_surface input of the same name is a `color3`. A
+    //     wildcard refactor on MAX-MAT-005's pass would call
+    //     `_TryGetStaticColor3` on a float input and currently fail safe
+    //     (parse returns false), but that is accidental safety, not a
+    //     designed bound.
+    // Negative test coverage pinning this bound:
+    //   * `src/Tests/Integration/mtlxShaderWriter_test.ms` ::
+    //     `test_export_openpbr_material_preserves_collision_named_inputs`
+    //     -- exports an OpenPBR() material via MaterialX and asserts the
+    //     collision-named inputs survive verbatim (gated on Max 2025.3+).
+    //   * Python validator
+    //     `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+    //     5c66e23f-c809-45a2-baeb-328d9fe6ddf1/
+    //     validate_openpbr_surface_coverage.py` -- runs all five passes
+    //     on a synthetic doc with a standard_surface AND an
+    //     open_pbr_surface side-by-side, asserts the standard_surface
+    //     leak inputs are stripped and the open_pbr_surface inputs are
+    //     untouched, including idempotence.
+    //
+    // MAX-PRIM-001 surgical-coverage bound (audit, no logic change): the
+    // five passes below are scoped to the MaterialX writer path ONLY --
+    // specifically, they operate on the in-memory `MaterialX::Document`
+    // returned by `MtlxIOUtil.ExportMtlxString` after `readFromXmlString`,
+    // and they MUST NOT be ported to, shared with, or invoked from the
+    // UsdPreviewSurface writer code path. The UsdPreviewSurface writers
+    // are an entirely separate translator chain:
+    //   * `src/MaxUsd/Translators/LastResortUSDPreviewSurfaceWriter.cpp`
+    //     -- the C++ fallback registered with `ContextSupport::Fallback`
+    //     for `UsdImagingTokens->UsdPreviewSurface`. Authors a single
+    //     `inputs:diffuseColor` from `Mtl::GetDiffuse()` and nothing
+    //     else; carries no emission-strip helpers and never will.
+    //   * `src/ApplicationPlugins/usd-component/Contents/scripts/
+    //     materials/shaderWriter.py` + `usd_material_writer.py` -- the
+    //     Python `DefaultShaderWriter` registered for the Max materials
+    //     PhysicalMaterial / PBR Material (Metal/Rough) / PBR Material
+    //     (Spec/Gloss) / USD Preview Surface / OpenPBR Material when
+    //     `ConvertMaterialsTo == "UsdPreviewSurface"`. Authoring is
+    //     entirely data-driven from the `.material_conversion` JSON
+    //     tables (`data_files/default.material_conversion`,
+    //     `3dsmax_materials.mat_def`, `usd_materials.mat_def`).
+    //
+    // The two writer paths share NO color/emission helper today, and
+    // a planner-emitted "unify color-emission helper across MaterialX
+    // and UsdPreviewSurface writers" refactor would be wrong because the
+    // shapes diverge on every axis the unification would have to bridge:
+    //
+    //   Concept           UsdPreviewSurface     MaterialX standard_surface
+    //   ----------------  --------------------  --------------------------
+    //   Emission color    `emissiveColor`       `emission_color` (color3,
+    //                     (color3f, default     default (1, 1, 1)) gated
+    //                     (0, 0, 0))            by `emission` (float,
+    //                                           default 0.0)
+    //   Diffuse color     `diffuseColor`        `base_color` (color3,
+    //                     (color3f, default     default (0.8, 0.8, 0.8))
+    //                     (0.18, 0.18, 0.18))   gated by `base` (float,
+    //                                           default 0.8)
+    //   Specular color    `specularColor`       `specular_color` (color3,
+    //                     (color3f, default     default (1, 1, 1)) gated
+    //                     (0, 0, 0)) +          by `specular` (float,
+    //                     `useSpecularWorkflow` default 1.0)
+    //                     bool toggle
+    //   Metallic / IOR    `metallic` (float)    `metalness` (float, same
+    //                                           default) -- name only
+    //   Roughness         `roughness` (float,   `specular_roughness`
+    //                     default 0.5)         (float, default 0.2)
+    //   Opacity           `opacity` (float,     `opacity` (color3, default
+    //                     default 1.0)         (1, 1, 1)) -- name-collision
+    //                                           BUT dimensionality conflict
+    //   Normal            `normal` (normal3f    no direct input -- routed
+    //                     direct input)        through a `normalmap` node
+    //
+    // The "color-emission" concept the planner's bite called out covers
+    // BOTH the diffuseColor/base_color and emissiveColor/emission_color
+    // axes. On both axes UsdPreviewSurface has a single combined input
+    // while MaterialX standard_surface has a (scalar gate, color)
+    // pair -- structurally not unifiable into a single helper that
+    // preserves artist intent. A unification attempt that flattened
+    // MaterialX's split into UsdPS's combined inputs would lose the
+    // gate scalar; one that split UsdPS's combined inputs into a
+    // MaterialX-style pair would have to invent the gate scalar (and
+    // would AUTHOR the (1.0, (X, Y, Z)) shape that MAX-MAT-002 itself
+    // strips when the color is (0, 0, 0)).
+    //
+    // The audit's primary visible bound (per its visual auditor pair):
+    // an artist-authored `emissiveColor = (0.05, 0, 0)` on a
+    // UsdPreviewSurface shader (a faint dark-red glow override) survives
+    // a re-export, because (a) the five passes below iterate
+    // `doc->getNodes("standard_surface")` on the MaterialX doc,
+    // returning an empty list for any UsdPreviewSurface authoring (which
+    // does not live in this MaterialX doc at all), AND (b) the
+    // LastResort + Python UsdPS writers do not carry emission-strip
+    // helpers. Any cross-writer unification that ported the strip-gate
+    // would have to widen it to operate without the paired `emission`
+    // scalar (which UsdPS does not have); the widened gate would either
+    // be dead code or would silently strip artist-authored emissiveColor
+    // on appearance alone -- the still-broken counterfactual the audit's
+    // visual pair captures.
+    //
+    // Negative test coverage pinning this bound:
+    //   * `src/Tests/Integration/mtlxShaderWriter_test.ms` ::
+    //     `test_export_writer_path_separation_color_emission` --
+    //     exports the SAME PhysicalMaterial under both the MaterialX
+    //     and UsdPreviewSurface targets in a single test run, asserts
+    //     (a) the MaterialX export's standard_surface emission inputs
+    //     are stripped per MAX-MAT-002 (positive control), AND
+    //     (b) the UsdPreviewSurface export's authored `emissiveColor`
+    //     survives untouched (the cross-writer-path bound). Gated on
+    //     the same Max 2025+ guard as the surrounding MaterialX tests
+    //     (`IS_MAX2025_OR_GREATER` mirrored at the runtime layer).
+    //   * Python validator
+    //     `/Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+    //     da4ca14a-c323-47a6-bd26-8997a625e3f6/
+    //     validate_color_emission_writer_separation.py` -- runs all
+    //     five passes on a synthetic MaterialX::Document containing a
+    //     standard_surface node with every known MAX-MAT-001/002/004/
+    //     005/006 leak side-by-side with a UsdPreviewSurface-category
+    //     node carrying UsdPS-shaped inputs (emissiveColor = (0.05,0,0)
+    //     authored, diffuseColor = (0.18,0.18,0.18), metallic = 0.5,
+    //     roughness = 0.3, ior = 1.4, specularColor = (1,1,1),
+    //     useSpecularWorkflow = true, opacity = 1.0 FLOAT,
+    //     normal = (0.5,0.5,1.0)). Asserts the standard_surface leaks
+    //     are stripped (positive control) AND the UsdPreviewSurface-
+    //     category node is untouched on both name and value, including
+    //     name-spelling-near-collisions (`specularColor` vs stdsurf
+    //     `specular_color = (1,1,1)`), topology-collisions (`opacity`
+    //     FLOAT vs stdsurf color3), and UsdPS-only inputs that have no
+    //     MaterialX standard_surface analogue (`useSpecularWorkflow`,
+    //     `normal` direct input). Plus idempotence on both sides.
+    //
+    // A future PR that genuinely needs to share helper code between
+    // these two writer paths should land as a SEPARATE concern with
+    // its own captured corpus + its own MaxScript regression + its own
+    // doc entry naming what the shared helper actually does -- not as
+    // a wildcard widening of these five passes into the UsdPreviewSurface
+    // writer's domain.
+    _NormalizeStandardSurfaceSpecularRotation(mtlxDoc);
+    _NormalizeStandardSurfaceEmissionDefault(mtlxDoc);
+    _NormalizeStandardSurfaceCoatDefaults(mtlxDoc);
+    _NormalizeStandardSurfaceSubsurfaceRadiusDefault(mtlxDoc);
+    _StripStandardSurfaceSpecDefaultInputs(mtlxDoc);
 
     // Sanitize the material name using the same logic as with the MaterialX component
     // to match the node name produced by the MaterialX exporter. createValidName

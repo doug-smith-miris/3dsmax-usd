@@ -192,6 +192,120 @@ UsdPrim BreakInstancingAndCopySubset(
     return overridePrim;
 }
 
+// -----------------------------------------------------------------------------
+// MAX-MAT-010 surgical-coverage bound (material-instance / Multi-Mtl
+// override-structure fidelity audit, 2026-06-26).
+//
+// `_AddInstancePrimsToMaterialMap` walks every USD prototype on the
+// exported stage and for each prototype decides how to author the
+// material bindings of its USD instances, based on whether all
+// instances share a material and (if not) what kind of material the
+// divergent instances carry. The decision tree below has FOUR named
+// surgical branches the validator's named cases pin one-for-one:
+//
+//   Branch A -- sameMaterialForAllInstances == true (the
+//               "keep instancing" common case)
+//     * Action: bind the material on the inheritance-base prim's
+//       child (the prototype's master mesh). USD composition then
+//       propagates the binding to every instance via the inheritance
+//       arc; no instance prim gets a per-instance opinion.
+//     * Surgical bound: instancing is PRESERVED. A widening that
+//       always broke instancing would bloat stage size for the
+//       common case (every instanced prototype turned into N
+//       independent meshes) and break downstream prototype-aware
+//       consumers (USD instancing-renderers, asset-validators
+//       counting unique meshes).
+//     * Validator case: `SameMaterial_KeepInstancing`.
+//
+//   Branch B -- different materials, non-MultiMtl (Mtl override on
+//               one or more instances, no Multi/Sub-Object)
+//     * Action: each instance prim gets a per-instance
+//       MaterialBindingAPI binding ON ITS OWN PATH. Instancing is
+//       PRESERVED -- the per-instance opinion wins at composition
+//       time; the prototype's binding is overridden ONLY at the
+//       instance prim level.
+//     * Surgical bound: instancing PRESERVED + per-instance opinion
+//       authored on the local spec, not on the prototype. A widening
+//       that broke instancing here would gratuitously bloat the
+//       stage (the override-structure does not require breaking,
+//       since there are no subsets on the prototype that need
+//       per-instance shadowing).
+//     * Validator case: `DifferentMaterial_NonMulti`.
+//
+//   Branch C -- different materials, MultiMtl, NO subsets on the
+//               prototype's child (the "single matId" Multi case
+//               where ApplyMaxMaterialIDs did not produce any
+//               GeomSubsets in the materialBind family)
+//     * Action: `_AddPrimWithMultiMaterialtoMaterialMap` takes the
+//       no-subset sub-branch (lines 119-141 of this file): reads
+//       `customData[3dsmax:matId]` from the prototype child, looks
+//       up the matching sub-material on the divergent instance's
+//       MultiMtl, binds it directly on the instance prim's path.
+//     * Surgical bound: instancing PRESERVED. A widening that broke
+//       instancing here would (a) bloat the stage like Branch B,
+//       and (b) attempt a subset-copy that has nothing to copy --
+//       either crashing or authoring empty subset prims that
+//       desync from the prototype's customData layout.
+//     * Validator case: `DifferentMaterial_MultiNoSubsets`.
+//
+//   Branch D -- different materials, MultiMtl, subsets DO exist on
+//               the prototype's child (the canonical per-instance
+//               MultiMtl override case the bite is named after)
+//     * Action: `BreakInstancingAndCopySubset` runs (defined above,
+//       lines 144-193). Three things happen:
+//         (i)  `instancePrim.SetInstanceable(false)` on the
+//              divergent instance -- USD instancing is BROKEN on
+//              this one prim so descendant opinions can take
+//              effect at composition time;
+//         (ii) the prototype's `materialBind`-family
+//              `UsdGeomSubset` children are COPIED onto a new
+//              override-child mesh prim under the divergent
+//              instance, with `customData[3dsmax:matId]`
+//              preserved across the copy (the C++ does a +1/-1
+//              round-trip in SubsetInfo's ctor to keep the matId
+//              value byte-identical with the prototype's);
+//         (iii) `_AddPrimWithMultiMaterialtoMaterialMap` is called
+//              again on the OVERRIDE prim, NOT the original
+//              instance prim, so the per-subset bindings
+//              author against the copied subsets the divergent
+//              MultiMtl actually wants to bind.
+//     * Surgical bound: instancing BROKEN + subsets COPIED with
+//       matId customData preserved. A widening that dropped any
+//       part of this (the SetInstanceable(false), the subset copy,
+//       the matId preservation, or the rebinding against the copy)
+//       would silently DROP the per-instance MultiMtl override --
+//       a data-loss regression that the diagnostic corpus would not
+//       catch because the prototype's bindings still render
+//       something visually coherent. The KEY bound the audit pins.
+//     * Validator case: `DifferentMaterial_MultiWithSubsets`.
+//
+// The four branches are MUTUALLY EXCLUSIVE per `instancePrim` and the
+// gate predicates are independent (sameMaterial gate; MultiMtl
+// dynamic_cast; prototype-subset emptiness). A wildcard refactor
+// proposing "unify override handling" across the four would either
+// pick one branch's shape and apply it to every case (regressing
+// the other three by named case) or invent a fifth shape that the
+// validator's `CrossPath_Divergence` final case catches when every
+// branch's invariant must hold simultaneously on one fixture.
+//
+// See also:
+//   * `src/translators/MultiMaterialUtils.cpp::DiscoverMaterialIDsAndCreateBundles`
+//     for the parallel instance-break path on the MtlSwitcher
+//     variant-set flow (Branches A + D under a switcher's
+//     `AsVariantSets` export style).
+//   * `src/translators/MtlSwitcherWriter.cpp::Write` / `::PostWrite`
+//     for the three switcher-shape branches (E, F, G).
+//   * Validator:
+//     /Users/d.smith/MirisProjects/Agent Builder/agent/arch-builds/
+//       1a92bee3-23b8-4465-93cf-122a6758ad16/
+//       validate_material_instance_override_surgical.py
+//   * Visual auditor pair in the same arch-build dir
+//     (`render_karma_postfix.png`, `render_unreal_reference.png`,
+//     `compare_side_by_side.png`, `intended_example.md`): two
+//     concrete cube meshes side-by-side; BOX_1 always reads red+blue,
+//     BOX_2 reads green+yellow when the override LANDED (postfix)
+//     and red+blue when the override was LOST (still-broken).
+// -----------------------------------------------------------------------------
 void _AddInstancePrimsToMaterialMap(
     const MaxUsdWriteJobContext&                            jobCtx,
     const pxr::TfHashSet<pxr::SdfPath, pxr::SdfPath::Hash>& primsToMaterialBind,

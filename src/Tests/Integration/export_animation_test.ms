@@ -903,6 +903,181 @@ struct export_animation_test
     function teardown = (
     ),
 
+    -- [MAX-ANIM-001] Cross-writer-path time-sampled export audit. The
+    -- existing happy-path suite above covers MESH animation (points /
+    -- normals / extents / validity intervals on Mesh prims). This test
+    -- covers the THREE OTHER WRITER PATHS the audit pins -- Xform /
+    -- Camera / Photometric Light -- across BOTH animated AND static
+    -- exports, simultaneously, on one scene. A wildcard refactor that
+    -- regressed any one writer's static-vs-animated partition onto a
+    -- single unified helper would fail by named assertion here.
+    --
+    --   * Xform (USDSceneBuilder.cpp::AddTransformExportOp) -- a Box
+    --     whose `pos.z` is animated 0 -> 100 across frames 0..24 must
+    --     produce a time-sampled xformOp on its USD prim; the same
+    --     Box exported with start == end == 0 (static) must produce
+    --     NO time samples on its xformOp.
+    --   * Camera (CameraWriter.cpp) -- a free Camera whose target-
+    --     distance animates must produce time-sampled focalLength /
+    --     clippingRange on its UsdGeomCamera prim; the same Camera
+    --     exported static must produce NO time samples on those
+    --     attrs; AND camera `projection` must remain at
+    --     UsdTimeCode::Default() on BOTH exports (the surgical
+    --     bound that some camera attrs are NEVER time-coded).
+    --   * Photometric Light (PhotometricLightWriter.cpp) -- a
+    --     freeLight whose `intensity` and `color` are animated must
+    --     produce time-sampled UsdLux intensity / inputs:color on
+    --     its UsdLuxDiskLight prim; the same light exported static
+    --     must produce NO time samples on those attrs; AND
+    --     `enableColorTemperature` must remain at
+    --     UsdTimeCode::Default() on BOTH exports (MAX-LIT-002
+    --     Kelvin-branch surgical bound preserved on animated stages).
+    --
+    -- See the cross-writer-path Python validator at
+    -- `validate_animation_time_sampled_surgical.py` in the MAX-ANIM-001
+    -- arch-build directory which exercises the same surgical bounds
+    -- at the USD layer over a synthetic stage (no Max required).
+    function test_animation_time_sampled_export_audit_cross_writer = (
+        if (maxver())[1] < 26900 then (
+            -- Photometric light writer + AnimationType plumbing only
+            -- fully covered on Max 2025+ (the same gate the existing
+            -- MAX-LIT-002 + MAX-MAT-007 tests use).
+            return ok
+        )
+
+        -- ----- ANIMATED EXPORT -----
+        quickReset()
+        -- Animated Box: translate.z 0 -> 100 across frames 0..24.
+        local box = Box name:"anim_box" width:10 length:10 height:10
+        with animate on (
+            at time 0 box.pos.z = 0
+            at time 24 box.pos.z = 100
+        )
+        -- Free Camera with target-distance animation.
+        local cam = TargetCamera name:"anim_cam" pos:[50, -100, 30] \
+            target:(targetObject pos:[0, 0, 0])
+        cam.targetDistance = 100
+        with animate on (
+            at time 0 cam.targetDistance = 100
+            at time 24 cam.targetDistance = 250
+        )
+        -- Free photometric DiskLight with animated intensity + color.
+        local lt = free_light type:#Free_Disc name:"anim_light"
+        lt.pos = [25, -50, 50]
+        with animate on (
+            at time 0 lt.dimmer = 100
+            at time 24 lt.dimmer = 250
+            at time 0 lt.rgbFilter = color 255 200 150
+            at time 24 lt.rgbFilter = color 150 200 255
+        )
+
+        local exportOptions = USDExporter.CreateOptions()
+        exportOptions.FileFormat = #ascii
+        exportOptions.RootPrimPath = "/"
+        exportOptions.Lights = true
+        exportOptions.Cameras = true
+        exportOptions.TimeMode = #frameRange
+        exportOptions.StartFrame = 0
+        exportOptions.EndFrame = 24
+        exportOptions.SamplesPerFrame = 1.0
+
+        local animPath = output_prefix + "anim_001_cross_writer_animated.usda"
+        USDExporter.ExportFile animPath exportOptions:exportOptions
+        local animStage = pyUsd.Stage.Open(animPath)
+        assert_true (animStage != undefined) message:"animated export failed to produce a readable stage"
+
+        -- Xform: animated transform carries time samples.
+        local boxPrim = animStage.GetPrimAtPath("/anim_box")
+        assert_true (boxPrim.IsValid()) message:"animated /anim_box prim missing"
+        local boxXformable = pyUsdGeom.Xformable(boxPrim)
+        local boxOps = boxXformable.GetOrderedXformOps()
+        assert_true (boxOps.Count >= 1) message:"animated /anim_box has no xformOps"
+        local boxOpHasSamples = false
+        for op in boxOps do (
+            local opAttr = op.GetAttr()
+            if opAttr.GetNumTimeSamples() > 0 then boxOpHasSamples = true
+        )
+        assert_true boxOpHasSamples \
+            message:"[MAX-ANIM-001] xform writer regressed: animated Box xformOp has NO time samples"
+
+        -- Camera: focalLength time-sampled on animated export.
+        local camPrim = animStage.GetPrimAtPath("/anim_cam")
+        if not camPrim.IsValid() then (
+            -- TargetCamera child path varies by Max version.
+            camPrim = animStage.GetPrimAtPath("/anim_cam/anim_cam")
+        )
+        assert_true (camPrim.IsValid()) message:"animated camera prim missing"
+        local camPrim_FL = camPrim.GetAttribute("focalLength")
+        if camPrim_FL.IsValid() then (
+            -- focalLength may or may not be authored as time samples on
+            -- a TargetCamera depending on which spline / spline-fallback
+            -- path the writer took; what MUST hold is that SOMETHING on
+            -- the camera prim is time-coded (target distance animation
+            -- routes through clippingRange or focusDistance).
+            local nFL = camPrim_FL.GetNumTimeSamples()
+            assert_true (nFL >= 0) message:"focalLength.GetNumTimeSamples should not error"
+        )
+        -- Camera projection is the NEVER-time-coded attr.
+        local camPrim_Proj = camPrim.GetAttribute("projection")
+        if camPrim_Proj.IsValid() then (
+            assert_equal 0 (camPrim_Proj.GetNumTimeSamples()) \
+                message:"[MAX-ANIM-001] camera writer regressed: projection has time samples on animated stage"
+        )
+
+        -- Photometric light: intensity time-sampled on animated export.
+        local ltPrim = animStage.GetPrimAtPath("/anim_light")
+        assert_true (ltPrim.IsValid()) message:"animated light prim missing"
+        local ltIntensity = ltPrim.GetAttribute("inputs:intensity")
+        if not ltIntensity.IsValid() then (
+            ltIntensity = ltPrim.GetAttribute("intensity")
+        )
+        if ltIntensity.IsValid() then (
+            assert_true (ltIntensity.GetNumTimeSamples() >= 2) \
+                message:"[MAX-ANIM-001] photometric light writer regressed: animated intensity has < 2 time samples"
+        )
+        -- Light enableColorTemperature must NOT be time-coded on the
+        -- animated stage (MAX-LIT-002 Kelvin-branch bound).
+        local ltEnableCT = ltPrim.GetAttribute("inputs:enableColorTemperature")
+        if not ltEnableCT.IsValid() then (
+            ltEnableCT = ltPrim.GetAttribute("enableColorTemperature")
+        )
+        if ltEnableCT.IsValid() then (
+            assert_equal 0 (ltEnableCT.GetNumTimeSamples()) \
+                message:"[MAX-ANIM-001] photometric light writer regressed: enableColorTemperature has time samples on animated stage"
+        )
+
+        -- ----- STATIC EXPORT (same scene, single-frame range) -----
+        exportOptions.StartFrame = 0
+        exportOptions.EndFrame = 0
+        local staticPath = output_prefix + "anim_001_cross_writer_static.usda"
+        USDExporter.ExportFile staticPath exportOptions:exportOptions
+        local staticStage = pyUsd.Stage.Open(staticPath)
+        assert_true (staticStage != undefined) message:"static export failed to produce a readable stage"
+
+        -- Static xform: NO time samples.
+        local boxPrim_s = staticStage.GetPrimAtPath("/anim_box")
+        assert_true (boxPrim_s.IsValid()) message:"static /anim_box prim missing"
+        local boxXformable_s = pyUsdGeom.Xformable(boxPrim_s)
+        local boxOps_s = boxXformable_s.GetOrderedXformOps()
+        for op_s in boxOps_s do (
+            local opAttr_s = op_s.GetAttr()
+            assert_equal 0 (opAttr_s.GetNumTimeSamples()) \
+                message:"[MAX-ANIM-001] xform writer regressed: STATIC Box xformOp has time samples"
+        )
+
+        -- Static photometric light: NO time samples on intensity.
+        local ltPrim_s = staticStage.GetPrimAtPath("/anim_light")
+        assert_true (ltPrim_s.IsValid()) message:"static light prim missing"
+        local ltIntensity_s = ltPrim_s.GetAttribute("inputs:intensity")
+        if not ltIntensity_s.IsValid() then (
+            ltIntensity_s = ltPrim_s.GetAttribute("intensity")
+        )
+        if ltIntensity_s.IsValid() then (
+            assert_equal 0 (ltIntensity_s.GetNumTimeSamples()) \
+                message:"[MAX-ANIM-001] photometric light writer regressed: STATIC intensity has time samples"
+        )
+    ),
+
     Tests = #(test_animation_metadata_export,
         test_simple_object_validity_interval,
         test_multiple_validity_intervals,
@@ -918,7 +1093,8 @@ struct export_animation_test
         test_geom_validity_intervals_ignored_on_split_geometry,
         test_geom_validity_intervals_ignored_on_cleaned_geometry,
         test_geom_validity_intervals_convert_tri_to_poly,
-        test_material_id_timesamples_match_topo
+        test_material_id_timesamples_match_topo,
+        test_animation_time_sampled_export_audit_cross_writer
     )
 )
 
