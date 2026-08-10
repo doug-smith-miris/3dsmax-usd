@@ -76,15 +76,27 @@ bool MaxUsdCameraWriter::Write(
 
     const auto& displayTimeIndependentWarnings = time.IsFirstFrame();
 
-    // Clipping range:
-    if (maxCamera->GetManualClip() != 0) {
+    // Clipping range: author on EVERY exported camera, independent of 3ds Max's
+    // "Clip Manually" toggle. UsdGeomCamera.clippingRange defaults to (1.0, 1000000.0)
+    // in scene units when unauthored, which is silently wrong at metersPerUnit != 1
+    // (e.g. inches, cm, mm) and hides cameras behind a kilometre-scale far plane.
+    // We derive from GetClipDist(CAM_HITHER_CLIP/CAM_YON_CLIP) unconditionally, and
+    // sanity-clamp degenerate pairs (non-positive, NaN, inverted near >= far) to
+    // (1.0, 1000.0) in scene units. NaN is caught implicitly: NaN compared with
+    // anything is false, so !(x > 0) and !(near < far) both trigger on NaN.
+    {
         float nearDistance = maxCamera->GetClipDist(timeVal, CAM_HITHER_CLIP);
         float farDistance = maxCamera->GetClipDist(timeVal, CAM_YON_CLIP);
 
-        if (nearDistance + FLT_EPSILON > FLT_MIN && farDistance + FLT_EPSILON > FLT_MIN) {
-            pxr::GfVec2f clippingRange { nearDistance, farDistance };
-            usdCamera.CreateClippingRangeAttr().Set(clippingRange, usdTimeCode);
+        const bool degenerate = !(nearDistance > 0.0f) || !(farDistance > 0.0f)
+            || !(nearDistance < farDistance);
+        if (degenerate) {
+            nearDistance = 1.0f;
+            farDistance = 1000.0f;
         }
+
+        pxr::GfVec2f clippingRange { nearDistance, farDistance };
+        usdCamera.CreateClippingRangeAttr().Set(clippingRange, usdTimeCode);
 
 #ifdef USD_CURVES_SUPPORTED
         if (GetExportArgs().GetAnimationType()
