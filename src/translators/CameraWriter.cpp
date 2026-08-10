@@ -28,6 +28,8 @@
 
 #include <Scene/IPhysicalCamera.h>
 
+#include <cmath>
+
 PXR_NAMESPACE_OPEN_SCOPE
 
 MaxUsdCameraWriter::MaxUsdCameraWriter(const MaxUsdWriteJobContext& jobCtx, INode* node)
@@ -77,14 +79,27 @@ bool MaxUsdCameraWriter::Write(
     const auto& displayTimeIndependentWarnings = time.IsFirstFrame();
 
     // Clipping range:
-    if (maxCamera->GetManualClip() != 0) {
+    // Author an explicit clippingRange on every exported UsdGeomCamera, regardless of
+    // the 3ds Max 'Clip Manually' toggle. GetClipDist(CAM_HITHER_CLIP/CAM_YON_CLIP)
+    // always returns the effective near/far — either the artist's manual values or
+    // Max's per-camera defaults — so gating on GetManualClip() previously left every
+    // non-manual camera to fall back to the UsdGeomCamera schema default of
+    // (1.0, 1000000.0), which is nonsensical at metersPerUnit != 1.0 (far in km when
+    // the scene is in inches/cm/mm). Degenerate values (non-positive, NaN, or
+    // inverted near >= far) are sanity-clamped to (1.0, 1000.0) in scene units.
+    {
         float nearDistance = maxCamera->GetClipDist(timeVal, CAM_HITHER_CLIP);
         float farDistance = maxCamera->GetClipDist(timeVal, CAM_YON_CLIP);
 
-        if (nearDistance + FLT_EPSILON > FLT_MIN && farDistance + FLT_EPSILON > FLT_MIN) {
-            pxr::GfVec2f clippingRange { nearDistance, farDistance };
-            usdCamera.CreateClippingRangeAttr().Set(clippingRange, usdTimeCode);
+        const bool nearInvalid = std::isnan(nearDistance) || nearDistance <= 0.0f;
+        const bool farInvalid = std::isnan(farDistance) || farDistance <= 0.0f;
+        if (nearInvalid || farInvalid || !(nearDistance < farDistance)) {
+            nearDistance = 1.0f;
+            farDistance = 1000.0f;
         }
+
+        pxr::GfVec2f clippingRange { nearDistance, farDistance };
+        usdCamera.CreateClippingRangeAttr().Set(clippingRange, usdTimeCode);
 
 #ifdef USD_CURVES_SUPPORTED
         if (GetExportArgs().GetAnimationType()
