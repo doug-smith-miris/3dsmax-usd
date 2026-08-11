@@ -586,6 +586,278 @@ size_t _EnrichMtlxDocFromMaxMaterial(
     return injected;
 }
 
+// MAX-MTLX-002: after MAX-MTLX-001 wires up every Bitmap-backed input, walk
+// the remaining ND_standard_surface inputs and query the Max material for the
+// constant value that was authored on each un-textured slot. Returned string
+// is one entry per line: `mtlxInputName|mtlxType|value`, where value is a
+// comma-separated triple for color3 or a single float for float. The color
+// components are normalized to [0,1] from Max's [0,255] float color scale.
+// Emission-weight & metalness are only meaningful when > 0 so they are
+// skipped when the Max property is 0 (preserving the ND_standard_surface
+// NodeDef default rather than authoring redundant zeros).
+static const TSTR discoverMaxMtlxConstantsFn = LR"(
+    fn discoverMaxMtlxConstants materialAnimHandle = (
+        local m = getAnimByHandle materialAnimHandle
+        local result = ""
+        if m == undefined then return result
+        -- Slot map: (Max PhysicalMaterial/OpenPBR property name,
+        --           ND_standard_surface input name,
+        --           MaterialX type token)
+        local slotMap = #(
+            #("base_color",         "base_color",         "color3"),
+            #("baseColor",          "base_color",         "color3"),
+            #("Base_Color",         "base_color",         "color3"),
+            #("roughness",          "specular_roughness", "float"),
+            #("Roughness",          "specular_roughness", "float"),
+            #("metalness",          "metalness",          "float"),
+            #("Metalness",          "metalness",          "float"),
+            #("emit_color",         "emission_color",     "color3"),
+            #("emissionColor",      "emission_color",     "color3"),
+            #("refl_color",         "specular_color",     "color3"),
+            #("specularColor",      "specular_color",     "color3"),
+            #("Reflection_Color",   "specular_color",     "color3"),
+            #("trans_color",        "transmission_color", "color3"),
+            #("transmissionColor",  "transmission_color", "color3"),
+            #("transparency",       "transmission",       "float"),
+            #("cutout",             "opacity",            "float"),
+            #("cutoutOpacity",      "opacity",            "float")
+        )
+        local seenInputs = #()
+        for entry in slotMap do (
+            local propName  = entry[1]
+            local mtlxInput = entry[2]
+            local mtlxType  = entry[3]
+            if (isProperty m propName) then (
+                local v = getProperty m propName
+                if v != undefined then (
+                    if (findItem seenInputs mtlxInput) == 0 then (
+                        append seenInputs mtlxInput
+                        local valStr = ""
+                        if mtlxType == "color3" then (
+                            -- Max colors are in [0,255] float; normalize to [0,1].
+                            -- We author the value in the same nominal color space
+                            -- MtlxIOUtil uses for direct shader-input values
+                            -- (linear-in-name; downstream tools honor colorSpace
+                            -- metadata on the attribute — see color3 branch of
+                            -- _SetInputValue for the paired-Bitmap case).
+                            local rn = (v.r / 255.0)
+                            local gn = (v.g / 255.0)
+                            local bn = (v.b / 255.0)
+                            valStr = ((rn as string) + "," + (gn as string) + "," + (bn as string))
+                        ) else (
+                            -- Floats and cutout/opacity come through as-is.
+                            valStr = v as string
+                        )
+                        result += (mtlxInput + "|" + mtlxType + "|" + valStr + "\n")
+                    )
+                )
+            )
+        )
+        return result
+    )
+    discoverMaxMtlxConstants )";
+
+// Parses one line of the discoverMaxMtlxConstants output into (input, type, value).
+// Mirrors _ParseTexmapLine's contract; kept separate so evolution of one does
+// not silently break the other.
+static bool _ParseConstantLine(
+    const std::string& line,
+    std::string&       mtlxInput,
+    std::string&       mtlxType,
+    std::string&       valStr)
+{
+    auto pipe1 = line.find('|');
+    if (pipe1 == std::string::npos) {
+        return false;
+    }
+    auto pipe2 = line.find('|', pipe1 + 1);
+    if (pipe2 == std::string::npos) {
+        return false;
+    }
+    mtlxInput = line.substr(0, pipe1);
+    mtlxType = line.substr(pipe1 + 1, pipe2 - pipe1 - 1);
+    valStr = line.substr(pipe2 + 1);
+    while (!valStr.empty()
+           && (valStr.back() == '\r' || valStr.back() == '\n'
+               || valStr.back() == ' ')) {
+        valStr.pop_back();
+    }
+    return !mtlxInput.empty() && !mtlxType.empty() && !valStr.empty();
+}
+
+// MAX-MTLX-002: after `_EnrichMtlxDocFromMaxMaterial` has wired every Bitmap
+// slot it could recover, some ND_standard_surface inputs still reference
+// NodeGraph outputs whose interior source `MtlxIOUtil.ExportMtlxString`
+// dropped and no Bitmap map slot exists to restore them (117 dangling
+// outputs across 81 arena materials in the MAX-MTLX-001 baseline: 74
+// base_color, 28 specular_roughness, 7 opacity, 7 specular_color, 1
+// transmission_color). Downstream Karma / Hydra evaluates a connection to
+// a source-less NodeGraph output as zero, so every affected material
+// renders black-on-that-input even though the artist authored a solid
+// color.
+//
+// Fix: for each dangling input, drop the NodeGraph reference on the
+// shader input (converting the connection back into a bare value slot)
+// and set a constant value read from the Max material's PhysicalMaterial
+// / OpenPBR property. Also drop the now-orphaned NG output so we do not
+// leave declared-but-unused ports in the exported USD.  If the shader
+// input already has a value string from `MtlxIOUtil` we prefer that; a
+// MAXScript query is only consulted for inputs where the writer emitted
+// nothing at all.
+//
+// Returns the number of shader inputs pruned. No-op when the mtlxDoc has
+// no dangling connections (e.g. every input was Bitmap-wired by
+// MAX-MTLX-001, or a future Autodesk fix to MtlxIOUtil populates them).
+size_t _PruneDanglingNodeGraphOutputs(
+    const MaterialX::DocumentPtr& mtlxDoc,
+    const MaterialX::NodePtr&     shaderNode,
+    AnimHandle                    animHandle)
+{
+    if (!mtlxDoc || !shaderNode) {
+        return 0;
+    }
+
+    // Collect the set of currently-dangling shader inputs first, so a
+    // single MAXScript discovery call can populate them all.
+    std::vector<MaterialX::InputPtr> danglingInputs;
+    for (auto input : shaderNode->getInputs()) {
+        if (input->getNodeGraphString().empty()
+            && input->getOutputString().empty()) {
+            // Not wired through a NodeGraph — nothing for us to do.
+            continue;
+        }
+        if (_IsShaderInputDangling(mtlxDoc, shaderNode, input->getName())) {
+            danglingInputs.push_back(input);
+        }
+    }
+    if (danglingInputs.empty()) {
+        return 0;
+    }
+
+    // Query Max for the constant values that live on the shader inputs
+    // whose NG side has no interior source. Building the lookup once is
+    // cheaper than round-tripping to MAXScript per-input.
+    std::map<std::string, std::pair<std::string, std::string>> constantByInput;
+    {
+        FPValue rvalue;
+        rvalue.Init();
+        std::wstringstream ss;
+        ss << discoverMaxMtlxConstantsFn << animHandle << L'\0';
+        ExecuteMAXScriptScript(
+            ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue);
+        auto discovery = MaxUsd::MaxStringToUsdString(rvalue.s);
+        for (size_t start = 0; start <= discovery.size();) {
+            auto nl = discovery.find('\n', start);
+            std::string line;
+            if (nl == std::string::npos) {
+                line = discovery.substr(start);
+                start = discovery.size() + 1;
+            } else {
+                line = discovery.substr(start, nl - start);
+                start = nl + 1;
+            }
+            if (line.empty()) {
+                continue;
+            }
+            std::string mtlxInput, mtlxType, valStr;
+            if (!_ParseConstantLine(line, mtlxInput, mtlxType, valStr)) {
+                continue;
+            }
+            constantByInput[mtlxInput] = std::make_pair(mtlxType, valStr);
+        }
+    }
+
+    size_t pruned = 0;
+    std::set<std::pair<std::string, std::string>> outputsToRemove;
+
+    for (auto input : danglingInputs) {
+        auto inputName = input->getName();
+
+        // Note which NG output is being orphaned before mutating the input.
+        auto ngName = input->getNodeGraphString();
+        std::string outputName = input->getOutputString();
+        if (outputName.empty()) {
+            outputName = inputName + "_output";
+        }
+        if (!ngName.empty()) {
+            outputsToRemove.insert(std::make_pair(ngName, outputName));
+        }
+
+        // Break the connection. `nodegraph` / `output` attributes on a
+        // MaterialX shader input are how NodeGraph promotion is expressed
+        // in the serialized doc; clearing them turns the input back into
+        // a bare value slot.
+        if (input->hasAttribute("nodegraph")) {
+            input->removeAttribute("nodegraph");
+        }
+        if (input->hasAttribute("output")) {
+            input->removeAttribute("output");
+        }
+        // A `nodename` on a shader input (rare here — that's the "direct
+        // shader connection" form) would also point at a now-gone node;
+        // clear it defensively.
+        if (input->hasAttribute("nodename")) {
+            input->removeAttribute("nodename");
+        }
+
+        // If MtlxIOUtil didn't author a value alongside the connection,
+        // read the constant we discovered from the Max material.
+        if (input->getValueString().empty()) {
+            auto it = constantByInput.find(inputName);
+            if (it != constantByInput.end()) {
+                const auto& mtlxType = it->second.first;
+                const auto& valStr = it->second.second;
+                // Only set the value when the type on the shader input
+                // (declared by the NodeDef) matches the type we read from
+                // Max. Mismatches are dropped rather than coerced — better
+                // to fall back to the NodeDef default than author the wrong
+                // type. In practice all mappings above are one-to-one, so
+                // this guard is belt-and-suspenders.
+                if (input->getType() == mtlxType) {
+                    input->setValueString(valStr);
+                }
+            }
+        }
+
+        ++pruned;
+    }
+
+    // Drop the now-orphaned NG outputs so the exported USD does not
+    // carry declared-but-unused NodeGraph ports.
+    for (const auto& ngOut : outputsToRemove) {
+        auto ng = mtlxDoc->getNodeGraph(ngOut.first);
+        if (!ng) {
+            continue;
+        }
+        // Do not remove the output if some *other* shader input still
+        // references it (e.g. two ND_standard_surface siblings sharing
+        // one NG in an unusual authoring). Cheap safety check.
+        bool referencedElsewhere = false;
+        for (auto sibling : shaderNode->getInputs()) {
+            if (sibling->getNodeGraphString() == ngOut.first
+                && sibling->getOutputString() == ngOut.second) {
+                referencedElsewhere = true;
+                break;
+            }
+            if (sibling->getNodeGraphString() == ngOut.first
+                && sibling->getOutputString().empty()
+                && (sibling->getName() + "_output") == ngOut.second) {
+                referencedElsewhere = true;
+                break;
+            }
+        }
+        if (referencedElsewhere) {
+            continue;
+        }
+        auto output = ng->getOutput(ngOut.second);
+        if (output) {
+            ng->removeOutput(ngOut.second);
+        }
+    }
+
+    return pruned;
+}
+
 // Adds a node graph input to a USD node graph based on a MaterialX input.
 void _AddNodeGraphInput(
     const MaterialX::InputPtr& input,
@@ -897,6 +1169,14 @@ void MtlxShaderWriter::Write()
     // unconnected outputs. No-op when the doc is already fully populated or
     // when the material has no Bitmap-backed slots.
     _EnrichMtlxDocFromMaxMaterial(mtlxDoc, shaderNode, animHandle);
+
+    // MAX-MTLX-002: after MAX-MTLX-001 has restored every wire-able slot,
+    // some shader inputs still reference NodeGraph outputs with no source
+    // (materials whose input is a solid color rather than a Bitmap). Prune
+    // those connections and set the constant value read from the Max
+    // material, so downstream Karma / Hydra evaluates the artist's chosen
+    // color instead of a dangling-connection zero.
+    _PruneDanglingNodeGraphOutputs(mtlxDoc, shaderNode, animHandle);
 
     _SetShaderInfoAttributes(shaderNode, shaderSchema);
     _AddDependentNodes(shaderNode, collectedNodes, GetUsdStage(), parentPath);
