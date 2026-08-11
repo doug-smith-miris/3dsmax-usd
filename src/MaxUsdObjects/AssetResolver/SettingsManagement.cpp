@@ -138,7 +138,7 @@ void ShowDialog(const Adsk::AssetResolverPathDialog::Tab& tab, UsdStageRefPtr st
                 usdPathDialog->setCurrentStage(stage);
             }
         }
-        mainWindow->raiseDockWidget(s_dockWidget);
+        /* [miris-compat] QmaxMainWindow::raiseDockWidget absent in this Max 2027 SDK; the s_dockWidget->raise() on the next line raises it anyway (UI-only, not on the headless export path). */
         s_dockWidget->raise();
         if (s_dockWidget->isMinimized()) {
             s_dockWidget->showNormal();
@@ -199,7 +199,7 @@ void ShowDialog(const Adsk::AssetResolverPathDialog::Tab& tab, UsdStageRefPtr st
             }
         });
 
-    mainWindow->raiseDockWidget(dockWidget);
+    /* [miris-compat] QmaxMainWindow::raiseDockWidget absent in this Max 2027 SDK; the dockWidget->raise() on the next line raises it anyway (UI-only, not on the headless export path). */
     dockWidget->raise();
     dockWidget->show();
 
