@@ -270,6 +270,322 @@ void _AddShaderInput(
     }
 }
 
+// MAX-MTLX-001: 3ds Max's `MtlxIOUtil.ExportMtlxString` (invoked via
+// `exportMtlToMtlx` above) reliably emits the `ND_standard_surface` shader
+// and the `NG_<name>` NodeGraph output declarations, but drops the interior
+// `<tiledimage>` (image) nodes that carry the actual Bitmap/VRayBitmap file
+// slots. `_AddDependentNodes` faithfully translates whatever the doc contains,
+// so with an empty NG the exported USD ends up with dangling NodeGraph outputs
+// and zero `ND_tiledimage_*` shader prims. This helper walks the Max material's
+// map slots via MAXScript, discovers each Bitmap slot's file path + MaterialX
+// input mapping, and injects the missing `<tiledimage>` nodes into the
+// in-memory MaterialX document *before* the walker runs.
+//
+// Returned string is one entry per line: `mtlxInputName|mtlxType|filePath`.
+// Types are the ND_standard_surface input types (color3, float, vector3).
+// The `normal` input is special-cased: it flows through an `ND_normalmap_float`
+// whose `in` input needs a `vector3` image; we emit both the tiledimage and,
+// if missing, connect it through the existing normalmap node.
+static const TSTR discoverMaxMtlxTexmapsFn = LR"(
+    fn discoverMaxMtlxTexmaps materialAnimHandle = (
+        local m = getAnimByHandle materialAnimHandle
+        local result = ""
+        if m == undefined then return result
+        -- Slot map: (Max PhysicalMaterial/OpenPBR property name,
+        --           ND_standard_surface input name,
+        --           MaterialX type token used in the NodeGraph)
+        local slotMap = #(
+            #("base_color_map",         "base_color",         "color3"),
+            #("baseColorMap",           "base_color",         "color3"),
+            #("roughness_map",          "specular_roughness", "float"),
+            #("roughnessMap",           "specular_roughness", "float"),
+            #("metalness_map",          "metalness",          "float"),
+            #("metalnessMap",           "metalness",          "float"),
+            #("bump_map",               "normal",             "vector3"),
+            #("bumpMap",                "normal",             "vector3"),
+            #("norm_map",               "normal",             "vector3"),
+            #("normalMap",              "normal",             "vector3"),
+            #("emit_color_map",         "emission_color",     "color3"),
+            #("emissionColorMap",       "emission_color",     "color3"),
+            #("refl_color_map",         "specular_color",     "color3"),
+            #("specularColorMap",       "specular_color",     "color3"),
+            #("trans_color_map",        "transmission_color", "color3"),
+            #("transmissionColorMap",   "transmission_color", "color3"),
+            #("cutout_map",             "opacity",            "float"),
+            #("cutoutMap",              "opacity",            "float")
+        )
+        local seenInputs = #()
+        for entry in slotMap do (
+            local propName  = entry[1]
+            local mtlxInput = entry[2]
+            local mtlxType  = entry[3]
+            -- MAXScript has no `continue`; guard each stage with nested ifs.
+            if (isProperty m propName) then (
+                local tex = getProperty m propName
+                if tex != undefined then (
+                    -- Traverse through common wrappers to reach the underlying
+                    -- Bitmap. V-Ray's VRayBitmap wraps a `.bitmap`; OSL bitmaps
+                    -- expose `.filename`. Fall back to `.filename` on the
+                    -- top-level tex.
+                    local fname = undefined
+                    local cls   = classOf tex
+                    if cls == Bitmaptexture then (
+                        fname = tex.filename
+                    ) else if (isProperty tex #filename) then (
+                        fname = getProperty tex #filename
+                    ) else if (isProperty tex #bitmap) then (
+                        local bmp = getProperty tex #bitmap
+                        if bmp != undefined and (isProperty bmp #filename) then (
+                            fname = getProperty bmp #filename
+                        )
+                    )
+                    if fname != undefined and fname != "" then (
+                        -- Deduplicate on the mtlx input name; first hit wins.
+                        if (findItem seenInputs mtlxInput) == 0 then (
+                            append seenInputs mtlxInput
+                            result += (mtlxInput + "|" + mtlxType + "|" + fname + "\n")
+                        )
+                    )
+                )
+            )
+        )
+        return result
+    )
+    discoverMaxMtlxTexmaps )";
+
+// Parses one line of the discoverMaxMtlxTexmaps output into (input, type, path).
+static bool _ParseTexmapLine(
+    const std::string& line,
+    std::string&       mtlxInput,
+    std::string&       mtlxType,
+    std::string&       filePath)
+{
+    auto pipe1 = line.find('|');
+    if (pipe1 == std::string::npos) {
+        return false;
+    }
+    auto pipe2 = line.find('|', pipe1 + 1);
+    if (pipe2 == std::string::npos) {
+        return false;
+    }
+    mtlxInput = line.substr(0, pipe1);
+    mtlxType = line.substr(pipe1 + 1, pipe2 - pipe1 - 1);
+    filePath = line.substr(pipe2 + 1);
+    // trim trailing whitespace / CR
+    while (!filePath.empty()
+           && (filePath.back() == '\r' || filePath.back() == '\n'
+               || filePath.back() == ' ')) {
+        filePath.pop_back();
+    }
+    return !mtlxInput.empty() && !mtlxType.empty() && !filePath.empty();
+}
+
+// Locates the NodeGraph feeding a given input on a shader node. Returns null
+// if the input doesn't route through a NodeGraph output.
+MaterialX::NodeGraphPtr _GetInputNodeGraph(
+    const MaterialX::DocumentPtr& doc,
+    const MaterialX::NodePtr&     shaderNode,
+    const std::string&            inputName)
+{
+    auto input = shaderNode->getInput(inputName);
+    if (!input) {
+        return nullptr;
+    }
+    auto ngName = input->getNodeGraphString();
+    if (!ngName.empty()) {
+        return doc->getNodeGraph(ngName);
+    }
+    return nullptr;
+}
+
+// Returns true if the NodeGraph output referenced by shaderNode->getInput(inputName)
+// currently has no source (dangling — the MAX-MTLX-001 defect).
+bool _IsShaderInputDangling(
+    const MaterialX::DocumentPtr& doc,
+    const MaterialX::NodePtr&     shaderNode,
+    const std::string&            inputName)
+{
+    auto input = shaderNode->getInput(inputName);
+    if (!input) {
+        return true;
+    }
+    auto ng = _GetInputNodeGraph(doc, shaderNode, inputName);
+    if (!ng) {
+        return input->getNodeName().empty()
+            && input->getValueString().empty();
+    }
+    auto outName = input->getOutputString();
+    if (outName.empty()) {
+        outName = inputName + "_output";
+    }
+    auto out = ng->getOutput(outName);
+    if (!out) {
+        return true;
+    }
+    return out->getNodeName().empty()
+        && out->getNodeGraphString().empty();
+}
+
+// MAX-MTLX-001: inject the missing <tiledimage> nodes into the mtlxDoc's
+// NodeGraphs / shader wiring based on the Max material's map-slot inventory.
+// Returns the number of tiledimage nodes injected — 0 if the material is
+// fully populated already or has no Bitmap slots.
+size_t _EnrichMtlxDocFromMaxMaterial(
+    const MaterialX::DocumentPtr& mtlxDoc,
+    const MaterialX::NodePtr&     shaderNode,
+    AnimHandle                    animHandle)
+{
+    if (!mtlxDoc || !shaderNode) {
+        return 0;
+    }
+
+    FPValue rvalue;
+    rvalue.Init();
+    std::wstringstream ss;
+    ss << discoverMaxMtlxTexmapsFn << animHandle << L'\0';
+    ExecuteMAXScriptScript(
+        ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue);
+    auto discovery = MaxUsd::MaxStringToUsdString(rvalue.s);
+    if (discovery.empty()) {
+        return 0;
+    }
+
+    size_t      injected = 0;
+    std::string line;
+    for (size_t start = 0; start <= discovery.size();) {
+        auto nl = discovery.find('\n', start);
+        if (nl == std::string::npos) {
+            line = discovery.substr(start);
+            start = discovery.size() + 1;
+        } else {
+            line = discovery.substr(start, nl - start);
+            start = nl + 1;
+        }
+        if (line.empty()) {
+            continue;
+        }
+        std::string mtlxInput, mtlxType, filePath;
+        if (!_ParseTexmapLine(line, mtlxInput, mtlxType, filePath)) {
+            continue;
+        }
+
+        // Only inject when the corresponding shader input is dangling —
+        // don't overwrite MaterialX-authored connections that survived the
+        // MAXScript export path.
+        if (!_IsShaderInputDangling(mtlxDoc, shaderNode, mtlxInput)) {
+            continue;
+        }
+
+        // Locate (or create) the NodeGraph that feeds this input.
+        auto shaderInput = shaderNode->getInput(mtlxInput);
+        MaterialX::NodeGraphPtr ng;
+        std::string             outputName;
+        if (shaderInput) {
+            ng = _GetInputNodeGraph(mtlxDoc, shaderNode, mtlxInput);
+            outputName = shaderInput->getOutputString();
+        }
+        if (outputName.empty()) {
+            outputName = mtlxInput + "_output";
+        }
+        if (!ng) {
+            // Fall back to any NodeGraph that already declares this output.
+            for (auto candidate : mtlxDoc->getNodeGraphs()) {
+                if (candidate->getOutput(outputName)) {
+                    ng = candidate;
+                    break;
+                }
+            }
+        }
+        if (!ng) {
+            // No NodeGraph scaffold present — create one alongside the shader.
+            auto ngName = "NG_" + shaderNode->getName();
+            ng = mtlxDoc->getNodeGraph(ngName);
+            if (!ng) {
+                ng = mtlxDoc->addNodeGraph(ngName);
+            }
+        }
+        if (!ng) {
+            continue;
+        }
+
+        // Create the tiledimage node inside the NodeGraph.
+        auto imgName = "img_" + mtlxInput;
+        auto imgNode = ng->getNode(imgName);
+        if (!imgNode) {
+            imgNode = ng->addNode("tiledimage", imgName, mtlxType);
+        }
+        if (!imgNode) {
+            continue;
+        }
+        auto fileInput = imgNode->getInput("file");
+        if (!fileInput) {
+            fileInput = imgNode->addInput("file", "filename");
+        }
+        if (fileInput) {
+            fileInput->setValueString(filePath);
+            if (mtlxType == "color3") {
+                // Match the color space authoring the MaterialX exporter would use.
+                fileInput->setAttribute("colorspace", "srgb_texture");
+            }
+        }
+
+        // Wire the NodeGraph output to the newly-created tiledimage.
+        auto output = ng->getOutput(outputName);
+        if (!output) {
+            output = ng->addOutput(outputName, mtlxType);
+        }
+        if (output) {
+            output->setNodeName(imgName);
+            // Clear any stale nodegraph reference that would fight the direct
+            // connection.
+            if (output->hasAttribute("nodegraph")) {
+                output->removeAttribute("nodegraph");
+            }
+        }
+
+        // Ensure the shader input references this NodeGraph + output. It usually
+        // already does, but be defensive against exports that emitted a bare
+        // constant value.
+        if (shaderInput) {
+            shaderInput->setNodeGraphString(ng->getName());
+            shaderInput->setOutputString(outputName);
+            // Remove any constant value that would shadow the connection.
+            if (shaderInput->hasAttribute("value")) {
+                shaderInput->removeAttribute("value");
+            }
+        }
+
+        // Special-case: `normal` on ND_standard_surface flows through
+        // ND_normalmap_float, whose `in` input needs a vector3 image. If the
+        // NodeGraph already contains an ND_normalmap_float with a dangling
+        // `in`, re-route the output through it and connect the tiledimage.
+        if (mtlxInput == "normal") {
+            for (auto n : ng->getNodes()) {
+                if (n->getCategory() == "normalmap"
+                    || n->getName().find("normalmap") != std::string::npos) {
+                    auto nmIn = n->getInput("in");
+                    if (nmIn && nmIn->getNodeName().empty()
+                        && nmIn->getValueString().empty()) {
+                        if (!nmIn) {
+                            nmIn = n->addInput("in", "vector3");
+                        }
+                        nmIn->setNodeName(imgName);
+                    }
+                    // Point NodeGraph output at the normalmap instead of the
+                    // raw image so downstream tangent-space handling kicks in.
+                    if (output) {
+                        output->setNodeName(n->getName());
+                    }
+                    break;
+                }
+            }
+        }
+
+        ++injected;
+    }
+    return injected;
+}
+
 // Adds a node graph input to a USD node graph based on a MaterialX input.
 void _AddNodeGraphInput(
     const MaterialX::InputPtr& input,
@@ -574,6 +890,14 @@ void MtlxShaderWriter::Write()
             usdPrim.GetPrimPath().GetText());
         return;
     }
+    // MAX-MTLX-001: enrich the in-memory MaterialX doc with the Bitmap map
+    // slots that `MtlxIOUtil.ExportMtlxString` dropped, so the downstream
+    // walker emits ND_tiledimage USD Shader prims wired into each dangling
+    // NodeGraph output instead of leaving the NodeGraph with declared but
+    // unconnected outputs. No-op when the doc is already fully populated or
+    // when the material has no Bitmap-backed slots.
+    _EnrichMtlxDocFromMaxMaterial(mtlxDoc, shaderNode, animHandle);
+
     _SetShaderInfoAttributes(shaderNode, shaderSchema);
     _AddDependentNodes(shaderNode, collectedNodes, GetUsdStage(), parentPath);
 
