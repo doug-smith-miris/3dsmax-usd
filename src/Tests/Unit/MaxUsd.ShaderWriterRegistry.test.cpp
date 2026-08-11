@@ -17,9 +17,10 @@
 
 #include "Mocks/MockStdMat.h"
 
-#include <MaxUsd/Translators/ShaderWriterRegistry.h>
+#include <MaxUsd/Translators/LastResortMtlxShaderWriter.h>
 #include <MaxUsd/Translators/LastResortUSDPreviewSurfaceWriter.h>
 #include <MaxUsd/Translators/RegistryHelper.h>
+#include <MaxUsd/Translators/ShaderWriterRegistry.h>
 
 #include <pxr/usd/usdShade/shader.h>
 #include <pxr/usdImaging/usdImaging/tokens.h>
@@ -98,6 +99,57 @@ TEST(ShaderWriteRegistryTest, NoWriterDummyFallbackWhenNoTarget)
 	MaxUsdShaderWriterRegistry::WriterFactoryFn writerFn = MaxUsdShaderWriterRegistry::Find(
 			Class_ID(0xd00f1e00L, 0xbe77e500L) /* PBR Material (Metal / Rough) */, exportArgs);
 
+	EXPECT_EQ(nullptr, writerFn);
+}
+
+// MAX-MTLX-004: mirror of NoRegisteredShaderWriterDummyFallback, but for the
+// MaterialX render target. Before the fix, Find() returned nullptr for any
+// material Class_ID that had no registered writer on the MaterialX target,
+// so the 36 arch-viz materials with non-Physical / non-OpenPBR sources
+// never got an outputs:mtlx:surface arc. The new symmetric branch in
+// ShaderWriterRegistry::Find returns a LastResortMtlxShaderWriter factory
+// for those cases, gated on the same
+// GetUseLastResortUSDPreviewSurfaceWriter() option the UsdPreviewSurface
+// fallback uses.
+TEST(ShaderWriteRegistryTest, NoRegisteredShaderWriterMtlxFallback)
+{
+	MaxUsd::USDSceneBuilderOptions exportArgs;
+	exportArgs.SetConvertMaterialsTo(TfToken("MaterialX"));
+	MaxUsdShaderWriterRegistry::WriterFactoryFn writerFn =
+			MaxUsdShaderWriterRegistry::Find(
+				Class_ID(0xd00f1e00L, 0xbe77e500L) /* PBR Material (Metal / Rough) */,
+				exportArgs);
+
+	auto dummyName = std::string{};
+	MockStdMat mtl;
+	MaxUsdWriteJobContext ctx{ pxr::UsdStage::CreateInMemory(), dummyName, exportArgs, false, false };
+	auto writer = writerFn(&mtl, pxr::SdfPath{ "/mtl" }, ctx);
+	auto dummyWriter = dynamic_cast<LastResortMtlxShaderWriter*>(writer.get());
+
+	EXPECT_NE(nullptr, dummyWriter);
+
+	// Symmetric to the UsdPreviewSurface case: disabling the last-resort
+	// option must suppress the MaterialX fallback too.
+	exportArgs.SetUseLastResortUSDPreviewSurfaceWriter(false);
+	MaxUsdShaderWriterRegistry::WriterFactoryFn writerFnNoFallback = MaxUsdShaderWriterRegistry::Find(
+			Class_ID(0xd00f1e00L, 0xbe77e500L) /* PBR Material (Metal / Rough) */,
+			exportArgs);
+	EXPECT_EQ(nullptr, writerFnNoFallback);
+}
+
+// MAX-MTLX-004: the MaterialX fallback must not fire for other targets
+// (e.g. Arnold, custom render contexts). Guards against a future change to
+// the branch expression accidentally widening the fallback beyond the
+// MaterialX target.
+TEST(ShaderWriteRegistryTest, MtlxFallbackDoesNotFireForOtherTargets)
+{
+	MaxUsd::USDSceneBuilderOptions exportArgs;
+	exportArgs.SetAllMaterialConversions({TfToken("Arnold")});
+	exportArgs.SetConvertMaterialsTo(TfToken("Arnold"));
+	MaxUsdShaderWriterRegistry::WriterFactoryFn writerFn =
+			MaxUsdShaderWriterRegistry::Find(
+				Class_ID(0xd00f1e00L, 0xbe77e500L) /* PBR Material (Metal / Rough) */,
+				exportArgs);
 	EXPECT_EQ(nullptr, writerFn);
 }
 
