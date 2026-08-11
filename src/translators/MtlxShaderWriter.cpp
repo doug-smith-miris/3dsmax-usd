@@ -858,6 +858,174 @@ size_t _PruneDanglingNodeGraphOutputs(
     return pruned;
 }
 
+// MAX-MTLX-003: the ND_normalmap_float sub-shader that scaffolds the normal
+// branch of a MaterialX NodeGraph reaches the exporter with its own `in`
+// input dropped by `MtlxIOUtil.ExportMtlxString`. MAX-MTLX-001 only wires
+// the tiledimage → normalmap.in when the shader-side `normal` input is
+// itself dangling (i.e. the NG's `normal_output` had no source); it skips
+// the case where the NG's `normal_output` DOES connect to a normalmap node
+// but that node's own `in` is the dangling port. In the diagnostic run's
+// baseline (`08_wrap_up.txt`, pipeline `0b6d5e38`), only 4 of 45 scaffolded
+// ND_normalmap_float nodes had `in` wired to an ND_tiledimage_vector3; the
+// other 41 fell through to the port default, so those materials lose their
+// normal mapping entirely.
+//
+// Fix: after `_EnrichMtlxDocFromMaxMaterial` (MAX-MTLX-001) and
+// `_PruneDanglingNodeGraphOutputs` (MAX-MTLX-002) run, walk every
+// normalmap-class node in every NodeGraph belonging to this shader; for
+// any whose `in` input is still dangling, re-run `discoverMaxMtlxTexmaps`
+// to find the Bitmap-backed normal slot on the Max material, inject an
+// `img_normal` (or reuse) ND_tiledimage_vector3 in the same NodeGraph,
+// and wire the normalmap's `in` to it. This is the wiring MAX-MTLX-001
+// would have authored had its outer skip check considered the normalmap's
+// own port state instead of only the shader's `normal` input.
+//
+// Returns the number of normalmap.in connections wired. No-op when there
+// is no dangling normalmap.in (either every normalmap was already wired
+// by MtlxIOUtil / MAX-MTLX-001, or the material carries no normal map
+// slot at all — in which case Karma correctly falls through to the port
+// default and no wire is authored).
+size_t _WireDanglingNormalmapInputs(
+    const MaterialX::DocumentPtr& mtlxDoc,
+    const MaterialX::NodePtr&     shaderNode,
+    AnimHandle                    animHandle)
+{
+    if (!mtlxDoc || !shaderNode) {
+        return 0;
+    }
+
+    // Collect (nodegraph, normalmap-node) pairs whose `in` input is
+    // currently dangling. Doing this pass first means we only pay the
+    // MAXScript round-trip when the shader actually has a normal branch
+    // that needs help.
+    std::vector<std::pair<MaterialX::NodeGraphPtr, MaterialX::NodePtr>> targets;
+    for (auto ng : mtlxDoc->getNodeGraphs()) {
+        for (auto n : ng->getNodes()) {
+            const bool isNormalmap
+                = n->getCategory() == "normalmap"
+                  || n->getName().find("normalmap") != std::string::npos;
+            if (!isNormalmap) {
+                continue;
+            }
+            auto nmIn = n->getInput("in");
+            // Consider the input dangling when it has no source node AND
+            // no explicit value string. A normalmap authored with a real
+            // vector3 value would be preserved by MtlxIOUtil and needs no
+            // help.
+            const bool inDangling
+                = !nmIn
+                  || (nmIn->getNodeName().empty()
+                      && nmIn->getNodeGraphString().empty()
+                      && nmIn->getOutputString().empty()
+                      && nmIn->getValueString().empty());
+            if (inDangling) {
+                targets.emplace_back(ng, n);
+            }
+        }
+    }
+    if (targets.empty()) {
+        return 0;
+    }
+
+    // Ask Max for the material's Bitmap-backed map slots. The `normal`
+    // entry (if any) carries the filename we need to wire in. Reuses the
+    // same MAX-MTLX-001 helper so the two paths stay in lockstep — if a
+    // future edit teaches `discoverMaxMtlxTexmaps` about a new normal-map
+    // property spelling, this fix picks it up automatically.
+    std::string normalFilePath;
+    {
+        FPValue rvalue;
+        rvalue.Init();
+        std::wstringstream ss;
+        ss << discoverMaxMtlxTexmapsFn << animHandle << L'\0';
+        ExecuteMAXScriptScript(
+            ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue);
+        auto discovery = MaxUsd::MaxStringToUsdString(rvalue.s);
+        for (size_t start = 0; start <= discovery.size();) {
+            auto nl = discovery.find('\n', start);
+            std::string line;
+            if (nl == std::string::npos) {
+                line = discovery.substr(start);
+                start = discovery.size() + 1;
+            } else {
+                line = discovery.substr(start, nl - start);
+                start = nl + 1;
+            }
+            if (line.empty()) {
+                continue;
+            }
+            std::string mtlxInput, mtlxType, filePath;
+            if (!_ParseTexmapLine(line, mtlxInput, mtlxType, filePath)) {
+                continue;
+            }
+            if (mtlxInput == "normal") {
+                normalFilePath = filePath;
+                break;
+            }
+        }
+    }
+    if (normalFilePath.empty()) {
+        // No discoverable normal Bitmap on the Max side. Leave the
+        // normalmap's `in` at its port default — this is the same behavior
+        // downstream Karma / Hydra sees today and matches MAX-MTLX-001's
+        // conservative no-op contract when a slot cannot be recovered.
+        return 0;
+    }
+
+    size_t wired = 0;
+    for (const auto& targetPair : targets) {
+        auto ng = targetPair.first;
+        auto normalmap = targetPair.second;
+
+        // Reuse an existing `img_normal` in the same NodeGraph if one is
+        // already there (defensive against future edits that pre-populate
+        // the tiledimage but forget to wire it). Otherwise create the
+        // ND_tiledimage_vector3 alongside the normalmap.
+        const std::string imgName = "img_normal";
+        auto              imgNode = ng->getNode(imgName);
+        if (!imgNode) {
+            imgNode = ng->addNode("tiledimage", imgName, "vector3");
+        }
+        if (!imgNode) {
+            continue;
+        }
+        auto fileInput = imgNode->getInput("file");
+        if (!fileInput) {
+            fileInput = imgNode->addInput("file", "filename");
+        }
+        if (fileInput) {
+            fileInput->setValueString(normalFilePath);
+            // The MaterialX exporter tags color3 filename inputs with
+            // colorspace="srgb_texture" to route them through the sRGB
+            // decode. For a normal map the raw texels ARE the tangent-space
+            // vector, not sRGB-encoded color, so we omit that attribute —
+            // matching the color-space handling MAX-MTLX-001 uses for its
+            // vector3 slot.
+            if (fileInput->hasAttribute("colorspace")) {
+                fileInput->removeAttribute("colorspace");
+            }
+        }
+
+        // Wire the normalmap's `in` to the tiledimage. Add the input if
+        // MtlxIOUtil dropped it entirely (the common case) or update it
+        // in place if a bare declaration survived.
+        auto nmIn = normalmap->getInput("in");
+        if (!nmIn) {
+            nmIn = normalmap->addInput("in", "vector3");
+        }
+        if (nmIn) {
+            nmIn->setNodeName(imgName);
+            // Any stale value string would shadow the source connection
+            // in some MaterialX evaluators — clear it defensively.
+            if (nmIn->hasAttribute("value")) {
+                nmIn->removeAttribute("value");
+            }
+            ++wired;
+        }
+    }
+    return wired;
+}
+
 // Adds a node graph input to a USD node graph based on a MaterialX input.
 void _AddNodeGraphInput(
     const MaterialX::InputPtr& input,
@@ -1177,6 +1345,16 @@ void MtlxShaderWriter::Write()
     // material, so downstream Karma / Hydra evaluates the artist's chosen
     // color instead of a dangling-connection zero.
     _PruneDanglingNodeGraphOutputs(mtlxDoc, shaderNode, animHandle);
+
+    // MAX-MTLX-003: MAX-MTLX-001 wires `ND_tiledimage_vector3` →
+    // `ND_normalmap_float.in` only when the shader-side `normal` input is
+    // itself dangling. When the NG's `normal_output` connects to a
+    // scaffolded normalmap node but that normalmap's OWN `in` was dropped
+    // by `MtlxIOUtil.ExportMtlxString`, MAX-MTLX-001 skips it and the
+    // material renders with no normal mapping. Walk the normalmap nodes
+    // in this shader's NodeGraphs and wire their `in` from the Max
+    // material's normal-map Bitmap slot.
+    _WireDanglingNormalmapInputs(mtlxDoc, shaderNode, animHandle);
 
     _SetShaderInfoAttributes(shaderNode, shaderSchema);
     _AddDependentNodes(shaderNode, collectedNodes, GetUsdStage(), parentPath);
