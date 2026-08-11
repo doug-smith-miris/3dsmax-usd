@@ -157,6 +157,7 @@ powershell.exe -ExecutionPolicy Unrestricted -Command "$(SolutionDir)..\build-sc
     <ClCompile Include="Translators\AnimExportTask.cpp" />
     <ClCompile Include="Translators\FallbackPrimReader.cpp" />
     <ClCompile Include="Translators\FunctorPrimReader.cpp" />
+    <ClCompile Include="Translators\LastResortMtlxShaderWriter.cpp" />
     <ClCompile Include="Translators\LastResortUSDPreviewSurfaceWriter.cpp" />
     <ClCompile Include="Translators\PrimReader.cpp" />
     <ClCompile Include="Translators\PrimReaderRegistry.cpp" />
@@ -260,6 +261,7 @@ powershell.exe -ExecutionPolicy Unrestricted -Command "$(SolutionDir)..\build-sc
     <ClInclude Include="maxusd_pch.h" />
     <ClInclude Include="Translators\AnimExportTask.h" />
     <ClInclude Include="Translators\FallbackPrimReader.h" />
+    <ClInclude Include="Translators\LastResortMtlxShaderWriter.h" />
     <ClInclude Include="Translators\LastResortUSDPreviewSurfaceWriter.h" />
     <ClInclude Include="Translators\ShadingModeImporter.h" />
     <ClInclude Include="Translators\FunctorPrimReader.h" />

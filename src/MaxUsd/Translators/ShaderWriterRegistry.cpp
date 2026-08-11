@@ -15,6 +15,7 @@
 //
 #include "ShaderWriterRegistry.h"
 
+#include "LastResortMtlxShaderWriter.h"
 #include "LastResortUSDPreviewSurfaceWriter.h"
 #include "RegistryHelper.h"
 
@@ -174,6 +175,27 @@ MaxUsdShaderWriterRegistry::WriterFactoryFn MaxUsdShaderWriterRegistry::Find(
                               const SdfPath&         usd_path,
                               MaxUsdWriteJobContext& job_ctx) {
             return std::make_shared<LastResortUSDPreviewSurfaceWriter>(material, usd_path, job_ctx);
+        };
+    }
+    // MAX-MTLX-004: Symmetric MaterialX fallback. Prior to this branch, when
+    // the MaterialX target was active and the material's Class_ID was not one
+    // of the two the MtlxShaderWriter is registered for (PhysicalMaterial /
+    // OpenPBR), Find() returned nullptr, so the material got a
+    // UsdPreviewSurface arc (from the sister branch above) but no
+    // `outputs:mtlx:surface` at all. That leaves any MaterialX-consuming
+    // renderer (Karma, MaterialXView) evaluating only the material's
+    // fallback color — and for the 36-of-179 non-Physical materials in the
+    // arch-viz corpus that means no MaterialX network is authored on the
+    // stage at all. Gate this on the same option the UsdPreviewSurface
+    // fallback uses so users who opted out of last-resort writers get
+    // symmetric behavior across targets.
+    else if (
+        exportArgs.GetConvertMaterialsTo() == TfToken("MaterialX")
+        && exportArgs.GetUseLastResortUSDPreviewSurfaceWriter() == true) {
+        lastResortWriter = [](Mtl*                   material,
+                              const SdfPath&         usd_path,
+                              MaxUsdWriteJobContext& job_ctx) {
+            return std::make_shared<LastResortMtlxShaderWriter>(material, usd_path, job_ctx);
         };
     }
     return lastResortWriter;
