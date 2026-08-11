@@ -517,6 +517,13 @@ size_t _EnrichMtlxDocFromMaxMaterial(
         if (!imgNode) {
             continue;
         }
+        // Author the explicit nodedef string. USD export derives `info:id` solely from
+        // node->getNodeDefString() (see _GetNodeDefString: "the 3dsmax MaterialX component
+        // guarantees that the nodeDefString is set"). addNode() sets category+type but NOT
+        // this attribute, so without it info:id serializes empty and the node is inert —
+        // MaterialX can't resolve its type, so it neither renders nor counts as a texture
+        // node. Native exporter nodes always set it; match that (ND_tiledimage_<type>).
+        imgNode->setNodeDefString("ND_tiledimage_" + mtlxType);
         auto fileInput = imgNode->getInput("file");
         if (!fileInput) {
             fileInput = imgNode->addInput("file", "filename");
@@ -989,6 +996,9 @@ size_t _WireDanglingNormalmapInputs(
         if (!imgNode) {
             continue;
         }
+        // Author the explicit nodedef so USD export sets info:id (see the matching comment
+        // and _GetNodeDefString). Without it the injected normal-map image node is inert.
+        imgNode->setNodeDefString("ND_tiledimage_vector3");
         auto fileInput = imgNode->getInput("file");
         if (!fileInput) {
             fileInput = imgNode->addInput("file", "filename");
