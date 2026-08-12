@@ -311,11 +311,31 @@ MaxUsdPrimWriter::ContextSupport MaxUsdVRayLightWriter::CanExport(
     INode*                                node,
     const MaxUsd::USDSceneBuilderOptions& exportArgs)
 {
-    if (!exportArgs.GetTranslateLights()) {
+    // [MAX-LIT-DIAG] Reliable runtime diagnostics via MaxUsd::Log (the exporter's own
+    // logging facility — captured to opt.LogPath; C++ ofstream to C:\suts is a proven no-op).
+    // One-time marker proves the writer is REGISTERED and consulted at all; the per-light
+    // marker (gated on LIGHT super-class) shows why CanExport accepts/rejects each light.
+    static bool s_vrayProbeRegistered = false;
+    if (!s_vrayProbeRegistered) {
+        s_vrayProbeRegistered = true;
+        MaxUsd::Log::Warn(L"[VRAYLIGHTPROBE] CanExport reached — writer IS registered");
+    }
+    const bool tl = exportArgs.GetTranslateLights();
+    const auto object = node->EvalWorldState(exportArgs.GetResolvedTimeConfig().GetStartTime()).obj;
+    const bool objNull = (object == nullptr);
+    const bool superIsLight = (!objNull && object->SuperClassID() == LIGHT_CLASS_ID);
+    if (superIsLight) {
+        MaxUsd::Log::Warn(
+            L"[VRAYLIGHTPROBE] light node={0} translateLights={1} scid={2} class={3}",
+            node->GetName(),
+            tl ? 1 : 0,
+            static_cast<int>(object->SuperClassID()),
+            static_cast<int>(object->ClassID().PartA()));
+    }
+    if (!tl) {
         return ContextSupport::Unsupported;
     }
-    const auto object = node->EvalWorldState(exportArgs.GetResolvedTimeConfig().GetStartTime()).obj;
-    if (object == nullptr) {
+    if (objNull) {
         return ContextSupport::Unsupported;
     }
     // Claim any light-super-class object. The prior class-name gate (matching "vray"+"light"
@@ -367,6 +387,14 @@ bool MaxUsdVRayLightWriter::Write(
     GenLight* genLight = dynamic_cast<GenLight*>(object);
     const auto probe = _ProbeVRayLight(sourceNode);
     const auto primType = _ClassifyVRayLight(probe);
+
+    // [MAX-LIT-DIAG] Write() only runs if FindWriter selected THIS writer for the node.
+    MaxUsd::Log::Warn(
+        L"[VRAYLIGHTWRITE] node={0} className={1} primType={2} genLight={3}",
+        sourceNode->GetName(),
+        MaxUsd::UsdStringToMaxString(probe.className).data(),
+        MaxUsd::UsdStringToMaxString(primType.GetString()).data(),
+        (genLight != nullptr) ? 1 : 0);
 
     auto stage = targetPrim.GetStage();
     auto primPath = targetPrim.GetPath();
