@@ -38,6 +38,7 @@
 #include <pxr/usd/usdLux/sphereLight.h>
 
 #include <genlight.h>
+#include <lslights.h> // LIGHTSCAPE_LIGHT_CLASS — defer photometric lights to PhotometricLightWriter
 #include <maxscript/maxscript.h>
 #include <maxscript/foundation/functions.h>
 #include <maxscript/util/listener.h>
@@ -338,18 +339,23 @@ MaxUsdPrimWriter::ContextSupport MaxUsdVRayLightWriter::CanExport(
     if (objNull) {
         return ContextSupport::Unsupported;
     }
-    // Claim any light-super-class object. The prior class-name gate (matching "vray"+"light"
-    // on object->GetClassName()) was too fragile — GetClassName can return a localized/display
-    // string that misses the substring — and it silently dropped all 185 VRayLights to ZERO
-    // UsdLux. Photometric (Lightscape) lights are still handled by MaxUsdPhotometricLightWriter,
-    // which is registered BEFORE this writer, so FindWriter returns the photometric writer for
-    // those (both are Fallback; first-registered wins). Non-photometric lights (VRayLight /
-    // VRayIES / VRaySun / standard) fall through to this writer. The MAXScript probe reads the
-    // V-Ray-specific params when present and defaults gracefully otherwise.
     if (object->SuperClassID() != LIGHT_CLASS_ID) {
         return ContextSupport::Unsupported;
     }
-    return ContextSupport::Fallback;
+    // Photometric (Lightscape) lights belong to MaxUsdPhotometricLightWriter — defer to it.
+    if (object->IsSubClassOf(LIGHTSCAPE_LIGHT_CLASS)) {
+        return ContextSupport::Unsupported;
+    }
+    // Claim any non-photometric light object as SUPPORTED (not Fallback). This is deliberate:
+    // MaxUsdMeshWriter::CanExport returns Fallback for ANY object that CanConvertToType(TriObject)
+    // — which many V-Ray lights (VRayLight plane/sphere/disc/mesh, VRayIES) satisfy — and it is
+    // registered BEFORE this writer, so among Fallback writers MeshWriter won and 168 of 185
+    // lights exported as meshes/xforms instead of UsdLux (only the 17 non-mesh-convertible lights
+    // fell through to us). Returning Supported makes FindWriter prefer this writer over every
+    // Fallback claimant, so ALL non-photometric lights become UsdLux. The prior class-name gate
+    // (matching "vray"+"light" on GetClassName) was dropped earlier as too fragile; GenLight in
+    // Write() reads the standard interface and the MAXScript probe fills V-Ray specifics.
+    return ContextSupport::Supported;
 }
 
 MaxUsd::XformSplitRequirement MaxUsdVRayLightWriter::RequiresXformPrim()
