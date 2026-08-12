@@ -562,6 +562,72 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         -- one cannot wire displacement — that requires a separate
         -- authoring path (new node type, new material output arc),
         -- scoped OUT of MAX-MTLX-010 to a follow-on bite.
+        --
+        -- MAX-MTLX-011: transmission (refraction) roughness + sheen
+        -- roughness maps. Prior to this fix the slotMap covered no
+        -- transmission-roughness or sheen-roughness slots at all, so
+        -- every glass / glazing / frosted-dielectric material with a
+        -- refraction-roughness map, and every velvet / satin / brushed-
+        -- fabric material with a sheen-roughness map, silently exported
+        -- with those inputs locked at their ND_standard_surface port
+        -- defaults (transmission_extra_roughness = 0.0, sheen_roughness
+        -- = 0.3) regardless of what the source scene said. Prior-run
+        -- evidence:
+        --   evidence-slotmap-and-wrappers.md:33-35 lists
+        --   `texmap_refractionGlossiness` / `trans_roughness_map` /
+        --   `transmissionRoughnessMap` and `sheen_roughness_map` as
+        --   silent-drop classes distinct from MTLX-006's wrapper walk
+        --   and MTLX-007's blend/override unwrap.
+        --
+        -- MaterialX stdlib target inputs (verified via `hython` +
+        -- `mx.getNodeDef("ND_standard_surface_surfaceshader")`):
+        --   transmission_extra_roughness  (float, default 0.0) — ADDED
+        --     on top of specular_roughness for transmission ray paths.
+        --     There is NO plain `transmission_roughness` input on
+        --     ND_standard_surface; `transmission_extra_roughness` is
+        --     the canonical target and is what MaterialX 1.38+ uses.
+        --   sheen_roughness               (float, default 0.3) —
+        --     directly drives the sheen BRDF's roughness.
+        --
+        -- Property spellings:
+        --   PhysicalMaterial-style (custom / third-party):
+        --     trans_roughness_map (snake) / transRoughnessMap (camel)
+        --   OpenPBR-style long form (custom / third-party):
+        --     transmission_roughness_map / transmissionRoughnessMap
+        --   Generic sheen:
+        --     sheen_roughness_map (snake) / sheenRoughnessMap (camel)
+        --
+        -- NOTE: Neither stock PhysicalMaterial nor stock OpenPBR
+        -- exposes a transmission-roughness map slot in the shipping
+        -- `3dsmax_materials.mat_def` (stock PhysicalMaterial has no
+        -- roughness family for transmission at all; stock OpenPBR
+        -- shares `specular_roughness_map` between reflection and
+        -- transmission per the OpenPBR spec). These slotMap entries
+        -- cover MAXScript-authored / third-party PhysicalMaterial-
+        -- derived materials that DO expose a distinct transmission
+        -- roughness map. Stock OpenPBR scenes route to
+        -- ND_open_pbr_surface_surfaceshader (which uses
+        -- `fuzz_roughness`, not `sheen_roughness`) and are handled by
+        -- their own writer path — MAX-MTLX-011 targets the
+        -- ND_standard_surface path (PhysicalMaterial + VRayMtl
+        -- converted to Physical, plus any custom material whose
+        -- slotMap exposes these names).
+        --
+        -- VRayMtl's `texmap_refractionGlossiness` is EXCLUDED from
+        -- this bite: V-Ray exposes glossiness (0 = rough, 1 = smooth)
+        -- while ND_standard_surface uses roughness (0 = smooth,
+        -- 1 = rough). Wiring glossiness directly to
+        -- transmission_extra_roughness would produce a semantically
+        -- inverted map — polished glass would render as frost. Adding
+        -- V-Ray's glossiness map requires an `ND_invert_float` node
+        -- inserted between the tiledimage and the shader input, which
+        -- is an authoring-path change beyond a slotMap extension. That
+        -- is a follow-on bite (candidateMission
+        -- `max-mtlx-013-vray-glossiness-to-roughness-invert`). The
+        -- dominant arch-viz path — VRayMtl scenes run through the
+        -- V-Ray Scene Converter to become PhysicalMaterial — reaches
+        -- transmission roughness via the PhysicalMaterial spellings
+        -- authored above.
         local slotMap = #(
             #("base_color_map",         "base_color",         "color3"),
             #("baseColorMap",           "base_color",         "color3"),
@@ -598,7 +664,17 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
             #("texmap_anisotropy",          "specular_anisotropy", "float"),
             #("anisotropy_rotation_map",    "specular_rotation",   "float"),
             #("anisotropyRotationMap",      "specular_rotation",   "float"),
-            #("texmap_anisotropyRotation",  "specular_rotation",   "float")
+            #("texmap_anisotropyRotation",  "specular_rotation",   "float"),
+            -- MAX-MTLX-011 additions: transmission (refraction)
+            -- roughness + sheen roughness maps. All route to float
+            -- ND_tiledimage; the color3 colorspace gate does the
+            -- right thing (no sRGB decode of scalar roughness).
+            #("trans_roughness_map",         "transmission_extra_roughness", "float"),
+            #("transRoughnessMap",           "transmission_extra_roughness", "float"),
+            #("transmission_roughness_map",  "transmission_extra_roughness", "float"),
+            #("transmissionRoughnessMap",    "transmission_extra_roughness", "float"),
+            #("sheen_roughness_map",         "sheen_roughness",              "float"),
+            #("sheenRoughnessMap",           "sheen_roughness",              "float")
         )
         local seenInputs = #()
         for currentMat in subMtls do (
