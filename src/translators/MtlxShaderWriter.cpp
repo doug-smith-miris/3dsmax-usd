@@ -1275,6 +1275,216 @@ size_t _WireDanglingNormalmapInputs(
     return wired;
 }
 
+// MAX-MTLX-012: bump / normal-map STRENGTH scalar authoring on ND_normalmap.
+//
+// Every ND_normalmap_float scaffolded by MAX-MTLX-001 / MAX-MTLX-003 runs at
+// its port-default `scale = 1.0` regardless of the source material's authored
+// bump strength. On PhysicalMaterial that scalar lives at `.bump_map_amt`
+// (float, default 1.0 in the UI), on VRayMtl at `.bump_multiplier` (float,
+// default 1.0), on OpenPBR at `.bumpMapAmount` (mirror of PhysicalMaterial).
+// Baseline arch-viz scenes ship a mix of these where the artist has dialed
+// bump strength down (0.2-0.4) for weathered stone / carpet weave, and up
+// (2.0+) for hero brick / masonry — every one of those materials serialized
+// today with `scale` at 1.0, so Karma / Hydra render the bump at the WRONG
+// intensity even when MAX-MTLX-003 successfully wires the tiledimage into
+// `normalmap.in`. That is: the map data is present, the strength scalar is
+// dropped.
+//
+// Fix: after `_WireDanglingNormalmapInputs` has ensured every normalmap has
+// a source-wired `in`, walk the same normalmap-class node set and author
+// `scale` from the Max material's bump-strength property. Uses a companion
+// MAXScript helper (`discoverMaxMtlxBumpStrengthFn`) that mirrors the
+// MAX-MTLX-007 wrapper-walk (base-first VRayBlendMtl / VRayOverrideMtl
+// unwrap) so the base sub-material's bump strength wins over any coat's —
+// same first-hit-wins precedence as `discoverMaxMtlxTexmaps`.
+//
+// Returns the number of normalmap nodes whose `scale` was authored. No-op
+// when the material has no bump-strength property, when the property is
+// present but equals the ND_normalmap port default (1.0 — nothing to
+// author) so we do not pollute the exported doc with `1.0` no-ops, and
+// when the shader has no normalmap nodes to touch (either UsdPreviewSurface-
+// only material or a material with no normal branch at all — in which case
+// MAX-MTLX-003 also correctly no-ops).
+
+// MAX-MTLX-012: MAXScript helper that probes the Max material's bump-strength
+// scalar. Returns a numeric string ("0.35", "2.0", ...) or "" when no
+// property was found on any sub-material. Base-first traversal (same
+// `unwrapBlendMaterialSubMtls` recursion order as `discoverMaxMtlxTexmaps`)
+// so baseMtl's strength wins over any coat's.
+//
+// Property table (Max property → ND_normalmap.scale). Order matters — a hit
+// on ANY row for a given sub-material short-circuits the rest for that
+// sub-material, then the outer loop moves on to the next sub-material only
+// if no hit was found. PhysicalMaterial + OpenPBR spellings first because
+// they are the concrete surface classes both stock and V-Ray-Scene-Converted
+// materials collapse to on modern arch-viz scenes; VRayMtl next for the
+// legacy V-Ray direct-surface case.
+static const TSTR discoverMaxMtlxBumpStrengthFn = LR"(
+    fn discoverMaxMtlxBumpStrength materialAnimHandle = (
+        local m = getAnimByHandle materialAnimHandle
+        if m == undefined then return ""
+        -- Reuse the MAX-MTLX-007 wrapper-walk so blend / override wrappers
+        -- expand to their concrete sub-materials with base-first order. Non-
+        -- wrapper materials return `#(m)` — 1-element list, behavior byte-
+        -- identical to a direct probe on the surface class.
+        local subMtls = unwrapBlendMaterialSubMtls m #() 0
+        -- Property table: Max property spelling → note. Only the property
+        -- name matters at runtime; the note is for the reader.
+        --   bump_map_amt      — PhysicalMaterial (snake_case runtime API)
+        --   bumpMapAmount     — PhysicalMaterial / OpenPBR (camelCase spelling
+        --                       some MAXScript-authored scenes use)
+        --   bump_multiplier   — VRayMtl (legacy V-Ray direct-surface case
+        --                       where Scene Converter has NOT run)
+        --   bumpAmount        — StdMaterial-flavored name (rare, tolerated
+        --                       for legacy scenes that authored their own
+        --                       Standard material with a custom scalar).
+        local propNames = #(#bump_map_amt, #bumpMapAmount, #bump_multiplier, #bumpAmount)
+        for currentMat in subMtls do (
+            for pn in propNames do (
+                if (isProperty currentMat pn) then (
+                    local v = getProperty currentMat pn
+                    if v != undefined then (
+                        -- Only accept numeric values (float / integer). Reject
+                        -- everything else (e.g. a Texmap in the same-name slot
+                        -- on an unfamiliar wrapper) rather than mis-authoring
+                        -- a garbage `scale`.
+                        local vc = classOf v
+                        if vc == Float or vc == Double or vc == Integer or vc == Integer64 then (
+                            return (v as string)
+                        )
+                    )
+                )
+            )
+        )
+        return ""
+    )
+    discoverMaxMtlxBumpStrength )";
+
+// Parses the MAXScript strength string into a float. Returns true on success.
+// Empty string / non-numeric input → false. The MAXScript helper itself only
+// emits stringified numeric values, so a parse failure here means the
+// MAXScript env returned something unexpected — treat as "no strength" and
+// let the caller no-op.
+static bool _ParseBumpStrengthString(const std::string& s, float& out)
+{
+    if (s.empty()) {
+        return false;
+    }
+    try {
+        size_t pos = 0;
+        out = std::stof(s, &pos);
+        // Guard against negative-strength authoring — MaterialX ND_normalmap
+        // treats scale as a magnitude multiplier, and a negative value would
+        // invert the tangent-space delta (renderer-defined behavior). Max
+        // clamps its own bump UI to a non-negative range; keep the same
+        // contract here.
+        if (out < 0.0f) {
+            out = 0.0f;
+        }
+        return pos > 0;
+    } catch (...) {
+        return false;
+    }
+}
+
+size_t _ApplyBumpStrengthToNormalmaps(
+    const MaterialX::DocumentPtr& mtlxDoc,
+    const MaterialX::NodePtr&     shaderNode,
+    AnimHandle                    animHandle)
+{
+    if (!mtlxDoc || !shaderNode) {
+        return 0;
+    }
+
+    // Collect normalmap-class nodes first. If there are none, don't pay the
+    // MAXScript round-trip. Same category / name gate as
+    // `_WireDanglingNormalmapInputs` so the two functions agree on which
+    // nodes count as normalmap.
+    std::vector<MaterialX::NodePtr> normalmaps;
+    for (auto ng : mtlxDoc->getNodeGraphs()) {
+        for (auto n : ng->getNodes()) {
+            const bool isNormalmap
+                = n->getCategory() == "normalmap"
+                  || n->getName().find("normalmap") != std::string::npos;
+            if (isNormalmap) {
+                normalmaps.push_back(n);
+            }
+        }
+    }
+    if (normalmaps.empty()) {
+        return 0;
+    }
+
+    // Ask Max for the material's bump-strength scalar.
+    std::string strengthStr;
+    {
+        FPValue rvalue;
+        rvalue.Init();
+        std::wstringstream ss;
+        ss << discoverMaxMtlxBumpStrengthFn << animHandle << L'\0';
+        ExecuteMAXScriptScript(
+            ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue);
+        strengthStr = MaxUsd::MaxStringToUsdString(rvalue.s);
+        // Trim trailing whitespace / CR that some MAXScript stringifications
+        // leave behind on certain locales.
+        while (!strengthStr.empty()
+               && (strengthStr.back() == '\r' || strengthStr.back() == '\n'
+                   || strengthStr.back() == ' ' || strengthStr.back() == '\t')) {
+            strengthStr.pop_back();
+        }
+    }
+    float strength = 1.0f;
+    if (!_ParseBumpStrengthString(strengthStr, strength)) {
+        // No probeable strength on the Max side. Leave every normalmap's
+        // `scale` at its port default — matches MAX-MTLX-001's conservative
+        // no-op contract when a value cannot be recovered.
+        return 0;
+    }
+
+    // Skip the port default. Authoring `scale = 1.0` is a no-op in the
+    // MaterialX evaluator and would only clutter the exported doc with
+    // synthetic-looking inputs on every material whose artist accepted the
+    // Max UI's default. Use a small epsilon so a value like 0.9999999f from
+    // MAXScript stringification still round-trips to the port default.
+    if (std::fabs(strength - 1.0f) < 1e-6f) {
+        return 0;
+    }
+
+    size_t authored = 0;
+    for (const auto& normalmap : normalmaps) {
+        // `scale` is the MaterialX 1.38+ spelling for the bump-strength
+        // multiplier on ND_normalmap_float / ND_normalmap_vector2. See
+        // `MaterialX/libraries/stdlib/stdlib_defs.mtlx` — the port is
+        // `<input name="scale" type="float" value="1.0" />` on
+        // ND_normalmap_float and `type="vector2"` on ND_normalmap_vector2.
+        // We treat the value as a scalar float for both; for vector2 the
+        // MaterialX doc will coerce a single float to (v, v) on read.
+        auto scaleInput = normalmap->getInput("scale");
+        if (!scaleInput) {
+            scaleInput = normalmap->addInput("scale", "float");
+        }
+        if (!scaleInput) {
+            continue;
+        }
+        // Clear any pre-existing connection so the value opinion wins. In
+        // practice MtlxIOUtil.ExportMtlxString drops the scale input the
+        // same way it drops `in`, so a connection here would be a synthetic
+        // survivor — but be defensive.
+        if (!scaleInput->getNodeName().empty()) {
+            scaleInput->setNodeName("");
+        }
+        if (!scaleInput->getNodeGraphString().empty()) {
+            scaleInput->setNodeGraphString("");
+        }
+        if (!scaleInput->getOutputString().empty()) {
+            scaleInput->setOutputString("");
+        }
+        scaleInput->setValueString(strengthStr);
+        ++authored;
+    }
+    return authored;
+}
+
 // Adds a node graph input to a USD node graph based on a MaterialX input.
 void _AddNodeGraphInput(
     const MaterialX::InputPtr& input,
@@ -1604,6 +1814,20 @@ void MtlxShaderWriter::Write()
     // in this shader's NodeGraphs and wire their `in` from the Max
     // material's normal-map Bitmap slot.
     _WireDanglingNormalmapInputs(mtlxDoc, shaderNode, animHandle);
+
+    // MAX-MTLX-012: the ND_normalmap_float sub-shader's `scale` (bump-strength
+    // multiplier) is dropped alongside `in` by MtlxIOUtil.ExportMtlxString, so
+    // every scaffolded normalmap runs at its port default `1.0` even when the
+    // artist authored a non-unit bump strength on the Max material
+    // (`bump_map_amt` / `bumpMapAmount` on PhysicalMaterial / OpenPBR,
+    // `bump_multiplier` on VRayMtl). Walk the shader's normalmap nodes and
+    // author `scale` from the Max material's bump-strength property. Base-
+    // first wrapper walk (`unwrapBlendMaterialSubMtls`) so baseMtl's strength
+    // wins over any coat's, matching the layered-material precedence
+    // MAX-MTLX-007 established for the texture-map discovery path. No-op
+    // when no bump-strength property is discoverable or when the discovered
+    // value equals the port default (1.0) — the exported doc stays clean.
+    _ApplyBumpStrengthToNormalmaps(mtlxDoc, shaderNode, animHandle);
 
     _SetShaderInfoAttributes(shaderNode, shaderSchema);
     _AddDependentNodes(shaderNode, collectedNodes, GetUsdStage(), parentPath);
