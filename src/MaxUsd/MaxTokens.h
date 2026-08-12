@@ -59,6 +59,7 @@ TF_DECLARE_PUBLIC_TOKENS(MaxUsdPrimvarTokens, MaxUSDAPI, MAX_USD_PRIMVAR_TOKENS)
     (CylinderLight) \
     (SphereLight) \
     (DistantLight) \
+    (DomeLight) \
     (Camera) \
     (Mesh) \
     (BasisCurves) \
