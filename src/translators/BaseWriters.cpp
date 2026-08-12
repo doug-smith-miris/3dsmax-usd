@@ -22,6 +22,7 @@
 #include "SkinMorpherWriter.h"
 #include "StageWriter.h"
 #include "SunPositionerWriter.h"
+#include "VRayLightWriter.h"
 
 #include <MaxUsd/Translators/PrimWriterRegistry.h>
 
@@ -44,6 +45,11 @@ TF_REGISTRY_FUNCTION(MaxUsdPrimWriterRegistry)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdMeshWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdCameraWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdPhotometricLightWriter)
+    // MAX-LIT-002: V-Ray light writer sits AFTER PhotometricLightWriter but
+    // BEFORE Sun/Helper — it only claims LIGHT_CLASS_ID objects whose class
+    // name matches "VRay*Light" (or VRayIES/VRaySun), so it's a strict
+    // superset of the classes the photometric writer rejects.
+    MAXUSD_REGISTER_BASEWRITER(MaxUsdVRayLightWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdSunPositionerWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdHelperWriter)
 }

@@ -32,6 +32,8 @@
                   # CameraWriter - all Camera class objects
                   # ShapeWriter - any Shape class objects
                   # PhotometricLightWriter - any LightScape light class objects
+                  # VRayLightWriter - any LIGHT_CLASS_ID object whose class
+                  #     name matches VRayLight / VRayIES / VRaySun (MAX-LIT-002)
                   # SunPositionerWriter - any subject objects of SunPositioner class type
                   # HelperWriter - any PointHelper or Dummy class objects
                }

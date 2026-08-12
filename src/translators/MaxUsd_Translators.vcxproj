@@ -28,6 +28,7 @@
     <ClInclude Include="SkinMorpherWriter.h" />
     <ClInclude Include="StageWriter.h" />
     <ClInclude Include="SunPositionerWriter.h" />
+    <ClInclude Include="VRayLightWriter.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="BaseWriters.cpp" />
@@ -55,6 +56,7 @@
     <ClCompile Include="SkinMorpherWriter.cpp" />
     <ClCompile Include="StageWriter.cpp" />
     <ClCompile Include="SunPositionerWriter.cpp" />
+    <ClCompile Include="VRayLightWriter.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="MaxUsd_Translators.def" />
