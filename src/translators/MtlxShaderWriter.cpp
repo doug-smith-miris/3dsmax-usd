@@ -455,6 +455,50 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         -- VRayBlendMtl / VRayOverrideMtl the list is (self, baseMtl-tree,
         -- coats-tree...) and the first-hit-wins dedupe on `seenInputs`
         -- keeps baseMtl's textures winning over coats'.
+        --
+        -- MAX-MTLX-008 (scope/coverage audit — WHERE THE WRAPPER WALK
+        -- STOPS). The class-name gate above (`cls == "VRayBlendMtl"` /
+        -- `cls == "VRayOverrideMtl"`) is an EXACT equality match — case-
+        -- insensitive per MAXScript `==` string semantics but otherwise
+        -- literal. Any other wrapper-shaped material class the plugin
+        -- encounters is INTENTIONALLY out of scope; do not extend the
+        -- gate to a prefix/substring/suffix heuristic. The audit's
+        -- 48-case Python mirror at
+        -- `src/Tests/Integration/test_miris_max_mtlx_008.py` catches
+        -- superstring / substring / suffix drift, adjacent-wrapper
+        -- descent, novel-slot descent, and slot-order flips.
+        --
+        -- COLLISION SHAPE — `.baseMtl` exists on VRayOverrideMtl (walked)
+        -- AND on VRayMtlWrapper / VRayBumpMtl (NOT walked). The class-
+        -- name gate is the ONLY guard preventing a silent descent into
+        -- the wrapper-material family. A refactor to "just check for
+        -- `.baseMtl`" would silently widen scope to every V-Ray matte/
+        -- bump wrapper in an arch-viz scene. See MAX-MTLX-008 in
+        -- `doc/translation-mapping.md` for the full bounds.
+        --
+        -- Adjacent V-Ray classes deliberately excluded:
+        --   VRay2SidedMtl   — front/back are visually distinct; not a
+        --                     first-hit-wins texture merge.
+        --   VRayMtlWrapper  — matte/render-pass wrapper (has .baseMtl!);
+        --                     the wrapper itself IS the surface artists
+        --                     see.
+        --   VRayBumpMtl     — bump-only wrapper (has .baseMtl!);
+        --                     descending would double-count the
+        --                     substrate against its own .bump_map.
+        --   VRayFastSSS2, VRayLightMtl, VRayHairMtl — no wrapper role
+        --                     for the standard texmap-discovery path
+        --                     (VRayLightMtl is separately handled by
+        --                     MAX-MTLX-005 in LastResortMtlxShaderWriter).
+        --
+        -- Stock 3ds Max classes deliberately excluded:
+        --   Multi/Sub-Object — per-face-ID; MAX-GEO-002/006 owns the
+        --                     GeomSubset partition.
+        --   DoubleSided, Shell Material, Blend (stock), Composite Mtl,
+        --   Top/Bottom, Matte/Shadow — different combining semantics.
+        --
+        -- Extending MAX-MTLX-007 to a NEW wrapper class is a SEPARATE
+        -- future bite with its own captured corpus of leak values, its
+        -- own tests, and its own doc entry.
         local subMtls = unwrapBlendMaterialSubMtls m #() 0
         -- Slot map: (Max PhysicalMaterial/OpenPBR property name,
         --           ND_standard_surface input name,
