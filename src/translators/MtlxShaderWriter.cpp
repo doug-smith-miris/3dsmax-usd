@@ -503,6 +503,30 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         -- Slot map: (Max PhysicalMaterial/OpenPBR property name,
         --           ND_standard_surface input name,
         --           MaterialX type token used in the NodeGraph)
+        --
+        -- MAX-MTLX-009: specular_IOR maps (glass / water / coated
+        -- dielectrics) were silently dropped by every prior discovery
+        -- pass — the property spellings below are the canonical
+        -- IOR-map slot names for the three PBR material families the
+        -- arch-viz pipeline exercises (PhysicalMaterial, OpenPBR, VRayMtl).
+        -- All entries map to the SAME ND_standard_surface `specular_IOR`
+        -- input (float, port default 1.5), so the outer `seenInputs`
+        -- first-hit-wins dedupe picks whichever spelling the source
+        -- material used. VRayMtl exposes TWO IOR maps (reflectionIOR +
+        -- refractionIOR); we honor the base assumption that a
+        -- physically-plausible dielectric shares one IOR across both
+        -- reflection and refraction and route both to the SAME input —
+        -- first-hit-wins gives reflection priority since that is the
+        -- one the ND_standard_surface `specular_IOR` input controls
+        -- directly. Property-spelling audit:
+        --   PhysicalMaterial:  trans_ior_map (see
+        --     `src/Tests/Integration/export_material_test.ms:544` and
+        --     the plugin's own `3dsmax_materials.mat_def` line 41).
+        --   OpenPBR:           specular_ior_map (see
+        --     `3dsmax_materials.mat_def` line 192).
+        --   VRayMtl:           texmap_reflectionIOR / texmap_refractionIOR
+        --     (V-Ray SDK canonical names — surfaced at the MAXScript
+        --     layer as `.texmap_reflectionIOR` / `.texmap_refractionIOR`).
         local slotMap = #(
             #("base_color_map",         "base_color",         "color3"),
             #("baseColorMap",           "base_color",         "color3"),
@@ -521,7 +545,14 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
             #("trans_color_map",        "transmission_color", "color3"),
             #("transmissionColorMap",   "transmission_color", "color3"),
             #("cutout_map",             "opacity",            "float"),
-            #("cutoutMap",              "opacity",            "float")
+            #("cutoutMap",              "opacity",            "float"),
+            -- MAX-MTLX-009 additions: specular_IOR maps.
+            #("trans_ior_map",          "specular_IOR",       "float"),
+            #("transIorMap",            "specular_IOR",       "float"),
+            #("specular_ior_map",       "specular_IOR",       "float"),
+            #("specularIorMap",         "specular_IOR",       "float"),
+            #("texmap_reflectionIOR",   "specular_IOR",       "float"),
+            #("texmap_refractionIOR",   "specular_IOR",       "float")
         )
         local seenInputs = #()
         for currentMat in subMtls do (
