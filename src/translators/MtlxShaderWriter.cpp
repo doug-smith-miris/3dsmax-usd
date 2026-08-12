@@ -527,6 +527,41 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         --   VRayMtl:           texmap_reflectionIOR / texmap_refractionIOR
         --     (V-Ray SDK canonical names — surfaced at the MAXScript
         --     layer as `.texmap_reflectionIOR` / `.texmap_refractionIOR`).
+        -- MAX-MTLX-010: anisotropy + anisotropy-rotation maps
+        -- (`specular_anisotropy` / `specular_rotation` on
+        -- ND_standard_surface — both float, port defaults 0.0). Prior
+        -- to this fix the slotMap covered NO anisotropy slots at all,
+        -- so every VRayMtl brushed-metal / anisotropic-fabric / carbon-
+        -- fiber material silently exported with anisotropy locked at
+        -- its port default 0.0 (i.e. isotropic) regardless of what the
+        -- source scene said. Prior-run evidence:
+        --   evidence-slotmap-and-wrappers.md:31-32 lists
+        --   `texmap_anisotropy` / `anisotropy_map` and
+        --   `texmap_anisotropyRotation` / `anisotropy_rotation_map` as
+        --   silent-drop classes distinct from MTLX-006's wrapper walk
+        --   and MTLX-007's blend/override unwrap.
+        --
+        -- NOTE: PhysicalMaterial (Autodesk stock) does NOT expose
+        -- anisotropy in its parameter surface (see
+        -- `3dsmax_materials.mat_def:10-43` — no anisotropy inputs),
+        -- so no PhysicalMaterial-only spellings are added. VRayMtl
+        -- exposes `texmap_anisotropy` / `texmap_anisotropyRotation`
+        -- directly (V-Ray SDK canonical). The generic
+        -- `anisotropy_map` / `anisotropy_rotation_map` spellings
+        -- (snake_case + camelCase) cover MAXScript-authored
+        -- workflows and third-party PBR materials that route through
+        -- the same discovery loop.
+        --
+        -- Displacement maps are ALSO silently dropped
+        -- (`evidence-slotmap-and-wrappers.md:30`), but ND_standard_surface
+        -- has no displacement input (verified via
+        -- `mx.getNodeDef("ND_standard_surface_surfaceshader")` — displacement
+        -- is on the MaterialX <material>'s `outputs:displacement` via
+        -- a separate `ND_displacement_float` / `ND_displacement_vector3`
+        -- node, not a shader input). A slotMap-only fix like this
+        -- one cannot wire displacement — that requires a separate
+        -- authoring path (new node type, new material output arc),
+        -- scoped OUT of MAX-MTLX-010 to a follow-on bite.
         local slotMap = #(
             #("base_color_map",         "base_color",         "color3"),
             #("baseColorMap",           "base_color",         "color3"),
@@ -552,7 +587,18 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
             #("specular_ior_map",       "specular_IOR",       "float"),
             #("specularIorMap",         "specular_IOR",       "float"),
             #("texmap_reflectionIOR",   "specular_IOR",       "float"),
-            #("texmap_refractionIOR",   "specular_IOR",       "float")
+            #("texmap_refractionIOR",   "specular_IOR",       "float"),
+            -- MAX-MTLX-010 additions: specular_anisotropy +
+            -- specular_rotation maps. All entries route to a
+            -- float ND_tiledimage; no colorspace attribute is
+            -- authored (float scalar, not color3 — see the type
+            -- gate in `_EnrichMtlxDocFromMaxMaterial`).
+            #("anisotropy_map",             "specular_anisotropy", "float"),
+            #("anisotropyMap",              "specular_anisotropy", "float"),
+            #("texmap_anisotropy",          "specular_anisotropy", "float"),
+            #("anisotropy_rotation_map",    "specular_rotation",   "float"),
+            #("anisotropyRotationMap",      "specular_rotation",   "float"),
+            #("texmap_anisotropyRotation",  "specular_rotation",   "float")
         )
         local seenInputs = #()
         for currentMat in subMtls do (
