@@ -22,8 +22,37 @@
 #include <pxr/pxr.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
+#include <pxr/usd/usdLux/meshLightAPI.h>
+
+#include <Materials/mtl.h>
+#include <max.h>
 
 PXR_NAMESPACE_OPEN_SCOPE
+
+namespace {
+// MAX-MTLX-005 (mesh-light half): true if the material tree contains a V-Ray self-illuminated
+// material (VRayLightMtl), directly or as a Multi/Sub-Object sub-material or inside a
+// VRayOverrideMtl. The emissive geometry in arch-viz scenes is usually a FACE SUBSET of a larger
+// mesh (a Multi/Sub-Object slot), so we test the whole tree and light the parent mesh.
+bool _TreeHasVRayLightMtl(Mtl* mtl, int depth = 0)
+{
+    if (mtl == nullptr || depth > 8) {
+        return false;
+    }
+    MSTR className;
+    mtl->GetClassName(className);
+    if (wcsstr(className.data(), L"VRayLightMtl") != nullptr) {
+        return true;
+    }
+    const int n = mtl->NumSubMtls();
+    for (int i = 0; i < n; ++i) {
+        if (_TreeHasVRayLightMtl(mtl->GetSubMtl(i), depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+} // namespace
 
 MaxUsdMeshWriter::MaxUsdMeshWriter(const MaxUsdWriteJobContext& jobCtx, INode* node)
     : MaxUsdPrimWriter(jobCtx, node)
@@ -84,6 +113,19 @@ bool MaxUsdMeshWriter::Write(
         timeConfig.IsAnimated(),
         time,
         GetExportArgs().GetTransformFormat());
+
+    // MAX-MTLX-005 (mesh-light half): if any face of this mesh uses a VRayLightMtl (self-illum)
+    // material, mark the whole mesh as a UsdLux geometry light. Karma (and other USD renderers
+    // that support geometry lights) then importance-sample the emissive faces as actual lights
+    // instead of relying on brute-force emissive-surface hits — which is how V-Ray's light cache
+    // fills the room from these emitters. MeshLightAPI derives the emission per-face from the bound
+    // material, so only the emissive subset actually emits. Applied once, on the first frame.
+    if (time.IsFirstFrame() && _TreeHasVRayLightMtl(sourceNode->GetMtl())) {
+        auto meshPrim = prim.GetPrim();
+        if (meshPrim) {
+            pxr::UsdLuxMeshLightAPI::Apply(meshPrim);
+        }
+    }
     return true;
 }
 
