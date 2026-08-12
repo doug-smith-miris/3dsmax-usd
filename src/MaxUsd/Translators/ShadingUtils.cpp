@@ -19,6 +19,7 @@
 #include <MaxUsd/MeshConversion/MeshConverter.h>
 
 #include <pxr/usd/usd/inherits.h>
+#include <pxr/usd/usd/relationship.h>
 #ifdef IS_MAX2025_OR_GREATER
 #include <pxr/usd/usdMtlx/utils.h>
 #endif
@@ -365,7 +366,68 @@ MaterialBindings FetchMaterials(
         INode* exportedNode = nodePrim.first;
         Mtl*   material = GetNodeMaterial(exportedNode);
         if (!material) {
-            // node without applied material
+            // node without applied material.
+            //
+            // MAX-GEO-006: bindable prim exists but no Max material is
+            // assigned. Previously we just `continue`d and never touched the
+            // prim, leaving `material:binding` un-authored -- which USD's
+            // UsdShade.MaterialBindingAPI.ComputeBoundMaterial reports as
+            // "no binding opinion" rather than "explicitly unbound". Downstream
+            // consumers (Karma / Hydra / MaterialX bindings-collection walkers)
+            // can't tell "the author forgot" apart from "the author deliberately
+            // unbound", so the mesh silently falls back to the render delegate's
+            // default gray. Author an explicit `rel material:binding = None`
+            // via UnbindDirectBinding() so ComputeBoundMaterial resolves
+            // deterministically to "unbound" and the layer expresses the null-
+            // material state as intentional.
+            //
+            // Iterate the same set of bindable prims we'd iterate for a real
+            // material (node's root prim if it's a Gprim, else its non-child-
+            // node children), and skip instance-inheritance prims (their
+            // binding is handled in _AddInstancePrimsToMaterialMap).
+            auto nodeRootPrim
+                = writeJobContext.GetUsdStage()->GetPrimAtPath(nodePrim.second);
+            if (!nodeRootPrim) {
+                continue;
+            }
+            auto isInheritInstance = [](const pxr::UsdPrim& prim) {
+                return prim.IsInstance()
+                    && prim.GetInherits().GetAllDirectInherits().size() == 1;
+            };
+            std::vector<pxr::UsdPrim> unboundPrims;
+            if (nodeRootPrim.IsA<UsdGeomGprim>()) {
+                unboundPrims.push_back(nodeRootPrim);
+            } else {
+                if (isInheritInstance(nodeRootPrim)) {
+                    continue;
+                }
+                for (const auto& prim : nodeRootPrim.GetChildren()) {
+                    if (primsToNodes.find(prim.GetPath()) != primsToNodes.end()) {
+                        continue;
+                    }
+                    if (isInheritInstance(prim)) {
+                        continue;
+                    }
+                    unboundPrims.push_back(prim);
+                }
+            }
+            for (auto& prim : unboundPrims) {
+                if (!prim.IsA<UsdGeomGprim>()) {
+                    continue;
+                }
+                UsdShadeMaterialBindingAPI unbindApi
+                    = UsdShadeMaterialBindingAPI::Apply(prim);
+                // Author `rel material:binding = None` explicitly. Idempotent
+                // when a binding is already authored (e.g. by a chaser or
+                // custom prim writer) -- UnbindDirectBinding is a no-op when
+                // the existing direct binding is already blocked, and we
+                // intentionally do NOT overwrite a real target.
+                UsdRelationship directRel = unbindApi.GetDirectBindingRel();
+                if (directRel && directRel.HasAuthoredTargets()) {
+                    continue;
+                }
+                unbindApi.UnbindDirectBinding();
+            }
             continue;
         }
 

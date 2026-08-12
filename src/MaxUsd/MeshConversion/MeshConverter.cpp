@@ -1055,6 +1055,45 @@ void MeshConverter::ApplyMaxMaterialIDs(
         return;
     }
 
+    // MAX-GEO-002 / MAX-GEO-006: a materialBind-family GeomSubset is only
+    // meaningful if something consumes its customData.3dsmax.matId to pick a
+    // corresponding submaterial from a bound MultiMtl. The MaxUSD importer
+    // does that via MaxUsdTranslatorMaterial::AssignMaterial's MultiMtl* cast.
+    // When the node's bound material is null (no Max material at all) or a
+    // non-MultiMtl single shader (PhysicalMaterial, OpenPBR, MaterialXMaterial,
+    // V-Ray-converted PhysicalMaterial, Revit-family materials, ...), the
+    // subsets contribute nothing on round-trip and render identically to the
+    // single-material path in every PBR delegate. Authoring them anyway:
+    //   * bloats the layer with N ghost prims per parametric primitive
+    //     (Box -> 6, Cylinder -> 3, and so on),
+    //   * mis-signals authoring intent via familyName = "materialBind"
+    //     + family:materialBind:familyType = "partition" (downstream
+    //     validators / USDZ packagers may warn that no submaterials are
+    //     bound), and
+    //   * is sticky: re-import + re-export recreates the same ghost subsets.
+    //
+    // Collapse to the single-matId customData path in that case, matching what
+    // the size == 1 early-out above does. Skip when materialBind subsets
+    // already exist on the prim -- that implies an earlier authoring pass we
+    // shouldn't destroy.
+    const bool boundIsMultiMtl = (mtl != nullptr) && mtl->IsMultiMtl();
+    if (!boundIsMultiMtl) {
+        pxr::UsdShadeMaterialBindingAPI existingBindingAPI(usdPrim);
+        if (existingBindingAPI.GetMaterialBindSubsets().empty()) {
+            int matId = materialIdToFacesMap.begin()->first + 1;
+            usdPrim.SetCustomDataByKey(MaxUsd::MetaData::matId, pxr::VtValue(matId));
+            MaxUsd::Log::Warn(
+                "Collapsing per-face material IDs on \"{0}\": the bound material is "
+                "{1}, not a Multi/Sub-Object material, so materialBind GeomSubsets would "
+                "carry no material:binding of their own and contribute nothing on "
+                "round-trip. Bind a MultiMtl with one sub-material per face mat-ID to "
+                "preserve the partition (MAX-GEO-002 / MAX-GEO-006).",
+                usdPrim.GetPath().GetString(),
+                mtl == nullptr ? "null" : "a single shader");
+            return;
+        }
+    }
+
     pxr::UsdShadeMaterialBindingAPI meshBindingAPI(usdPrim);
     const auto                      existingSubsets = meshBindingAPI.GetMaterialBindSubsets();
     bool                            createSubsets = existingSubsets.empty();
