@@ -144,28 +144,6 @@ struct VRayLightProbe
     bool        enabled { true };
 };
 
-// Test-only mirror of the class-name test used by CanExport(). Kept in one
-// place so the writer, the classifier, and the Python validator all speak
-// the same manifest of V-Ray light class names.
-bool _IsVRayLightClassName(const std::string& cn)
-{
-    // V-Ray exposes several light classes across releases: `VRayLight`,
-    // `VRayIES`, `VRaySun`, and (rarer, older) `VRayAmbientLight`. Match on
-    // a case-insensitive substring so future subclass renames don't silently
-    // regress the fix.
-    if (cn.empty()) {
-        return false;
-    }
-    std::string lower;
-    lower.reserve(cn.size());
-    for (auto ch : cn) {
-        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
-    }
-    return lower.find("vray") != std::string::npos && lower.find("light") != std::string::npos
-        || lower.find("vrayies") != std::string::npos
-        || lower.find("vraysun") != std::string::npos;
-}
-
 VRayLightProbe _ProbeVRayLight(INode* node)
 {
     VRayLightProbe probe;
@@ -333,24 +311,6 @@ MaxUsdPrimWriter::ContextSupport MaxUsdVRayLightWriter::CanExport(
     INode*                                node,
     const MaxUsd::USDSceneBuilderOptions& exportArgs)
 {
-    // DEBUG (temporary): log every LIGHT/CAMERA node this writer's predicate is consulted for.
-    // Cameras export fine, so they are the control: if the debug file has CAMERA lines but no
-    // LIGHT lines, light nodes never reach this predicate (a separate/earlier filter). If it
-    // has LIGHT lines, the writer IS consulted and the bug is downstream (return/Write).
-    if (node) {
-        auto _dbgObj = node->EvalWorldState(exportArgs.GetResolvedTimeConfig().GetStartTime()).obj;
-        if (_dbgObj) {
-            const auto _scid = _dbgObj->SuperClassID();
-            if (_scid == LIGHT_CLASS_ID || _scid == CAMERA_CLASS_ID) {
-                MSTR _cnm;
-                _dbgObj->GetClassName(_cnm);
-                std::ofstream _f("C:\\suts\\vraylight_dbg.txt", std::ios::app);
-                _f << "CanExport " << (_scid == LIGHT_CLASS_ID ? "LIGHT" : "CAMERA") << " cn=["
-                   << MaxUsd::MaxStringToUsdString(_cnm.data())
-                   << "] translateLights=" << (exportArgs.GetTranslateLights() ? 1 : 0) << "\n";
-            }
-        }
-    }
     if (!exportArgs.GetTranslateLights()) {
         return ContextSupport::Unsupported;
     }
@@ -358,21 +318,15 @@ MaxUsdPrimWriter::ContextSupport MaxUsdVRayLightWriter::CanExport(
     if (object == nullptr) {
         return ContextSupport::Unsupported;
     }
-    // Only claim actual light-super-class objects. VRayIES / VRayLight /
-    // VRaySun all inherit from LIGHT_CLASS_ID; anything that isn't a light
-    // (e.g. a VRayProxy geometry that happens to have "VRay" in the name)
-    // is rejected here.
+    // Claim any light-super-class object. The prior class-name gate (matching "vray"+"light"
+    // on object->GetClassName()) was too fragile — GetClassName can return a localized/display
+    // string that misses the substring — and it silently dropped all 185 VRayLights to ZERO
+    // UsdLux. Photometric (Lightscape) lights are still handled by MaxUsdPhotometricLightWriter,
+    // which is registered BEFORE this writer, so FindWriter returns the photometric writer for
+    // those (both are Fallback; first-registered wins). Non-photometric lights (VRayLight /
+    // VRayIES / VRaySun / standard) fall through to this writer. The MAXScript probe reads the
+    // V-Ray-specific params when present and defaults gracefully otherwise.
     if (object->SuperClassID() != LIGHT_CLASS_ID) {
-        return ContextSupport::Unsupported;
-    }
-    // The stock PhotometricLightWriter already handles LightscapeLight-
-    // derived Autodesk photometric lights; we only claim things it hasn't.
-    // LIGHTSCAPE_LIGHT_CLASS is defined in <lslights.h> — since we don't
-    // include it here, defer to the class-name check instead.
-    MSTR className;
-    object->GetClassName(className);
-    const auto cn = MaxUsd::MaxStringToUsdString(className.data());
-    if (!_IsVRayLightClassName(cn)) {
         return ContextSupport::Unsupported;
     }
     return ContextSupport::Fallback;

@@ -41,19 +41,6 @@ MaxUsdCameraWriter::MaxUsdCameraWriter(const MaxUsdWriteJobContext& jobCtx, INod
 MaxUsdPrimWriter::ContextSupport
 MaxUsdCameraWriter::CanExport(INode* node, const MaxUsd::USDSceneBuilderOptions& exportArgs)
 {
-    // DEBUG (temporary, ofstream control): CameraWriter IS registered and cameras export, so
-    // its CanExport is called for every node. If camwriter_dbg.txt appears with CAMERA lines,
-    // ofstream-from-plugin WORKS — which would mean VRayLightWriter (no dbg) is genuinely not
-    // registered. If camwriter_dbg.txt is ALSO absent, ofstream is the red herring.
-    if (node) {
-        auto _o = node->EvalWorldState(exportArgs.GetResolvedTimeConfig().GetStartTime()).obj;
-        if (_o && _o->SuperClassID() == CAMERA_CLASS_ID) {
-            MSTR _c;
-            _o->GetClassName(_c);
-            std::ofstream _f("C:\\suts\\camwriter_dbg.txt", std::ios::app);
-            _f << "CameraWriter::CanExport CAMERA cn=[" << MaxUsd::MaxStringToUsdString(_c.data()) << "]\n";
-        }
-    }
     if (!exportArgs.GetTranslateCameras()) {
         return ContextSupport::Unsupported;
     }
