@@ -287,6 +287,81 @@ void _AddShaderInput(
 // whose `in` input needs a `vector3` image; we emit both the tiledimage and,
 // if missing, connect it through the existing normalmap node.
 static const TSTR discoverMaxMtlxTexmapsFn = LR"(
+    -- MAX-MTLX-006: recursively walk common wrapper texmap classes to reach
+    -- the underlying Bitmap. Arch-viz scenes (Spectrum Center arena baseline
+    -- was 137/179 flat) routinely wrap the diffuse map in a Color_Correction
+    -- for tinting, in an OutputMap for gain/offset, in a UVW_Xform for
+    -- planar-projection tweaks, or in a Composite for multi-layer blends.
+    -- After V-Ray Scene Converter runs VRayMtl -> PhysicalMaterial the
+    -- resulting `base_color_map` inherits whatever wrapper stack the source
+    -- VRayMtl had, and MAX-MTLX-001's original leaf detector (Bitmaptexture
+    -- / #filename / #bitmap.filename) walked past it silently. This helper
+    -- recurses through the wrapper's known map-carrying properties (.map /
+    -- .map1 / .mapList / .normal_map / .baseTex / .sourceA) until it finds
+    -- a Bitmaptexture-like leaf, then returns its filename. Depth-capped at
+    -- 8 so a malformed cyclic map graph can't spin forever.
+    fn resolveMaxTexmapFilename tex depth = (
+        if tex == undefined or depth > 8 then return undefined
+        local cls = classOf tex
+        -- Leaf detectors first (identical to the pre-fix behavior).
+        if cls == Bitmaptexture then return tex.filename
+        if (isProperty tex #filename) then (
+            local fname = getProperty tex #filename
+            if fname != undefined and fname != "" then return fname
+        )
+        if (isProperty tex #bitmap) then (
+            local bmp = getProperty tex #bitmap
+            if bmp != undefined and (isProperty bmp #filename) then (
+                local fname = getProperty bmp #filename
+                if fname != undefined and fname != "" then return fname
+            )
+        )
+        -- Wrapper classes with a single nested map. Covers Color_Correction
+        -- (.map), UVW_Xform (.map), Normal_Bump (.normal_map, with .bump_map
+        -- fallback), OSL/procedural wrappers exposing .map1 (OutputMap,
+        -- RGB_Multiply, RGB_Tint, Mix map). Order tries the most-common
+        -- carrier first so a hit short-circuits the rest.
+        local nested = undefined
+        if (isProperty tex #map) then nested = getProperty tex #map
+        if nested == undefined and (isProperty tex #map1) then (
+            nested = getProperty tex #map1
+        )
+        if nested == undefined and (isProperty tex #normal_map) then (
+            nested = getProperty tex #normal_map
+        )
+        if nested == undefined and (isProperty tex #bump_map) then (
+            nested = getProperty tex #bump_map
+        )
+        -- V-Ray combiner classes wrap their source under different names:
+        -- VRayColor2Bump uses `.baseTex`; VRayCompTex uses `.sourceA` (with
+        -- `.sourceB` as the overlay layer).
+        if nested == undefined and (isProperty tex #baseTex) then (
+            nested = getProperty tex #baseTex
+        )
+        if nested == undefined and (isProperty tex #sourceA) then (
+            nested = getProperty tex #sourceA
+        )
+        if nested != undefined then (
+            local hit = resolveMaxTexmapFilename nested (depth + 1)
+            if hit != undefined and hit != "" then return hit
+        )
+        -- Composite maps carry an array of layers in .mapList. Return the
+        -- first layer whose recursion finds a bitmap. Layer 1 is the base
+        -- layer in Composite Map's UI, which is the closest thing to a
+        -- "diffuse texture" for tinted / stamped composites.
+        if (isProperty tex #mapList) then (
+            local ml = getProperty tex #mapList
+            if ml != undefined then (
+                for layer in ml do (
+                    if layer != undefined then (
+                        local hit = resolveMaxTexmapFilename layer (depth + 1)
+                        if hit != undefined and hit != "" then return hit
+                    )
+                )
+            )
+        )
+        return undefined
+    )
     fn discoverMaxMtlxTexmaps materialAnimHandle = (
         local m = getAnimByHandle materialAnimHandle
         local result = ""
@@ -323,22 +398,18 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
             if (isProperty m propName) then (
                 local tex = getProperty m propName
                 if tex != undefined then (
-                    -- Traverse through common wrappers to reach the underlying
-                    -- Bitmap. V-Ray's VRayBitmap wraps a `.bitmap`; OSL bitmaps
-                    -- expose `.filename`. Fall back to `.filename` on the
-                    -- top-level tex.
-                    local fname = undefined
-                    local cls   = classOf tex
-                    if cls == Bitmaptexture then (
-                        fname = tex.filename
-                    ) else if (isProperty tex #filename) then (
-                        fname = getProperty tex #filename
-                    ) else if (isProperty tex #bitmap) then (
-                        local bmp = getProperty tex #bitmap
-                        if bmp != undefined and (isProperty bmp #filename) then (
-                            fname = getProperty bmp #filename
-                        )
-                    )
+                    -- MAX-MTLX-006: delegate to `resolveMaxTexmapFilename`,
+                    -- which walks past wrapper maps (Color_Correction /
+                    -- OutputMap / Composite / VRayColor2Bump / etc.) to
+                    -- reach the leaf Bitmap. The pre-006 code only handled
+                    -- direct Bitmap / #filename / #bitmap leaves and
+                    -- returned undefined for wrapper-wrapped textures — the
+                    -- root cause of the arch-viz 137/179 flat-material
+                    -- census, where V-Ray Scene Converter had migrated the
+                    -- VRayMtl.texmap_diffuse -> base_color_map slot but the
+                    -- MtlxShaderWriter discovery couldn't see through the
+                    -- surviving wrapper stack.
+                    local fname = resolveMaxTexmapFilename tex 0
                     if fname != undefined and fname != "" then (
                         -- MAX-TEX-003: route the discovered filename through
                         -- FileResolutionManager.getFullFilePath so the
