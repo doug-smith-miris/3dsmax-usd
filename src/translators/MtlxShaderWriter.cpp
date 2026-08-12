@@ -362,10 +362,100 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         )
         return undefined
     )
+    -- MAX-MTLX-007: expand a possibly-wrapped material into the ordered list
+    -- of concrete sub-materials whose PhysicalMaterial / VRayMtl slot map
+    -- carries the actual texture maps. Non-wrapper materials return a
+    -- 1-element list (`#(m)`) so PhysicalMaterial / OpenPBR / VRayMtl /
+    -- StdMaterial behavior is preserved verbatim. The wrapper classes we
+    -- descend into are:
+    --
+    --   VRayBlendMtl        — layered paint / weathered surfaces. Holds the
+    --                         primary layer under `.baseMtl` and up to 9
+    --                         `.coatMtl_1..coatMtl_9` overlays. Neither the
+    --                         wrapper itself NOR the coat/base holder carry
+    --                         `base_color_map` — every map lives on one of
+    --                         the sub-materials. Pre-007, this wrapper's
+    --                         entire texture graph was silently dropped from
+    --                         the exported MaterialX network.
+    --   VRayOverrideMtl     — V-Ray's per-ray-type override trick. `.baseMtl`
+    --                         is the primary surface; `.giMtl` / `.reflectMtl`
+    --                         / `.refractMtl` / `.shadowMtl` are the per-ray
+    --                         overrides. baseMtl is the correct source for
+    --                         the exported UsdPreviewSurface / MaterialX
+    --                         surface (Karma / Hydra don't honor V-Ray's
+    --                         per-ray override contract). MAX-MTLX-005
+    --                         already unwraps this same wrapper for emission
+    --                         color in `LastResortMtlxShaderWriter`; this
+    --                         extends the same unwrap to the standard
+    --                         texture-map discovery path.
+    --
+    -- Recursion order is (self, baseMtl-tree, coat_1-tree, ..., coat_9-tree)
+    -- so that when the outer loop first-hit-dedupes on `seenInputs`, the
+    -- BASE material's textures win over any coat's — matching the layered-
+    -- material authoring convention (base = underlying surface, coats =
+    -- weathering / dirt / decals). Coats fill gaps when the base has no map
+    -- for a given slot. Depth-capped at 6 (max plausible arch-viz nesting)
+    -- and cycle-guarded via a shared `visited` list.
+    fn unwrapBlendMaterialSubMtls m visited depth = (
+        local out = #()
+        if m == undefined or depth > 6 then return out
+        -- Cycle guard. VRayBlendMtl allows an artist to (accidentally)
+        -- point .baseMtl back at the wrapper; guard so recursion terminates.
+        for v in visited do (
+            if v == m then return out
+        )
+        append visited m
+        append out m
+        local cls = (classOf m) as string
+        if cls == "VRayBlendMtl" then (
+            if (isProperty m #baseMtl) then (
+                local base = getProperty m #baseMtl
+                if base != undefined then (
+                    for sub in (unwrapBlendMaterialSubMtls base visited (depth + 1)) do (
+                        append out sub
+                    )
+                )
+            )
+            for i = 1 to 9 do (
+                local pn = ("coatMtl_" + (i as string))
+                if (isProperty m pn) then (
+                    local coat = getProperty m pn
+                    if coat != undefined then (
+                        for sub in (unwrapBlendMaterialSubMtls coat visited (depth + 1)) do (
+                            append out sub
+                        )
+                    )
+                )
+            )
+        )
+        if cls == "VRayOverrideMtl" then (
+            -- baseMtl first so its texture graph wins the first-hit dedupe
+            -- over the per-ray overrides.
+            for sn in #(#baseMtl, #giMtl, #reflectMtl, #refractMtl, #shadowMtl) do (
+                if (isProperty m sn) then (
+                    local sub = getProperty m sn
+                    if sub != undefined then (
+                        for r in (unwrapBlendMaterialSubMtls sub visited (depth + 1)) do (
+                            append out r
+                        )
+                    )
+                )
+            )
+        )
+        return out
+    )
     fn discoverMaxMtlxTexmaps materialAnimHandle = (
         local m = getAnimByHandle materialAnimHandle
         local result = ""
         if m == undefined then return result
+        -- MAX-MTLX-007: expand blend / override wrappers to the list of
+        -- concrete sub-materials that actually carry the slot-map
+        -- properties. For a plain PhysicalMaterial / OpenPBR / VRayMtl
+        -- this returns `#(m)` — behavior is identical to pre-007. For a
+        -- VRayBlendMtl / VRayOverrideMtl the list is (self, baseMtl-tree,
+        -- coats-tree...) and the first-hit-wins dedupe on `seenInputs`
+        -- keeps baseMtl's textures winning over coats'.
+        local subMtls = unwrapBlendMaterialSubMtls m #() 0
         -- Slot map: (Max PhysicalMaterial/OpenPBR property name,
         --           ND_standard_surface input name,
         --           MaterialX type token used in the NodeGraph)
@@ -390,59 +480,65 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
             #("cutoutMap",              "opacity",            "float")
         )
         local seenInputs = #()
-        for entry in slotMap do (
-            local propName  = entry[1]
-            local mtlxInput = entry[2]
-            local mtlxType  = entry[3]
-            -- MAXScript has no `continue`; guard each stage with nested ifs.
-            if (isProperty m propName) then (
-                local tex = getProperty m propName
-                if tex != undefined then (
-                    -- MAX-MTLX-006: delegate to `resolveMaxTexmapFilename`,
-                    -- which walks past wrapper maps (Color_Correction /
-                    -- OutputMap / Composite / VRayColor2Bump / etc.) to
-                    -- reach the leaf Bitmap. The pre-006 code only handled
-                    -- direct Bitmap / #filename / #bitmap leaves and
-                    -- returned undefined for wrapper-wrapped textures — the
-                    -- root cause of the arch-viz 137/179 flat-material
-                    -- census, where V-Ray Scene Converter had migrated the
-                    -- VRayMtl.texmap_diffuse -> base_color_map slot but the
-                    -- MtlxShaderWriter discovery couldn't see through the
-                    -- surviving wrapper stack.
-                    local fname = resolveMaxTexmapFilename tex 0
-                    if fname != undefined and fname != "" then (
-                        -- MAX-TEX-003: route the discovered filename through
-                        -- FileResolutionManager.getFullFilePath so the
-                        -- ND_tiledimage `file` input agrees, character-for-
-                        -- character, with the UsdUVTexture `inputs:file` on
-                        -- the dual-network sister shader — which resolves via
-                        -- the same accessor in
-                        -- `scripts/materials/usd_utils.get_file_path_mxs`.
-                        -- Some ingest pipelines (V-Ray Scene Converter, batch
-                        -- import scripts) normalize the raw `tex.filename` /
-                        -- `.bitmap.filename` to lowercase; the resolver looks
-                        -- up the actual on-disk case, which is what the
-                        -- UsdPreviewSurface side ends up authoring too. Both
-                        -- branches then serialize identical strings and the
-                        -- USD is portable to case-sensitive render farms
-                        -- (Linux/ARM Karma / Hydra). If the resolver can't
-                        -- find the file, fall back to the raw fname so the
-                        -- dangling-file case still ships an authored path
-                        -- (matching legacy behavior).
-                        local resolved = fname
-                        local resolverOk = false
-                        try (
-                            resolverOk = FileResolutionManager.getFullFilePath &resolved #bitmap
-                        ) catch (
-                            resolverOk = false
-                        )
-                        if resolverOk and resolved != undefined and resolved != "" then (
-                            fname = resolved
-                        )
-                        -- Deduplicate on the mtlx input name; first hit wins.
-                        if (findItem seenInputs mtlxInput) == 0 then (
-                            append seenInputs mtlxInput
-                            result += (mtlxInput + "|" + mtlxType + "|" + fname + "\n")
+        for currentMat in subMtls do (
+            for entry in slotMap do (
+                local propName  = entry[1]
+                local mtlxInput = entry[2]
+                local mtlxType  = entry[3]
+                -- MAXScript has no `continue`; guard each stage with nested ifs.
+                if (isProperty currentMat propName) then (
+                    local tex = getProperty currentMat propName
+                    if tex != undefined then (
+                        -- MAX-MTLX-006: delegate to `resolveMaxTexmapFilename`,
+                        -- which walks past wrapper maps (Color_Correction /
+                        -- OutputMap / Composite / VRayColor2Bump / etc.) to
+                        -- reach the leaf Bitmap. The pre-006 code only handled
+                        -- direct Bitmap / #filename / #bitmap leaves and
+                        -- returned undefined for wrapper-wrapped textures — the
+                        -- root cause of the arch-viz 137/179 flat-material
+                        -- census, where V-Ray Scene Converter had migrated the
+                        -- VRayMtl.texmap_diffuse -> base_color_map slot but the
+                        -- MtlxShaderWriter discovery couldn't see through the
+                        -- surviving wrapper stack.
+                        local fname = resolveMaxTexmapFilename tex 0
+                        if fname != undefined and fname != "" then (
+                            -- MAX-TEX-003: route the discovered filename through
+                            -- FileResolutionManager.getFullFilePath so the
+                            -- ND_tiledimage `file` input agrees, character-for-
+                            -- character, with the UsdUVTexture `inputs:file` on
+                            -- the dual-network sister shader — which resolves via
+                            -- the same accessor in
+                            -- `scripts/materials/usd_utils.get_file_path_mxs`.
+                            -- Some ingest pipelines (V-Ray Scene Converter, batch
+                            -- import scripts) normalize the raw `tex.filename` /
+                            -- `.bitmap.filename` to lowercase; the resolver looks
+                            -- up the actual on-disk case, which is what the
+                            -- UsdPreviewSurface side ends up authoring too. Both
+                            -- branches then serialize identical strings and the
+                            -- USD is portable to case-sensitive render farms
+                            -- (Linux/ARM Karma / Hydra). If the resolver can't
+                            -- find the file, fall back to the raw fname so the
+                            -- dangling-file case still ships an authored path
+                            -- (matching legacy behavior).
+                            local resolved = fname
+                            local resolverOk = false
+                            try (
+                                resolverOk = FileResolutionManager.getFullFilePath &resolved #bitmap
+                            ) catch (
+                                resolverOk = false
+                            )
+                            if resolverOk and resolved != undefined and resolved != "" then (
+                                fname = resolved
+                            )
+                            -- Deduplicate on the mtlx input name; first hit wins.
+                            -- MAX-MTLX-007: with the outer `for currentMat in
+                            -- subMtls` loop this makes baseMtl's textures win
+                            -- over any coat's — the correct precedence for
+                            -- layered arch-viz materials.
+                            if (findItem seenInputs mtlxInput) == 0 then (
+                                append seenInputs mtlxInput
+                                result += (mtlxInput + "|" + mtlxType + "|" + fname + "\n")
+                            )
                         )
                     )
                 )
