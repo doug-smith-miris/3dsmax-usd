@@ -340,6 +340,34 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
                         )
                     )
                     if fname != undefined and fname != "" then (
+                        -- MAX-TEX-003: route the discovered filename through
+                        -- FileResolutionManager.getFullFilePath so the
+                        -- ND_tiledimage `file` input agrees, character-for-
+                        -- character, with the UsdUVTexture `inputs:file` on
+                        -- the dual-network sister shader — which resolves via
+                        -- the same accessor in
+                        -- `scripts/materials/usd_utils.get_file_path_mxs`.
+                        -- Some ingest pipelines (V-Ray Scene Converter, batch
+                        -- import scripts) normalize the raw `tex.filename` /
+                        -- `.bitmap.filename` to lowercase; the resolver looks
+                        -- up the actual on-disk case, which is what the
+                        -- UsdPreviewSurface side ends up authoring too. Both
+                        -- branches then serialize identical strings and the
+                        -- USD is portable to case-sensitive render farms
+                        -- (Linux/ARM Karma / Hydra). If the resolver can't
+                        -- find the file, fall back to the raw fname so the
+                        -- dangling-file case still ships an authored path
+                        -- (matching legacy behavior).
+                        local resolved = fname
+                        local resolverOk = false
+                        try (
+                            resolverOk = FileResolutionManager.getFullFilePath &resolved #bitmap
+                        ) catch (
+                            resolverOk = false
+                        )
+                        if resolverOk and resolved != undefined and resolved != "" then (
+                            fname = resolved
+                        )
                         -- Deduplicate on the mtlx input name; first hit wins.
                         if (findItem seenInputs mtlxInput) == 0 then (
                             append seenInputs mtlxInput
