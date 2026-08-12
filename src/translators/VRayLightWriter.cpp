@@ -251,6 +251,34 @@ VRayLightProbe _ProbeVRayLight(INode* node)
 // the probed manifest. Returns one of:
 //   TfToken("SphereLight") / TfToken("RectLight") / TfToken("DiskLight") /
 //   TfToken("DistantLight") / TfToken("DomeLight")
+//
+// MAX-LIT-003 — surgical bounds of the classifier. Each branch below has an
+// exclusive, named authoring contract that MUST hold on every future refactor:
+//
+//   VRaySun          -> DistantLight  {inputs:angle=0.53°}
+//                       — MUST NOT author: radius, width, height, ies:file
+//   VRayIES          -> DiskLight     {inputs:radius=size0, shaping:ies:file}
+//                       — MUST NOT author: width, height, angle
+//   VRayAmbientLight -> DomeLight     {no shape attrs}
+//                       — MUST NOT author: radius, width, height, angle, ies:file
+//   VRayLight type=0 -> RectLight     {inputs:width=size0, inputs:height=size1}
+//                       — MUST NOT author: radius, angle, ies:file
+//   VRayLight type=1 -> DomeLight     {no shape attrs}
+//                       — MUST NOT author: radius, width, height, angle, ies:file
+//   VRayLight type=2 -> SphereLight   {inputs:radius=size0}
+//                       — MUST NOT author: width, height, angle, ies:file
+//   VRayLight type=3 -> SphereLight   {inputs:radius=size0}  (mesh->sphere fallback)
+//                       — MUST NOT author: width, height, angle, ies:file
+//   VRayLight type=4 -> DiskLight     {inputs:radius=size0}  (plain disc, NO IES)
+//                       — MUST NOT author: shaping:ies:file, width, height, angle
+//   unknown          -> RectLight     (V-Ray's out-of-box default; must not drop)
+//
+// Intensity is passed through VERBATIM from GenLight::GetIntensity() on every
+// branch — no unit conversion, no scaling. IES asset path is written verbatim
+// via SdfAssetPath — no relative rewriting or drive-letter normalization.
+// A wildcard refactor that widens any of these branches must fail the
+// MAX-LIT-003 scope-audit test suite (src/Tests/Integration/test_miris_max_lit_003.py)
+// BEFORE landing — that's the safety catch.
 TfToken _ClassifyVRayLight(const VRayLightProbe& probe)
 {
     const std::string& cn = probe.className;

@@ -1,5 +1,9 @@
 ## Changelog
 
+### Unreleased (Miris fork)
+
+#### Fixes:
+- **MAX-LIT-003** V-Ray → UsdLux per-subtype scope-coverage audit: locks in the MAX-LIT-002 dispatch (`VRaySun` → `UsdLuxDistantLight`, `VRayIES` → `UsdLuxDiskLight` + `ShapingAPI.ies:file`, `VRayLight` type=0/1/2/3/4 → `Rect`/`Dome`/`Sphere`/`Sphere`/`Disk`, `VRayAmbientLight` → `Dome`) with a 14-case negative-test suite so a wildcard refactor fails by named case. Adds `src/Tests/Integration/test_miris_max_lit_003.py` (arena-density census of 185 lights, per-subtype `MUST NOT author` inverses, intensity pass-through invariant, IES asset-path verbatim preservation, class-name gate scope-lock over 16 non-light V-Ray classes, idempotence + delta invariant, cross-subtype divergence anchor), a surgical-bounds comment block in `src/translators/VRayLightWriter.cpp`, and the `MAX-LIT-003` row + notes section in `doc/translation-mapping.md`. No C++ logic change — the audit's value is guardrailing what MAX-LIT-002 established. The auto-planner's follow-on rationale asked for per-subtype specialization, which the LIT-002 writer already implements; the audit prevents a future "unify the branches" refactor from silently mutating per-subtype fidelity on the 185-light Spectrum Center arena.
 
 ### v0.16.2
 
