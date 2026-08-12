@@ -96,10 +96,21 @@ static const TSTR discoverVRayLightMtlFn = LR"(
         local m = getAnimByHandle matAnimHandle
         local result = ""
         if m == undefined then return result
+        -- Unwrap VRayOverrideMtl (V-Ray's per-ray override trick): the emissive VRayLightMtl is the
+        -- base material; use it for the emission we author (single-material USD can't do per-ray).
+        if ((classOf m) as string) == "VRayOverrideMtl" then (
+            if (isProperty m #baseMtl) and ((getProperty m #baseMtl) != undefined) then m = getProperty m #baseMtl
+        )
         if ((classOf m) as string) != "VRayLightMtl" then return result
         result += "isLightMtl|1\n"
         if (isProperty m #multiplier) then (
             result += ("multiplier|" + ((getProperty m #multiplier) as string) + "\n")
+        )
+        -- VRayLightMtl's emission color is `.color` (0-255), NOT the diffuse channel
+        -- (Mtl::GetDiffuse returns black for a light material).
+        if (isProperty m #color) then (
+            local c = getProperty m #color
+            result += ("color|" + (c.r as string) + "," + (c.g as string) + "," + (c.b as string) + "\n")
         )
         if (isProperty m #texmap) then (
             local tex = getProperty m #texmap
@@ -129,6 +140,8 @@ struct VRayLightMtlProbe
 {
     bool        isLightMtl { false };
     float       multiplier { 1.f };
+    bool        hasColor { false };
+    float       cr { 0.f }, cg { 0.f }, cb { 0.f }; // emission color in [0,1]
     std::string texFile;
 };
 
@@ -175,6 +188,16 @@ VRayLightMtlProbe _ProbeVRayLightMtl(Mtl* material)
                 probe.isLightMtl = (val == "1");
             } else if (key == "multiplier") {
                 probe.multiplier = std::stof(val);
+            } else if (key == "color") {
+                // "r,g,b" in 0-255 (MAXScript Color) -> [0,1].
+                const auto c1 = val.find(',');
+                const auto c2 = (c1 == std::string::npos) ? std::string::npos : val.find(',', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                    probe.cr = std::stof(val.substr(0, c1)) / 255.f;
+                    probe.cg = std::stof(val.substr(c1 + 1, c2 - c1 - 1)) / 255.f;
+                    probe.cb = std::stof(val.substr(c2 + 1)) / 255.f;
+                    probe.hasColor = true;
+                }
             } else if (key == "texmap") {
                 probe.texFile = val;
             }
@@ -255,6 +278,18 @@ void LastResortMtlxShaderWriter::Write()
 
     // MAX-MTLX-005: self-illuminated (VRayLightMtl) materials author real emission.
     const VRayLightMtlProbe emit = _ProbeVRayLightMtl(material);
+    { // [MAX-MTLX-DIAG] revert before PR — proves per-material emission authoring.
+        MSTR mn = material->GetName();
+        MaxUsd::Log::Warn(
+            L"[EMITPROBE] mat={0} isLightMtl={1} mult={2} color=({3},{4},{5}) tex={6}",
+            mn.data(),
+            emit.isLightMtl ? 1 : 0,
+            emit.multiplier,
+            emit.cr,
+            emit.cg,
+            emit.cb,
+            emit.texFile.empty() ? 0 : 1);
+    }
     if (emit.isLightMtl) {
         // Pure emitter: no diffuse reflection.
         baseColorInput.Set(pxr::GfVec3f(0.f, 0.f, 0.f));
@@ -263,6 +298,11 @@ void LastResortMtlxShaderWriter::Write()
             = shaderSchema.CreateInput(pxr::TfToken("emission"), pxr::SdfValueTypeNames->Float);
         const auto emissionColorInput = shaderSchema.CreateInput(
             pxr::TfToken("emission_color"), pxr::SdfValueTypeNames->Color3f);
+
+        // Emission color = VRayLightMtl.color (probed; GetDiffuse is black for a light material).
+        const float er = emit.hasColor ? emit.cr : color.r;
+        const float eg = emit.hasColor ? emit.cg : color.g;
+        const float eb = emit.hasColor ? emit.cb : color.b;
 
         if (!emit.texFile.empty()) {
             // Tier 2: texture-driven emission. Author an ND_tiledimage_color3 sibling shader and
@@ -282,15 +322,15 @@ void LastResortMtlxShaderWriter::Write()
                     = texShader.CreateOutput(pxr::TfToken("out"), pxr::SdfValueTypeNames->Color3f);
                 emissionColorInput.ConnectToSource(texOut);
             } else {
-                emissionColorInput.Set(pxr::GfVec3f(color.r, color.g, color.b));
+                emissionColorInput.Set(pxr::GfVec3f(er, eg, eb));
             }
         } else {
             // Tier 1: constant emission color. Bake the multiplier into the color so a single
             // emission weight of 1 yields color * multiplier (values may exceed 1, as intended
             // for an emitter). WIRE-GLOW ×150, SPOTLIGHT-LENS ×75, LENS ×50, etc.
             emissionInput.Set(1.f);
-            emissionColorInput.Set(pxr::GfVec3f(
-                color.r * emit.multiplier, color.g * emit.multiplier, color.b * emit.multiplier));
+            emissionColorInput.Set(
+                pxr::GfVec3f(er * emit.multiplier, eg * emit.multiplier, eb * emit.multiplier));
         }
         return;
     }
