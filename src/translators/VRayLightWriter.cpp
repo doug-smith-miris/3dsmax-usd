@@ -15,6 +15,8 @@
 //
 #include "VRayLightWriter.h"
 
+#include <fstream>
+
 #include <MaxUsd/Translators/primWriter.h>
 #include <MaxUsd/Translators/writeJobContext.h>
 #include <MaxUsd/Utilities/Logging.h>
@@ -353,6 +355,8 @@ MaxUsdPrimWriter::ContextSupport MaxUsdVRayLightWriter::CanExport(
     MSTR className;
     object->GetClassName(className);
     const auto cn = MaxUsd::MaxStringToUsdString(className.data());
+    { std::ofstream _f("C:\\suts\\vraylight_dbg.txt", std::ios::app);
+      _f << "CanExport light node cn=[" << cn << "] isVray=" << (_IsVRayLightClassName(cn) ? 1 : 0) << "\n"; }
     if (!_IsVRayLightClassName(cn)) {
         return ContextSupport::Unsupported;
     }
@@ -382,6 +386,8 @@ bool MaxUsdVRayLightWriter::Write(
     if (sourceNode == nullptr) {
         return false;
     }
+    { std::ofstream _f("C:\\suts\\vraylight_dbg.txt", std::ios::app);
+      _f << "WRITE called prim=" << targetPrim.GetPath().GetString() << "\n"; }
     const auto  timeVal = time.GetMaxTime();
     const auto  usdTimeCode = time.GetUsdTime();
     const auto  object = sourceNode->EvalWorldState(timeVal).obj;
