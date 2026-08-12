@@ -42,6 +42,7 @@
 #include <maxscript/foundation/functions.h>
 #include <maxscript/util/listener.h>
 
+#include <fstream>
 #include <sstream>
 #include <string>
 
@@ -332,6 +333,24 @@ MaxUsdPrimWriter::ContextSupport MaxUsdVRayLightWriter::CanExport(
     INode*                                node,
     const MaxUsd::USDSceneBuilderOptions& exportArgs)
 {
+    // DEBUG (temporary): log every LIGHT/CAMERA node this writer's predicate is consulted for.
+    // Cameras export fine, so they are the control: if the debug file has CAMERA lines but no
+    // LIGHT lines, light nodes never reach this predicate (a separate/earlier filter). If it
+    // has LIGHT lines, the writer IS consulted and the bug is downstream (return/Write).
+    if (node) {
+        auto _dbgObj = node->EvalWorldState(exportArgs.GetResolvedTimeConfig().GetStartTime()).obj;
+        if (_dbgObj) {
+            const auto _scid = _dbgObj->SuperClassID();
+            if (_scid == LIGHT_CLASS_ID || _scid == CAMERA_CLASS_ID) {
+                MSTR _cnm;
+                _dbgObj->GetClassName(_cnm);
+                std::ofstream _f("C:\\suts\\vraylight_dbg.txt", std::ios::app);
+                _f << "CanExport " << (_scid == LIGHT_CLASS_ID ? "LIGHT" : "CAMERA") << " cn=["
+                   << MaxUsd::MaxStringToUsdString(_cnm.data())
+                   << "] translateLights=" << (exportArgs.GetTranslateLights() ? 1 : 0) << "\n";
+            }
+        }
+    }
     if (!exportArgs.GetTranslateLights()) {
         return ContextSupport::Unsupported;
     }
