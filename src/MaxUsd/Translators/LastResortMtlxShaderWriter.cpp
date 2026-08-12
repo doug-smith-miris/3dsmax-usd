@@ -19,8 +19,19 @@
 // shader's default output is done by the caller
 // (MaxUsdShadingUtils::CreateShaderOutputAndConnectMaterial), so this writer
 // only defines the shader prim, sets info:id, and authors a base_color from
-// the material's diffuse. Deliberately narrow — the purpose is dispatch
-// coverage, not shading fidelity, mirroring the UsdPreviewSurface fallback.
+// the material's diffuse.
+//
+// MAX-MTLX-005: Self-illuminated materials (V-Ray VRayLightMtl — LED ribbon
+// boards, scoreboards, concourse signage) have no dedicated MaterialX writer
+// and previously fell here, exporting as a plain diffuse surface with
+// emission_color=(0,0,0). That dropped the arena's single biggest fill-light
+// source, so a Karma/Hydra render of the export came out with a black seating
+// bowl while the V-Ray original is fully lit. This writer now probes VRayLightMtl
+// for its color/multiplier/texmap (MAXScript — the multiplier is a V-Ray param,
+// not exposed through the standard Mtl SDK) and authors real emission:
+//   Tier 1 (constant color): emission=1, emission_color = color * multiplier.
+//   Tier 2 (texture-driven):  emission=multiplier, emission_color <- ND_tiledimage.
+// base_color is set to black for a light material so it reads as a pure emitter.
 //
 #include "LastResortMtlxShaderWriter.h"
 
@@ -30,19 +41,31 @@
 #include "WriteJobContext.h"
 
 #include <MaxUsd/DebugCodes.h>
+#include <MaxUsd/Utilities/Logging.h>
+#include <MaxUsd/Utilities/TranslationUtils.h>
 
+#include <pxr/base/gf/vec2f.h>
+#include <pxr/base/gf/vec3f.h>
 #include <pxr/base/tf/diagnostic.h>
 #include <pxr/base/tf/token.h>
 #include <pxr/base/vt/value.h>
 #include <pxr/pxr.h>
+#include <pxr/usd/sdf/assetPath.h>
 #include <pxr/usd/sdf/path.h>
 #include <pxr/usd/sdf/types.h>
 #include <pxr/usd/usdShade/input.h>
+#include <pxr/usd/usdShade/output.h>
 #include <pxr/usd/usdShade/shader.h>
 #include <pxr/usd/usdShade/tokens.h>
 
 #include <Materials/mtl.h>
 #include <max.h>
+#include <maxscript/foundation/functions.h>
+#include <maxscript/maxscript.h>
+#include <maxscript/util/listener.h>
+
+#include <sstream>
+#include <string>
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -59,6 +82,108 @@ static const TfToken kMaterialXTarget("MaterialX");
 // through the same node definition, just with a plain base_color and no
 // texture graph.
 static const TfToken kNdStandardSurfaceId("ND_standard_surface_surfaceshader");
+static const TfToken kNdTiledImageColor3Id("ND_tiledimage_color3");
+
+// MAX-MTLX-005: MAXScript probe for a VRayLightMtl's emission parameters. Returns
+// a pipe/newline manifest (empty if the material is not a VRayLightMtl):
+//   isLightMtl|1
+//   multiplier|<float>
+//   texmap|<resolved file path>   (only if the color slot is texture-driven)
+// The color itself is read in C++ via Mtl::GetDiffuse() (already [0,1]); only the
+// V-Ray-specific multiplier + the texmap file need MAXScript.
+static const TSTR discoverVRayLightMtlFn = LR"(
+    fn discoverVRayLightMtl matAnimHandle = (
+        local m = getAnimByHandle matAnimHandle
+        local result = ""
+        if m == undefined then return result
+        if ((classOf m) as string) != "VRayLightMtl" then return result
+        result += "isLightMtl|1\n"
+        if (isProperty m #multiplier) then (
+            result += ("multiplier|" + ((getProperty m #multiplier) as string) + "\n")
+        )
+        if (isProperty m #texmap) then (
+            local tex = getProperty m #texmap
+            if tex != undefined then (
+                local fname = undefined
+                if (classOf tex) == Bitmaptexture then (
+                    fname = tex.filename
+                ) else if (isProperty tex #filename) then (
+                    fname = getProperty tex #filename
+                ) else if (isProperty tex #bitmap) then (
+                    local bmp = getProperty tex #bitmap
+                    if bmp != undefined and (isProperty bmp #filename) then fname = bmp.filename
+                )
+                if fname != undefined and fname != "" then (
+                    local resolved = fname
+                    try ( FileResolutionManager.getFullFilePath &resolved #bitmap ) catch ()
+                    if resolved == undefined or resolved == "" then resolved = fname
+                    result += ("texmap|" + resolved + "\n")
+                )
+            )
+        )
+        return result
+    )
+    discoverVRayLightMtl )";
+
+struct VRayLightMtlProbe
+{
+    bool        isLightMtl { false };
+    float       multiplier { 1.f };
+    std::string texFile;
+};
+
+VRayLightMtlProbe _ProbeVRayLightMtl(Mtl* material)
+{
+    VRayLightMtlProbe probe;
+    if (material == nullptr) {
+        return probe;
+    }
+    const AnimHandle handle = ::Animatable::GetHandleByAnim(material);
+    if (handle == 0) {
+        return probe;
+    }
+    FPValue rvalue;
+    rvalue.Init();
+    std::wstringstream ss;
+    ss << discoverVRayLightMtlFn << handle << L'\0';
+    ExecuteMAXScriptScript(ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue);
+    const std::string manifest = MaxUsd::MaxStringToUsdString(rvalue.s);
+    if (manifest.empty()) {
+        return probe;
+    }
+    for (size_t start = 0; start <= manifest.size();) {
+        auto        nl = manifest.find('\n', start);
+        std::string line;
+        if (nl == std::string::npos) {
+            line = manifest.substr(start);
+            start = manifest.size() + 1;
+        } else {
+            line = manifest.substr(start, nl - start);
+            start = nl + 1;
+        }
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        auto pipe = line.find('|');
+        if (pipe == std::string::npos) {
+            continue;
+        }
+        const auto key = line.substr(0, pipe);
+        const auto val = line.substr(pipe + 1);
+        try {
+            if (key == "isLightMtl") {
+                probe.isLightMtl = (val == "1");
+            } else if (key == "multiplier") {
+                probe.multiplier = std::stof(val);
+            } else if (key == "texmap") {
+                probe.texFile = val;
+            }
+        } catch (const std::exception&) {
+            // Ignore parse errors; keep defaults.
+        }
+    }
+    return probe;
+}
 } // namespace
 
 MaxUsdShaderWriter::ContextSupport
@@ -121,13 +246,56 @@ void LastResortMtlxShaderWriter::Write()
         return;
     }
 
-    // Mirror the UsdPreviewSurface fallback: read the base material's diffuse
-    // color and set it as `base_color`. base_color on ND_standard_surface is
-    // a color3f, matching Color::r/g/b as floats in [0,1].
+    // Read the base material's diffuse color; for a light material this is the
+    // emission color (VRayLightMtl::GetDiffuse returns its color in [0,1]).
     const auto color = material->GetDiffuse();
 
     const auto baseColorInput
         = shaderSchema.CreateInput(pxr::TfToken("base_color"), pxr::SdfValueTypeNames->Color3f);
+
+    // MAX-MTLX-005: self-illuminated (VRayLightMtl) materials author real emission.
+    const VRayLightMtlProbe emit = _ProbeVRayLightMtl(material);
+    if (emit.isLightMtl) {
+        // Pure emitter: no diffuse reflection.
+        baseColorInput.Set(pxr::GfVec3f(0.f, 0.f, 0.f));
+
+        const auto emissionInput
+            = shaderSchema.CreateInput(pxr::TfToken("emission"), pxr::SdfValueTypeNames->Float);
+        const auto emissionColorInput = shaderSchema.CreateInput(
+            pxr::TfToken("emission_color"), pxr::SdfValueTypeNames->Color3f);
+
+        if (!emit.texFile.empty()) {
+            // Tier 2: texture-driven emission. Author an ND_tiledimage_color3 sibling shader and
+            // connect it to emission_color; emission weight carries the multiplier.
+            emissionInput.Set(emit.multiplier);
+            const SdfPath texPath
+                = GetUsdPath().GetParentPath().AppendChild(pxr::TfToken("emission_tex"));
+            UsdShadeShader texShader = UsdShadeShader::Define(GetUsdStage(), texPath);
+            if (texShader) {
+                texShader.CreateIdAttr(VtValue(kNdTiledImageColor3Id));
+                texShader
+                    .CreateInput(pxr::TfToken("file"), pxr::SdfValueTypeNames->Asset)
+                    .Set(pxr::SdfAssetPath(emit.texFile));
+                texShader.CreateInput(pxr::TfToken("uvtiling"), pxr::SdfValueTypeNames->Float2)
+                    .Set(pxr::GfVec2f(1.f, 1.f));
+                const auto texOut
+                    = texShader.CreateOutput(pxr::TfToken("out"), pxr::SdfValueTypeNames->Color3f);
+                emissionColorInput.ConnectToSource(texOut);
+            } else {
+                emissionColorInput.Set(pxr::GfVec3f(color.r, color.g, color.b));
+            }
+        } else {
+            // Tier 1: constant emission color. Bake the multiplier into the color so a single
+            // emission weight of 1 yields color * multiplier (values may exceed 1, as intended
+            // for an emitter). WIRE-GLOW ×150, SPOTLIGHT-LENS ×75, LENS ×50, etc.
+            emissionInput.Set(1.f);
+            emissionColorInput.Set(pxr::GfVec3f(
+                color.r * emit.multiplier, color.g * emit.multiplier, color.b * emit.multiplier));
+        }
+        return;
+    }
+
+    // Non-emissive fallback (unchanged): diffuse color as base_color.
     const pxr::GfVec3f usdColor = { color.r, color.g, color.b };
     baseColorInput.Set(usdColor);
 }
