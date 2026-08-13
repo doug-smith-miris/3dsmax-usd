@@ -397,7 +397,8 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
     --                         Court-line decals (DECAL_/LOGO_ layers on a
     --                         concrete court PhysicalMaterial base) are the
     --                         motivating arch-viz use case — pre-014 the
-    --                         entire layer stack was dropped and the
+)"
+        LR"(    --                         entire layer stack was dropped and the
     --                         Composite fell through to a flat last-resort
     --                         surface with no textures. Walked base-first so
     --                         base surface's textures win the first-hit-wins
@@ -592,7 +593,8 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         -- `doc/translation-mapping.md` for the full bounds.
         --
         -- Adjacent V-Ray classes deliberately excluded:
-        --   VRay2SidedMtl   — front/back are visually distinct; not a
+)"
+        LR"(        --   VRay2SidedMtl   — front/back are visually distinct; not a
         --                     first-hit-wins texture merge.
         --   VRayMtlWrapper  — matte/render-pass wrapper (has .baseMtl!);
         --                     the wrapper itself IS the surface artists
@@ -933,7 +935,8 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
             -- material (Spectrum Center's anodized-aluminum handrails,
             -- chrome-tinted glass surrounds, tinted-brass fixtures)
             -- rendered with neutral-white specular in Karma instead of
-            -- the artist-tinted color the source scene authored — see
+)"
+        LR"(            -- the artist-tinted color the source scene authored — see
             -- `agent/pipeline-runs/40dca678-.../evidence/gaps-audit.md`
             -- S3 for the 179-material arena census delta (0 -> ~14
             -- tinted-reflection materials post-fix). No camelCase alt
@@ -1072,7 +1075,8 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
                         -- root cause of the arch-viz 137/179 flat-material
                         -- census, where V-Ray Scene Converter had migrated the
                         -- VRayMtl.texmap_diffuse -> base_color_map slot but the
-                        -- MtlxShaderWriter discovery couldn't see through the
+)"
+        LR"(                        -- MtlxShaderWriter discovery couldn't see through the
                         -- surviving wrapper stack.
                         local fname = resolveMaxTexmapFilename tex 0
                         if fname != undefined and fname != "" then (
