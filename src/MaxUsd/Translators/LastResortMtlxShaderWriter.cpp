@@ -26,11 +26,34 @@
 // and previously fell here, exporting as a plain diffuse surface with
 // emission_color=(0,0,0). That dropped the arena's single biggest fill-light
 // source, so a Karma/Hydra render of the export came out with a black seating
-// bowl while the V-Ray original is fully lit. This writer now probes VRayLightMtl
+// bowl while the V-Ray original is fully lit. This writer probes VRayLightMtl
 // for its color/multiplier/texmap (MAXScript — the multiplier is a V-Ray param,
-// not exposed through the standard Mtl SDK) and authors real emission:
-//   Tier 1 (constant color): emission=1, emission_color = color * multiplier.
-//   Tier 2 (texture-driven):  emission=multiplier, emission_color <- ND_tiledimage.
+// not exposed through the standard Mtl SDK) and authors real emission.
+//
+// MAX-MTLX-EMISSIVE-UNITS-013: The initial MAX-MTLX-005 landing baked the raw
+// V-Ray `.multiplier` scalar into `emission_color` (Tier 1: emission=1,
+// emission_color = color * multiplier). For a jumbotron / scoreboard authored
+// with mult=150 and color=(1,1,1) that produced emission_color=(150,150,150) —
+// an HDR value that Karma / any tone-mapped path tracer saturates to flat WHITE
+// on every exposed pixel of the emitter, exactly matching the diagnostic run's
+// "screens blow to flat WHITE" symptom. It also violates the ND_standard_surface
+// convention (emission_color is a 0..1 tint; emission is the scalar weight).
+// The fix routes the multiplier into `emission` (weight) and leaves
+// `emission_color` at the raw tint. Additionally, VRayLightMtl.units controls
+// the absolute-scale interpretation of `.multiplier`:
+//   units=0 (default, color 0..1)   -> multiplier is arbitrary author-scale
+//   units=1 (luminous power, lumens) -> divide by 683 (photopic peak lm/W)
+//   units=2 (luminance, cd/m² × π)  -> divide by pi
+//   units=3 (radiant power, watts)  -> pass through
+//   units=4 (radiance, W/m²/sr)     -> pass through
+// After per-units normalization the weight is clamped to a soft ceiling
+// (kEmissionCeiling = 30.0) so LED-jumbotron-style HDR multipliers still read
+// as very bright emitters in Karma without saturating a default tone-mapper.
+// Final authoring pattern:
+//   Tier 1 (constant color): emission=Normalize(multiplier, units),
+//                             emission_color = raw tint (unbaked).
+//   Tier 2 (texture-driven):  emission=Normalize(multiplier, units),
+//                             emission_color <- ND_tiledimage (raw texture).
 // base_color is set to black for a light material so it reads as a pure emitter.
 //
 #include "LastResortMtlxShaderWriter.h"
@@ -84,13 +107,17 @@ static const TfToken kMaterialXTarget("MaterialX");
 static const TfToken kNdStandardSurfaceId("ND_standard_surface_surfaceshader");
 static const TfToken kNdTiledImageColor3Id("ND_tiledimage_color3");
 
-// MAX-MTLX-005: MAXScript probe for a VRayLightMtl's emission parameters. Returns
-// a pipe/newline manifest (empty if the material is not a VRayLightMtl):
+// MAX-MTLX-005 / MAX-MTLX-EMISSIVE-UNITS-013: MAXScript probe for a
+// VRayLightMtl's emission parameters. Returns a pipe/newline manifest (empty if
+// the material is not a VRayLightMtl):
 //   isLightMtl|1
 //   multiplier|<float>
+//   units|<int>                   (MAX-MTLX-013: 0=default, 1=lumens, 2=lum, 3=W, 4=W/m²/sr)
+//   color|<r>,<g>,<b>             (0-255 MAXScript Color; C++ normalizes to [0,1])
 //   texmap|<resolved file path>   (only if the color slot is texture-driven)
-// The color itself is read in C++ via Mtl::GetDiffuse() (already [0,1]); only the
-// V-Ray-specific multiplier + the texmap file need MAXScript.
+// The base color is read in C++ via Mtl::GetDiffuse() as a fallback only; the
+// V-Ray-specific `.color`, `.multiplier`, `.units`, and texmap file must be
+// probed via MAXScript because they are NOT exposed through the standard Mtl SDK.
 static const TSTR discoverVRayLightMtlFn = LR"(
     fn discoverVRayLightMtl matAnimHandle = (
         local m = getAnimByHandle matAnimHandle
@@ -105,6 +132,17 @@ static const TSTR discoverVRayLightMtlFn = LR"(
         result += "isLightMtl|1\n"
         if (isProperty m #multiplier) then (
             result += ("multiplier|" + ((getProperty m #multiplier) as string) + "\n")
+        )
+        -- MAX-MTLX-EMISSIVE-UNITS-013: VRayLightMtl.units controls the absolute-scale
+        -- interpretation of `.multiplier`. Author-side values (V-Ray SDK):
+        --   0 = Default (arbitrary scale on a 0-1 color; typical multipliers 1..200)
+        --   1 = Luminous power (lumens)
+        --   2 = Luminance (lm/m^2/sr = candela/m^2 * pi)
+        --   3 = Radiant power (watts)
+        --   4 = Radiance (W/m^2/sr)
+        -- Absent on very old V-Ray versions -> C++ treats as 0.
+        if (isProperty m #units) then (
+            result += ("units|" + ((getProperty m #units) as string) + "\n")
         )
         -- VRayLightMtl's emission color is `.color` (0-255), NOT the diffuse channel
         -- (Mtl::GetDiffuse returns black for a light material).
@@ -140,10 +178,55 @@ struct VRayLightMtlProbe
 {
     bool        isLightMtl { false };
     float       multiplier { 1.f };
+    // MAX-MTLX-EMISSIVE-UNITS-013: VRayLightMtl.units mode; 0 = default
+    // (color 0-1, arbitrary scale), 1 = lumens, 2 = luminance, 3 = watts,
+    // 4 = W/m^2/sr. Absent -> treat as 0 (default) so pre-`units` V-Ray
+    // scenes retain the existing behavior.
+    int         units { 0 };
     bool        hasColor { false };
     float       cr { 0.f }, cg { 0.f }, cb { 0.f }; // emission color in [0,1]
     std::string texFile;
 };
+
+// MAX-MTLX-EMISSIVE-UNITS-013: Convert V-Ray's per-units multiplier into a
+// canonical ND_standard_surface `emission` weight. The ND_standard_surface
+// convention is `emission_color` = tint in [0,1], `emission` = float weight
+// in [0,inf). Raw V-Ray multipliers (e.g. 150 on a jumbotron) mapped into a
+// color3 tint saturate to flat WHITE in Karma's tone-mapper regardless of the
+// authored color; mapping them into the SCALAR weight and clamping to a soft
+// ceiling reads as a "very bright emitter" without blowing out. Per-units
+// factors bring physical modes (lumens, watts) into the same nominal range as
+// the arbitrary-scale default mode so a single ceiling is meaningful across
+// all five modes. Ceiling of 30 chosen empirically: enough headroom for LED
+// emitters to visibly dominate a scene, low enough that a default Karma render
+// with a mid-range exposure does not flat-white every emitter pixel.
+static constexpr float kEmissionCeiling = 30.0f;
+
+static float _NormalizeEmissionWeight(float multiplier, int units)
+{
+    float w = multiplier;
+    switch (units) {
+    case 1: // lumens: divide by photopic peak (683 lm/W) to get watt-equivalent
+        w = multiplier / 683.0f;
+        break;
+    case 2: // luminance (lm/m^2/sr = cd/m^2 * pi): divide by pi
+        w = multiplier / 3.14159265358979323846f;
+        break;
+    case 0: // default (arbitrary 0-1 color scale): author intent
+    case 3: // radiant power (watts): pass through
+    case 4: // radiance (W/m^2/sr): pass through
+    default:
+        w = multiplier;
+        break;
+    }
+    if (w > kEmissionCeiling) {
+        w = kEmissionCeiling;
+    }
+    if (w < 0.0f) {
+        w = 0.0f;
+    }
+    return w;
+}
 
 VRayLightMtlProbe _ProbeVRayLightMtl(Mtl* material)
 {
@@ -188,6 +271,12 @@ VRayLightMtlProbe _ProbeVRayLightMtl(Mtl* material)
                 probe.isLightMtl = (val == "1");
             } else if (key == "multiplier") {
                 probe.multiplier = std::stof(val);
+            } else if (key == "units") {
+                // MAX-MTLX-EMISSIVE-UNITS-013: 0..4 expected; clamp anything
+                // outside that range to 0 (default mode) rather than trusting
+                // a malformed manifest.
+                const int u = std::stoi(val);
+                probe.units = (u >= 0 && u <= 4) ? u : 0;
             } else if (key == "color") {
                 // "r,g,b" in 0-255 (MAXScript Color) -> [0,1].
                 const auto c1 = val.find(',');
@@ -304,10 +393,17 @@ void LastResortMtlxShaderWriter::Write()
         const float eg = emit.hasColor ? emit.cg : color.g;
         const float eb = emit.hasColor ? emit.cb : color.b;
 
+        // MAX-MTLX-EMISSIVE-UNITS-013: route the multiplier into the SCALAR emission
+        // weight (per ND_standard_surface convention) and normalize per VRayLightMtl.units
+        // so LED-jumbotron-style HDR multipliers don't blow the emission_color tint to
+        // saturated white. `emission_color` stays the raw 0..1 tint in BOTH tiers.
+        const float emissionWeight = _NormalizeEmissionWeight(emit.multiplier, emit.units);
+
         if (!emit.texFile.empty()) {
-            // Tier 2: texture-driven emission. Author an ND_tiledimage_color3 sibling shader and
-            // connect it to emission_color; emission weight carries the multiplier.
-            emissionInput.Set(emit.multiplier);
+            // Tier 2: texture-driven emission. Author an ND_tiledimage_color3 sibling shader
+            // and connect it to emission_color (raw tint); emission weight carries the
+            // units-normalized multiplier.
+            emissionInput.Set(emissionWeight);
             const SdfPath texPath
                 = GetUsdPath().GetParentPath().AppendChild(pxr::TfToken("emission_tex"));
             UsdShadeShader texShader = UsdShadeShader::Define(GetUsdStage(), texPath);
@@ -325,12 +421,13 @@ void LastResortMtlxShaderWriter::Write()
                 emissionColorInput.Set(pxr::GfVec3f(er, eg, eb));
             }
         } else {
-            // Tier 1: constant emission color. Bake the multiplier into the color so a single
-            // emission weight of 1 yields color * multiplier (values may exceed 1, as intended
-            // for an emitter). WIRE-GLOW ×150, SPOTLIGHT-LENS ×75, LENS ×50, etc.
-            emissionInput.Set(1.f);
-            emissionColorInput.Set(
-                pxr::GfVec3f(er * emit.multiplier, eg * emit.multiplier, eb * emit.multiplier));
+            // Tier 1: constant emission color. Author `emission = normalized weight` and
+            // `emission_color = raw tint` (0..1) so a Karma tone-mapper renders the
+            // emitter as bright-but-not-saturated. Pre-013 baked the multiplier into
+            // the color3 tint (emission=1, emission_color=color*multiplier), producing
+            // e.g. (150,150,150) on a scoreboard — flat white in any tone-mapped renderer.
+            emissionInput.Set(emissionWeight);
+            emissionColorInput.Set(pxr::GfVec3f(er, eg, eb));
         }
         return;
     }
