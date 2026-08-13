@@ -865,6 +865,38 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
             #("emissionColorMap",       "emission_color",     "color3"),
             #("refl_color_map",         "specular_color",     "color3"),
             #("specularColorMap",       "specular_color",     "color3"),
+            -- MAX-MTLX-VRAYMTL-REFLECTION-TINT-017 addition: VRayMtl
+            -- reflection-tint texmap. `texmap_reflection` is the V-Ray
+            -- SDK canonical name for the reflection-color map on
+            -- VRayMtl (see the V-Ray for 3ds Max SDK's VRayMtl param
+            -- surface — the pre-existing MTLX-009 `texmap_reflectionIOR`
+            -- / `texmap_refractionIOR` entries follow the same
+            -- `texmap_reflection*` naming family). Sits as a sibling to
+            -- the PhysicalMaterial `refl_color_map` / OpenPBR
+            -- `specularColorMap` entries above so all three families
+            -- route to the SAME ND_standard_surface `specular_color`
+            -- input (color3, port default (1,1,1)) and the outer
+            -- `seenInputs` first-hit-wins dedupe selects whichever
+            -- spelling the source material used. Symptom pre-fix:
+            -- every metal / tinted-chrome / anodized-aluminum V-Ray
+            -- material (Spectrum Center's anodized-aluminum handrails,
+            -- chrome-tinted glass surrounds, tinted-brass fixtures)
+            -- rendered with neutral-white specular in Karma instead of
+            -- the artist-tinted color the source scene authored — see
+            -- `agent/pipeline-runs/40dca678-.../evidence/gaps-audit.md`
+            -- S3 for the 179-material arena census delta (0 -> ~14
+            -- tinted-reflection materials post-fix). No camelCase alt
+            -- because V-Ray's SDK ships only the snake_case spelling
+            -- (matching MTLX-010's `texmap_anisotropy` /
+            -- MTLX-011's `texmap_opacity` single-spelling pattern for
+            -- V-Ray-only slots). The color3 colorspace gate in
+            -- `_EnrichMtlxDocFromMaxMaterial` does the right thing by
+            -- construction — `texmap_reflection` is a color tint, so
+            -- the injected ND_tiledimage_color3 carries the standard
+            -- `colorspace="srgb_texture"` attribute, matching the
+            -- pre-existing `refl_color_map` / `specularColorMap`
+            -- treatment.
+            #("texmap_reflection",      "specular_color",     "color3"),
             #("trans_color_map",        "transmission_color", "color3"),
             #("transmissionColorMap",   "transmission_color", "color3"),
             #("cutout_map",             "opacity",            "float"),
