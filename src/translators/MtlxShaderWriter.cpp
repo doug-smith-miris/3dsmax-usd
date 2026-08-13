@@ -922,7 +922,53 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
             #("coatNormalMap",               "coat_normal",    "vector3"),
             -- VRayMtl spelling (V-Ray SDK canonical):
             #("coat_amount_texmap",          "coat",           "float"),
-            #("coatAmountTexmap",            "coat",           "float")
+            #("coatAmountTexmap",            "coat",           "float"),
+            -- MAX-MTLX-OPACITY-MAP-016 additions: soft/continuous opacity
+            -- maps. The pre-existing `cutout_map` / `cutoutMap` entries
+            -- (above) handle 3ds Max's BINARY hard-alpha cutout slot
+            -- (mat_def:26 — either fully opaque or fully transparent
+            -- per texel). These new entries cover the semantically
+            -- DIFFERENT SOFT/CONTINUOUS opacity family: PhysicalMaterial
+            -- `opacity_map` / `opacityMap` (mat_def:64-66 — 0..1
+            -- continuous alpha for glass etch, mesh screens, tinted
+            -- plastic, court boundary-line halftone maps), OpenPBR
+            -- `geometry_opacity_map` / `geometryOpacityMap`
+            -- (mat_def:262), and VRayMtl `texmap_opacity` (V-Ray SDK
+            -- canonical). Prior-run evidence:
+            --   evidence/gaps-audit.md:158-170 (S2) — every material
+            --   whose alpha lives in one of these slots (rather than
+            --   in `cutout_map`) exported fully opaque, silently
+            --   dropping the soft-alpha authoring.
+            -- All route to `ND_standard_surface.opacity` as `float`,
+            -- matching the pre-existing cutout treatment. The
+            -- MaterialX shader input `opacity` is color3 in the stdlib
+            -- (default (1,1,1)); the evaluator broadcasts an
+            -- ND_tiledimage_float into it channel-broadcast so a
+            -- single-channel opacity texture reads as (a,a,a) — which
+            -- is the correct semantic for a mono-alpha map. No
+            -- ND_convert_float_color3 scaffolding is needed because
+            -- MaterialX handles the promotion at evaluation time.
+            -- No colorspace attribute is authored (`float` scalar, not
+            -- `color3` — the existing type gate in
+            -- `_EnrichMtlxDocFromMaxMaterial` does the right thing).
+            -- Ordering: these entries come AFTER `cutout_map` in
+            -- slotMap order so a material authoring BOTH cutout AND
+            -- opacity_map (unusual — most workflows author one or the
+            -- other) resolves to cutout under first-hit-wins. Within
+            -- this block, PhysicalMaterial declared before OpenPBR
+            -- before VRayMtl, snake_case before camelCase — matching
+            -- every other slotMap family.
+            -- PhysicalMaterial's `opacityThreshold` scalar (soft-to-
+            -- hard cutoff — mat_def:66) is intentionally out of scope:
+            -- authoring it requires an ND_ifgreatereq_float node
+            -- inserted between the tiledimage and `opacity`, which is
+            -- an authoring-path change beyond a slotMap entry. Follow-
+            -- on bite candidate: `max-mtlx-017-opacity-threshold-hard-cutoff`.
+            #("opacity_map",                 "opacity",        "float"),
+            #("opacityMap",                  "opacity",        "float"),
+            #("geometry_opacity_map",        "opacity",        "float"),
+            #("geometryOpacityMap",          "opacity",        "float"),
+            #("texmap_opacity",              "opacity",        "float")
         )
         local seenInputs = #()
         for currentMat in subMtls do (
