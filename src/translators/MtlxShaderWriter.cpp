@@ -766,6 +766,90 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         -- V-Ray Scene Converter to become PhysicalMaterial — reaches
         -- transmission roughness via the PhysicalMaterial spellings
         -- authored above.
+        --
+)"
+        LR"(        -- MAX-MTLX-COAT-015: coat weight/color/roughness/IOR/normal
+        -- maps. Prior to this fix the slotMap covered NO coat slots
+        -- at all, so every glossy floor sealer, car paint, gymnasium
+        -- lacquer, and metallic-finish car body/table silently
+        -- exported with the ND_standard_surface coat family locked
+        -- at port defaults (coat=0 (weight), coat_color=(1,1,1),
+        -- coat_roughness=0.1, coat_IOR=1.5, coat_normal=unset) —
+        -- i.e. the clear-coat overlay was invisible in the exported
+        -- MaterialX network regardless of what the source material
+        -- said. Prior-run evidence:
+        --   evidence/gaps-audit.md:139-156 (S1) enumerates the
+        --   silent-drop property spellings for PhysicalMaterial
+        --   (`coat_map`, `coat_rough_map`, `clearcoat_map`,
+        --   `clearcoatRoughness_map`), OpenPBR (`coat_weight_map`,
+        --   `coat_color_map`, `coat_roughness_map`, `coat_ior_map`,
+        --   `coat_normal_map`), and VRayMtl (`coat_amount_texmap`).
+        --
+        -- MaterialX stdlib target inputs on
+        -- ND_standard_surface_surfaceshader (verified via `hython` +
+        -- `mx.getNodeDef(...)`):
+        --   coat            (float,   default 0.0) — coat weight.
+        --   coat_color      (color3,  default (1,1,1)) — coat tint.
+        --   coat_roughness  (float,   default 0.1) — coat BRDF
+        --                                            roughness.
+        --   coat_IOR        (float,   default 1.5) — coat Fresnel IOR
+        --                                            (capital IOR to
+        --                                            match specular_IOR
+        --                                            spelling).
+        --   coat_normal     (vector3, default unset) — coat-space
+        --                                              normal map input.
+        --
+        -- Property spellings routed to `coat` (weight):
+        --   PhysicalMaterial: `coat_map` / `coatMap` (mat_def:35).
+        --   PhysicalMaterial alt: `clearcoat_map` / `clearcoatMap`
+        --     (mat_def:72 — some 3ds Max builds spell it clearcoat).
+        --   OpenPBR: `coat_weight_map` / `coatWeightMap` (mat_def:218).
+        --   VRayMtl: `coat_amount_texmap` / `coatAmountTexmap`
+        --     (V-Ray SDK canonical for the coat weight scalar).
+        -- Property spellings routed to `coat_roughness`:
+        --   PhysicalMaterial: `coat_rough_map` / `coatRoughMap`
+        --     (mat_def:38, short spelling used by the stock PhysMat UI).
+        --   PhysicalMaterial alt: `clearcoatRoughness_map` /
+        --     `clearcoatRoughnessMap` (mat_def:74).
+        --   OpenPBR: `coat_roughness_map` / `coatRoughnessMap`
+        --     (mat_def:222, long spelling).
+        -- Property spellings routed to `coat_color`:
+        --   OpenPBR: `coat_color_map` / `coatColorMap` (mat_def:220).
+        --   NOTE: PhysicalMaterial doesn't expose a coat_color map
+        --   in stock mat_def; the coat tint is fixed to (1,1,1) in
+        --   stock PhysMat and lives only on OpenPBR / VRayMtl.
+        -- Property spellings routed to `coat_IOR`:
+        --   OpenPBR: `coat_ior_map` / `coatIorMap` (mat_def:226).
+        --   NOTE: no PhysicalMaterial coat_ior slot — stock PhysMat
+        --   uses a scalar-only coat IOR.
+        -- Property spellings routed to `coat_normal`:
+        --   OpenPBR: `coat_normal_map` / `coatNormalMap` (mat_def:250).
+        --   NOTE: this wires a vector3 tiledimage directly into the
+        --   ND_standard_surface `coat_normal` input. The main-normal
+        --   input flows through an ND_normalmap_float node scaffolded
+        --   by `_WireDanglingNormalmapInputs` (MAX-MTLX-003) so it
+        --   correctly remaps 0..1 -> -1..1; scaffolding an equivalent
+        --   node for the COAT-normal path is a candidate follow-on
+        --   bite (`max-mtlx-016-coat-normalmap-remap`). Without it,
+        --   a coat_normal map that was authored as tangent-space
+        --   0..1 encoded will read half-strength in Karma. A raw
+        --   pass-through is nonetheless preferable to silently
+        --   dropping the map, which is what pre-fix code did.
+        --
+)"
+        LR"(        -- All entries follow the pre-existing conventions of the
+        -- slotMap: snake_case declared before camelCase within each
+        -- spelling family so first-hit-wins order matches every other
+        -- family; PhysicalMaterial spellings declared before OpenPBR /
+        -- VRayMtl spellings so the base PhysicalMaterial texture wins
+        -- when the same map is (unusually) authored on multiple slot
+        -- names in the same material. The wrapper walk (MAX-MTLX-007
+        -- `unwrapBlendMaterialSubMtls`, extended for Composite / Blend
+        -- by MAX-MTLX-COMPOSITE-DECAL-014) applies because slotMap
+        -- iteration lives inside `for currentMat in subMtls do` —
+        -- VRayBlendMtl / VRayOverrideMtl / Composite Mtl / stock Blend
+        -- unwrap identically for the new entries, and baseMtl's coat
+        -- textures win over any coat's / per-ray override's.
         local slotMap = #(
             #("base_color_map",         "base_color",         "color3"),
             #("baseColorMap",           "base_color",         "color3"),
@@ -813,7 +897,32 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         LR"(            #("transmission_roughness_map",  "transmission_extra_roughness", "float"),
             #("transmissionRoughnessMap",    "transmission_extra_roughness", "float"),
             #("sheen_roughness_map",         "sheen_roughness",              "float"),
-            #("sheenRoughnessMap",           "sheen_roughness",              "float")
+            #("sheenRoughnessMap",           "sheen_roughness",              "float"),
+            -- MAX-MTLX-COAT-015 additions: coat weight/color/roughness/
+            -- IOR/normal maps routed to ND_standard_surface coat family.
+            -- PhysicalMaterial spellings (mat_def:35/38/72/74):
+            #("coat_map",                    "coat",           "float"),
+            #("coatMap",                     "coat",           "float"),
+            #("coat_rough_map",              "coat_roughness", "float"),
+            #("coatRoughMap",                "coat_roughness", "float"),
+            #("clearcoat_map",               "coat",           "float"),
+            #("clearcoatMap",                "coat",           "float"),
+            #("clearcoatRoughness_map",      "coat_roughness", "float"),
+            #("clearcoatRoughnessMap",       "coat_roughness", "float"),
+            -- OpenPBR spellings (mat_def:218/220/222/226/250):
+            #("coat_weight_map",             "coat",           "float"),
+            #("coatWeightMap",               "coat",           "float"),
+            #("coat_color_map",              "coat_color",     "color3"),
+            #("coatColorMap",                "coat_color",     "color3"),
+            #("coat_roughness_map",          "coat_roughness", "float"),
+            #("coatRoughnessMap",            "coat_roughness", "float"),
+            #("coat_ior_map",                "coat_IOR",       "float"),
+            #("coatIorMap",                  "coat_IOR",       "float"),
+            #("coat_normal_map",             "coat_normal",    "vector3"),
+            #("coatNormalMap",               "coat_normal",    "vector3"),
+            -- VRayMtl spelling (V-Ray SDK canonical):
+            #("coat_amount_texmap",          "coat",           "float"),
+            #("coatAmountTexmap",            "coat",           "float")
         )
         local seenInputs = #()
         for currentMat in subMtls do (
