@@ -52,6 +52,33 @@ bool _TreeHasVRayLightMtl(Mtl* mtl, int depth = 0)
     }
     return false;
 }
+
+// MAX-MTLX-005 (mesh-light guard): true if the material tree contains a transparent/refractive
+// material. The whole-mesh MeshLightAPI light is REJECTED by Karma (and other Hydra renderers)
+// when the source mesh has transparent or cutout faces -- husk logs "Failed to create geometry
+// light because source object has stencil map or partial opacity" -- and the mesh then renders
+// as a solid white fallback. Arch-viz props such as a basketball goal carry a small illuminated
+// ad panel (VRayLightMtl) in the SAME Multi/Sub-Object as transparent backboard glass (a VRayMtl
+// with refraction) and an alpha-cutout net, so applying a geometry light to the whole goal makes
+// the net/rim/backboard glow white. Only opaque emitters (ribbon boards, LED video walls, light
+// fixtures) become geometry lights; transparent mixed props fall back to their emission surface
+// shader, so the illuminated faces still emit without lighting the transparent parts.
+bool _TreeHasTransparentMtl(Mtl* mtl, int depth = 0)
+{
+    if (mtl == nullptr || depth > 8) {
+        return false;
+    }
+    if (mtl->GetXParency() > 0.001f) {
+        return true;
+    }
+    const int n = mtl->NumSubMtls();
+    for (int i = 0; i < n; ++i) {
+        if (_TreeHasTransparentMtl(mtl->GetSubMtl(i), depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
 } // namespace
 
 MaxUsdMeshWriter::MaxUsdMeshWriter(const MaxUsdWriteJobContext& jobCtx, INode* node)
@@ -120,7 +147,8 @@ bool MaxUsdMeshWriter::Write(
     // instead of relying on brute-force emissive-surface hits — which is how V-Ray's light cache
     // fills the room from these emitters. MeshLightAPI derives the emission per-face from the bound
     // material, so only the emissive subset actually emits. Applied once, on the first frame.
-    if (time.IsFirstFrame() && _TreeHasVRayLightMtl(sourceNode->GetMtl())) {
+    if (time.IsFirstFrame() && _TreeHasVRayLightMtl(sourceNode->GetMtl())
+        && !_TreeHasTransparentMtl(sourceNode->GetMtl())) {
         auto meshPrim = prim.GetPrim();
         if (meshPrim) {
             pxr::UsdLuxMeshLightAPI::Apply(meshPrim);
