@@ -26,6 +26,7 @@
 #include <pxr/base/tf/token.h>
 #include <pxr/pxr.h>
 #include <pxr/usd/sdf/assetPath.h>
+#include <pxr/usd/sdf/types.h>
 #include <pxr/usd/usd/timeCode.h>
 #include <pxr/usd/usdLux/boundableLightBase.h>
 #include <pxr/usd/usdLux/diskLight.h>
@@ -79,6 +80,19 @@ namespace {
 //                                  with normalize=true)
 //                              3 = watts (total radiant flux)
 //                              4 = W/m²/sr (radiance)
+//   shadowRadius|<float>    -- VRayLight/VRayIES: shadow softness in world units
+//                              (0 = pin-sharp; the fix's KEY signal — see
+//                              MAX-LIT-SHADOW-SOFTNESS-006).
+//   shadowSubdivs|<int>     -- VRayLight/VRayIES: sample-count hint for
+//                              area-shadow evaluation (default 8).
+//   shadowBias|<float>      -- VRayLight/VRayIES: depth offset (defaults 0.2).
+//   areaShadow|<bool>       -- VRayLight: treat area light as area for shadow
+//                              computation (true) or as a point-source (false).
+//                              Maps to UsdLuxSphereLight's `treatAsPoint` on the
+//                              SphereLight branch.
+//   shadowColor|<r,g,b>     -- VRayLight/VRayIES: shadow tint. Comma-delimited
+//                              float triplet (0..1); authored to the stdlib
+//                              `UsdLuxShadowAPI.shadow:color` attr.
 //
 // Any line whose value cannot be probed is omitted. Absent lines mean
 // "use the GenLight default" in the caller.
@@ -124,6 +138,45 @@ static const TSTR discoverMaxVrayLightFn = LR"(
         if (isProperty obj #units) then (
             result += ("units|" + ((getProperty obj #units) as string) + "\n")
         )
+        -- MAX-LIT-SHADOW-SOFTNESS-006 shadow family. Each check is
+        -- independent so mixing spellings (V-Ray's UI wobbles between
+        -- shadowRadius / shadow_radius across releases) still works.
+        if (isProperty obj #shadowRadius) then (
+            result += ("shadowRadius|" + ((getProperty obj #shadowRadius) as string) + "\n")
+        )
+        if (isProperty obj #shadow_radius) then (
+            result += ("shadowRadius|" + ((getProperty obj #shadow_radius) as string) + "\n")
+        )
+        if (isProperty obj #shadowSubdivs) then (
+            result += ("shadowSubdivs|" + ((getProperty obj #shadowSubdivs) as string) + "\n")
+        )
+        if (isProperty obj #shadow_subdivs) then (
+            result += ("shadowSubdivs|" + ((getProperty obj #shadow_subdivs) as string) + "\n")
+        )
+        if (isProperty obj #shadowBias) then (
+            result += ("shadowBias|" + ((getProperty obj #shadowBias) as string) + "\n")
+        )
+        if (isProperty obj #shadow_bias) then (
+            result += ("shadowBias|" + ((getProperty obj #shadow_bias) as string) + "\n")
+        )
+        if (isProperty obj #areaShadow) then (
+            result += ("areaShadow|" + ((getProperty obj #areaShadow) as string) + "\n")
+        )
+        if (isProperty obj #area_shadow) then (
+            result += ("areaShadow|" + ((getProperty obj #area_shadow) as string) + "\n")
+        )
+        if (isProperty obj #shadowColor) then (
+            local sc = getProperty obj #shadowColor
+            if sc != undefined then (
+                result += ("shadowColor|" + ((sc.r / 255.0) as string) + "," + ((sc.g / 255.0) as string) + "," + ((sc.b / 255.0) as string) + "\n")
+            )
+        )
+        if (isProperty obj #shadow_color) then (
+            local sc2 = getProperty obj #shadow_color
+            if sc2 != undefined then (
+                result += ("shadowColor|" + ((sc2.r / 255.0) as string) + "," + ((sc2.g / 255.0) as string) + "," + ((sc2.b / 255.0) as string) + "\n")
+            )
+        )
         if (isProperty obj #enabled) then (
             result += ("enabled|" + ((getProperty obj #enabled) as string) + "\n")
         )
@@ -164,6 +217,22 @@ struct VRayLightProbe
     // a light class without the property) -> treat as mode 0 (pass-through).
     bool        hasUnits { false };
     int         units { 0 };
+    // MAX-LIT-SHADOW-SOFTNESS-006 — shadow-family fields probed off the
+    // V-Ray light object. Every field is optional; a missing probe line
+    // leaves the corresponding `has*` flag at false so the writer emits
+    // nothing new (byte-identical to the pre-006 output for scenes that
+    // author no shadow settings — the surgical-scope invariant the hython
+    // mirror locks in).
+    bool        hasShadowRadius { false };
+    float       shadowRadius { 0.f };
+    bool        hasShadowSubdivs { false };
+    int         shadowSubdivs { 8 };
+    bool        hasShadowBias { false };
+    float       shadowBias { 0.2f };
+    bool        hasAreaShadow { false };
+    bool        areaShadow { true };
+    bool        hasShadowColor { false };
+    float       shadowColor[3] { 0.f, 0.f, 0.f };
 };
 
 VRayLightProbe _ProbeVRayLight(INode* node)
@@ -249,6 +318,78 @@ VRayLightProbe _ProbeVRayLight(INode* node)
                 if (u >= 0 && u <= 4) {
                     probe.hasUnits = true;
                     probe.units = u;
+                }
+            } else if (key == "shadowRadius") {
+                // MAX-LIT-SHADOW-SOFTNESS-006: soft-shadow radius in world
+                // units. Clamp negatives to 0 (Max UI is non-negative) and
+                // cap the upper end to prevent a malformed manifest from
+                // ballooning a disk light's effective area at render time.
+                float r = std::stof(val);
+                if (r < 0.f) {
+                    r = 0.f;
+                }
+                if (r > 100.f) {
+                    r = 100.f;
+                }
+                probe.hasShadowRadius = true;
+                probe.shadowRadius = r;
+            } else if (key == "shadowSubdivs") {
+                // MAX-LIT-SHADOW-SOFTNESS-006: shadow sample count. Clamp
+                // to [1, 256] — VRayLight's UI cap is 100 but future
+                // releases may raise it; 256 keeps Karma tractable.
+                int s = std::stoi(val);
+                if (s < 1) {
+                    s = 1;
+                }
+                if (s > 256) {
+                    s = 256;
+                }
+                probe.hasShadowSubdivs = true;
+                probe.shadowSubdivs = s;
+            } else if (key == "shadowBias") {
+                // MAX-LIT-SHADOW-SOFTNESS-006: shadow depth-bias. Non-
+                // negative; VRayLight's default is 0.2 world units.
+                float b = std::stof(val);
+                if (b < 0.f) {
+                    b = 0.f;
+                }
+                probe.hasShadowBias = true;
+                probe.shadowBias = b;
+            } else if (key == "areaShadow") {
+                // MAX-LIT-SHADOW-SOFTNESS-006: when false, treat the area
+                // light as a point source for shadow evaluation. Maps to
+                // UsdLuxSphereLight's `treatAsPoint` on the SphereLight
+                // branch (RectLight/DiskLight preserve the raw value via
+                // the `inputs:vray:shadow:areaShadow` opinion).
+                std::string v = val;
+                for (auto& c : v) {
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+                probe.hasAreaShadow = true;
+                probe.areaShadow = !(v == "false" || v == "0");
+            } else if (key == "shadowColor") {
+                // MAX-LIT-SHADOW-SOFTNESS-006: shadow tint as "r,g,b" —
+                // three 0..1 floats. Malformed triplets leave the field
+                // absent so the writer preserves the pre-006 behavior.
+                auto c1 = val.find(',');
+                if (c1 != std::string::npos) {
+                    auto c2 = val.find(',', c1 + 1);
+                    if (c2 != std::string::npos) {
+                        float r = std::stof(val.substr(0, c1));
+                        float g = std::stof(val.substr(c1 + 1, c2 - c1 - 1));
+                        float b = std::stof(val.substr(c2 + 1));
+                        // Clamp to a physically-sensible [0, 1] range so
+                        // a rogue authored value doesn't lift shadows.
+                        auto clamp01 = [](float v) {
+                            if (v < 0.f) return 0.f;
+                            if (v > 1.f) return 1.f;
+                            return v;
+                        };
+                        probe.hasShadowColor = true;
+                        probe.shadowColor[0] = clamp01(r);
+                        probe.shadowColor[1] = clamp01(g);
+                        probe.shadowColor[2] = clamp01(b);
+                    }
                 }
             }
         } catch (const std::exception&) {
@@ -619,10 +760,115 @@ bool MaxUsdVRayLightWriter::Write(
             : (distantLight ? distantLight.GetPrim()
                             : (domeLight ? domeLight.GetPrim() : pxr::UsdPrim()));
         if (primForShadow) {
-            pxr::UsdLuxShadowAPI shadowApi(primForShadow);
+            pxr::UsdLuxShadowAPI shadowApi
+                = pxr::UsdLuxShadowAPI::Apply(primForShadow);
             const bool shadowEnable = (genLight != nullptr) ? (genLight->GetShadow() != 0) : true;
             shadowApi.CreateShadowEnableAttr().Set(
                 shadowEnable, pxr::UsdTimeCode::Default());
+
+            // MAX-LIT-SHADOW-SOFTNESS-006 — forward V-Ray shadow-family
+            // attrs so downstream renderers (Karma / Storm / Prman) get
+            // the soft-area shadow authoring the source scene called for
+            // instead of a pin-sharp point-shadow fallback.
+            //
+            // Two audiences:
+            //   (a) stdlib UsdLuxShadowAPI attrs — `shadow:color` is the
+            //       only stdlib shadow-family attr V-Ray directly maps
+            //       to. Author when the probe surfaced a tint.
+            //   (b) custom `inputs:vray:shadow:*` opinions preserve every
+            //       V-Ray-specific field for lossless round-trip. Delegates
+            //       that opt in read them; delegates that don't leave them
+            //       intact. Paired with:
+            //   (c) Karma's `karma:light:samplingquality` (int) receives
+            //       the same value as `.shadowSubdivs` so Karma actually
+            //       raises its sample count when the artist set a high
+            //       shadow subdiv — the practical visible fix.
+            //   (d) USD-canonical bridges — when `.areaShadow=false` on
+            //       a light that maps to SphereLight, set `treatAsPoint`
+            //       so any Hydra delegate skips the area-shadow integral.
+            //       When `.shadowRadius > 0` on a light that maps to
+            //       DiskLight (VRayIES), enlarge the disk's own radius so
+            //       the finite-area emitter naturally casts soft shadows.
+            //       normalize=true (authored above on every branch) keeps
+            //       the radius change from also affecting brightness.
+            if (probe.hasShadowColor) {
+                shadowApi.CreateShadowColorAttr().Set(
+                    pxr::GfVec3f(
+                        probe.shadowColor[0],
+                        probe.shadowColor[1],
+                        probe.shadowColor[2]),
+                    pxr::UsdTimeCode::Default());
+            }
+            if (probe.hasShadowRadius) {
+                pxr::UsdAttribute vrRadius = primForShadow.CreateAttribute(
+                    pxr::TfToken("inputs:vray:shadow:radius"),
+                    pxr::SdfValueTypeNames->Float,
+                    /*custom=*/false);
+                vrRadius.Set(probe.shadowRadius, pxr::UsdTimeCode::Default());
+            }
+            if (probe.hasShadowBias) {
+                pxr::UsdAttribute vrBias = primForShadow.CreateAttribute(
+                    pxr::TfToken("inputs:vray:shadow:bias"),
+                    pxr::SdfValueTypeNames->Float,
+                    /*custom=*/false);
+                vrBias.Set(probe.shadowBias, pxr::UsdTimeCode::Default());
+            }
+            if (probe.hasShadowSubdivs) {
+                pxr::UsdAttribute vrSub = primForShadow.CreateAttribute(
+                    pxr::TfToken("inputs:vray:shadow:subdivs"),
+                    pxr::SdfValueTypeNames->Int,
+                    /*custom=*/false);
+                vrSub.Set(probe.shadowSubdivs, pxr::UsdTimeCode::Default());
+                // Karma-visible sample-count mirror. `karma:light:samplingquality`
+                // is the delegate-registered token that raises Karma's per-light
+                // shadow sample count at render time.
+                pxr::UsdAttribute karmaQ = primForShadow.CreateAttribute(
+                    pxr::TfToken("karma:light:samplingquality"),
+                    pxr::SdfValueTypeNames->Int,
+                    /*custom=*/false);
+                karmaQ.Set(probe.shadowSubdivs, pxr::UsdTimeCode::Default());
+            }
+            if (probe.hasAreaShadow) {
+                pxr::UsdAttribute vrArea = primForShadow.CreateAttribute(
+                    pxr::TfToken("inputs:vray:shadow:areaShadow"),
+                    pxr::SdfValueTypeNames->Bool,
+                    /*custom=*/false);
+                vrArea.Set(probe.areaShadow, pxr::UsdTimeCode::Default());
+                // USD-canonical bridge for SphereLight only — Rect/Disk
+                // lack a `treatAsPoint` in the stdlib. Preserving the raw
+                // value via `inputs:vray:shadow:areaShadow` above covers
+                // the Rect/Disk cases losslessly.
+                if (!probe.areaShadow
+                    && primType == pxr::MaxUsdPrimTypeTokens->SphereLight) {
+                    pxr::UsdLuxSphereLight sphere(primForShadow);
+                    if (sphere) {
+                        sphere.CreateTreatAsPointAttr().Set(
+                            true, pxr::UsdTimeCode::Default());
+                    }
+                }
+            }
+            // Karma-visible shadow softness for VRayIES / VRayLight-disc.
+            // Enlarge the DiskLight's radius by shadowRadius so the finite-
+            // area emitter casts soft shadows in any Hydra renderer. The
+            // authored `normalize=true` above keeps this from changing
+            // brightness. Total radius is clamped to 100 world units so a
+            // rogue authored value can't explode the light's footprint.
+            if (probe.hasShadowRadius && probe.shadowRadius > 0.f
+                && primType == pxr::MaxUsdPrimTypeTokens->DiskLight) {
+                pxr::UsdLuxDiskLight disk(primForShadow);
+                if (disk) {
+                    float existing = 0.f;
+                    if (auto radAttr = disk.GetRadiusAttr()) {
+                        radAttr.Get(&existing, pxr::UsdTimeCode::Default());
+                    }
+                    float bumped = existing + probe.shadowRadius;
+                    if (bumped > 100.f) {
+                        bumped = 100.f;
+                    }
+                    disk.CreateRadiusAttr().Set(
+                        bumped, pxr::UsdTimeCode::Default());
+                }
+            }
         }
     }
 
