@@ -213,21 +213,22 @@ static constexpr float kUnits0Gain      = 2.3f; // default-mode V-Ray -> Karma c
 
 static float _NormalizeEmissionWeight(float multiplier, int units)
 {
-    constexpr float PI = 3.14159265358979323846f;
-    constexpr float K  = 683.0f; // photopic peak lm/W
-    float           w  = multiplier;
+    // NB: 'PI' is a Max SDK macro — use prefixed locals (mirrors kIntensityPi in VRayLightWriter).
+    constexpr float kEmitPi = 3.14159265358979323846f;
+    constexpr float kEmitK  = 683.0f; // photopic peak lm/W
+    float           w       = multiplier;
     switch (units) {
     case 1: // lumens (total luminous flux) -> nit-scale (Lambertian): / pi
-        w = multiplier / PI;
+        w = multiplier / kEmitPi;
         break;
     case 2: // lm/m^2/sr = cd/m^2 = nits: already the target scale, pass through
         w = multiplier;
         break;
     case 3: // watts (total radiant flux) -> lumens (x683) -> nits (/pi)
-        w = (multiplier * K) / PI;
+        w = (multiplier * kEmitK) / kEmitPi;
         break;
     case 4: // W/m^2/sr radiance -> luminance via photopic peak
-        w = multiplier * K;
+        w = multiplier * kEmitK;
         break;
     case 0: // default (arbitrary artistic scale): apply the units=0 calibration gain
     default:
