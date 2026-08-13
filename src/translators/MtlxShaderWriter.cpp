@@ -529,7 +529,8 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         --     layer as `.texmap_reflectionIOR` / `.texmap_refractionIOR`).
         -- MAX-MTLX-010: anisotropy + anisotropy-rotation maps
         -- (`specular_anisotropy` / `specular_rotation` on
-        -- ND_standard_surface — both float, port defaults 0.0). Prior
+)"
+        LR"(        -- ND_standard_surface — both float, port defaults 0.0). Prior
         -- to this fix the slotMap covered NO anisotropy slots at all,
         -- so every VRayMtl brushed-metal / anisotropic-fabric / carbon-
         -- fiber material silently exported with anisotropy locked at
