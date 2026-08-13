@@ -52,9 +52,26 @@
 #include <maxscript/maxwrapper/mxsobjects.h>
 
 #include <Shlwapi.h>
+#include <genlight.h>
 #include <memory>
 #include <modstack.h>
 #include <stack>
+
+namespace {
+// MAX-LIT-HIDDEN-GATE-004 — hidden-light gate bypass.
+// A 3ds Max node whose evaluated object is a LIGHT_CLASS_ID (any GenLight-derived light:
+// stock photometric, standard Omni/Direct/Spot, VRayLight/VRaySun/VRayIES, MR sky, etc.)
+// should ALWAYS export to USD regardless of the node's or its ancestors' hidden state.
+// Artists routinely hide lights that clutter the viewport (fill / kicker / practical rigs);
+// the exporter's coarse-grained TranslateHidden option forces an all-or-nothing choice
+// that un-drops every hidden helper/mesh in the scene too. This predicate lets the three
+// hidden-gate sites (writer dispatch, exportable-hierarchy filter, visibility-invisible
+// author) treat lights as never-hidden without changing behavior for any other class.
+bool _MaxUsd_IsLightObject(Object* object)
+{
+    return object != nullptr && object->SuperClassID() == LIGHT_CLASS_ID;
+}
+} // namespace
 
 namespace MAXUSD_NS_DEF {
 
@@ -881,8 +898,12 @@ MaxUsd::PrimDefVectorPtr USDSceneBuilder::ProcessNode(
 
     const auto& buildOptions = writeJobContext.GetArgs();
 
+    // MAX-LIT-HIDDEN-GATE-004 — always export light nodes, regardless of hidden state.
+    // See _MaxUsd_IsLightObject and its comment above for the rationale.
+    const bool isLightNode = _MaxUsd_IsLightObject(object);
+
     // Check if we need to export the node, if it is hidden.
-    if (buildOptions.GetTranslateHidden() || !context.node->IsNodeHidden()) {
+    if (buildOptions.GetTranslateHidden() || !context.node->IsNodeHidden() || isLightNode) {
         size_t numRegisteredWriters = 0;
 
         auto primWriter = pxr::MaxUsdPrimWriterRegistry::FindWriter(
@@ -1049,7 +1070,14 @@ MaxUsd::PrimDefVectorPtr USDSceneBuilder::ProcessNode(
                 pxr::UsdGeomXformable xFormPrim(prim);
 
                 // Setup the USD visibility, from the Max node's hidden state, if requested.
-                if (context.node->IsNodeHidden() && buildOptions.GetUseUSDVisibility()) {
+                // MAX-LIT-HIDDEN-GATE-004 — do not author visibility=invisible for lights.
+                // A hidden Max light node should still contribute to the rendered stage; the
+                // prior gate (up at line ~885) let hidden lights REACH this point but this
+                // branch then blanked them by authoring invisible on the UsdLux xform, which
+                // defeats the exporter's own light-writer output. Skip the author when the
+                // source object is a Max light.
+                if (context.node->IsNodeHidden() && buildOptions.GetUseUSDVisibility()
+                    && !isLightNode) {
                     xFormPrim.MakeInvisible(pxr::UsdTimeCode::Default());
                 }
 
@@ -1437,8 +1465,16 @@ bool USDSceneBuilder::HasExportableDescendants(
 
     // If we are exporting from a node list, make sure the node should be considered.
     if (nodesToExportSet.empty() || nodesToExportSet.find(node) != nodesToExportSet.end()) {
+        // MAX-LIT-HIDDEN-GATE-004 — mirror the ProcessNode-level gate: a hidden light node
+        // is still "exportable" so the parent's HasExportableDescendants decision propagates
+        // the light up through any invisible-ancestor pruning the caller applies. Without
+        // this, a hidden light living under a hierarchy whose only visible content is that
+        // light would cause the ancestor to be treated as having no exportable descendants.
+        const auto object
+            = node->EvalWorldState(buildOptions.GetResolvedTimeConfig().GetStartTime()).obj;
+        const bool isLightNode = _MaxUsd_IsLightObject(object);
         // Should the node be ignored because it is hidden?
-        if (!node->IsNodeHidden() || buildOptions.GetTranslateHidden()) {
+        if (!node->IsNodeHidden() || buildOptions.GetTranslateHidden() || isLightNode) {
             // Check if any of the translation operations apply to the node's object. If so, it
             // is considered exportable.
             exportableHierarchy = pxr::MaxUsdPrimWriterRegistry::CanBeExported(node, jobCtx);
