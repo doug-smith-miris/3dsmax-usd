@@ -1964,6 +1964,329 @@ size_t _ApplyBumpStrengthToNormalmaps(
     return authored;
 }
 
+// MAX-MTLX-GLOSSINESS-INVERT-018: Route VRayMtl `texmap_reflectionGlossiness`
+// and `texmap_refractionGlossiness` to ND_standard_surface's
+// `specular_roughness` and `transmission_extra_roughness` respectively, via
+// an `ND_invert_float` node inserted between the tiledimage and the
+// NodeGraph output. Rationale: V-Ray's glossiness convention is
+// (0 = rough, 1 = smooth); ND_standard_surface roughness is
+// (0 = smooth, 1 = rough). Wiring the tiledimage directly to the roughness
+// input would produce a SEMANTICALLY INVERTED map — polished chrome would
+// render as brushed, frosted glass as polished. MAX-MTLX-011 explicitly
+// scoped these V-Ray-specific slots out and punted them to this bite; see
+// `MtlxShaderWriter.cpp:704-717` (the MAX-MTLX-011 slotMap comment block).
+//
+// Ordering: runs AFTER `_EnrichMtlxDocFromMaxMaterial` (MAX-MTLX-001), so
+// materials that ALREADY have a polarity-correct roughness map wired via
+// MTLX-001's slotMap (`roughness_map` → specular_roughness or MTLX-011's
+// `trans_roughness_map` → transmission_extra_roughness) are respected: the
+// `_IsShaderInputDangling` guard makes this pass a no-op for those inputs,
+// preserving MTLX-001/011's direct wiring and surgical scope.
+//
+// Ordering: runs BEFORE `_AddDependentNodes`, so the invert + tiledimage
+// nodes end up serialized to USD Shader prims by the standard walker.
+//
+// Scope: VRayMtl-only. The V-Ray SDK is the only material family whose
+// canonical roughness-family texmap is authored as GLOSSINESS. Every
+// PhysicalMaterial / OpenPBR-derived variant already exposes a roughness-
+// convention map slot handled by MTLX-001 (`roughness_map` / `roughnessMap`
+// / MTLX-011's transmission-roughness spellings). The wrapper walk reuses
+// `unwrapBlendMaterialSubMtls` (MAX-MTLX-007 / MTLX-COMPOSITE-DECAL-014) so
+// VRayBlendMtl / VRayOverrideMtl / Composite / Blend materials with a
+// nested V-Ray sub-material also get the invert scaffolding via base-first
+// precedence, matching MTLX-001's convention.
+//
+// Graph shape authored (post-fix):
+//
+//   [img_specular_roughness_gloss (tiledimage_float)]     [file = <glossiness map path>]
+//                              |
+//                             (in)
+//                              v
+//   [invert_specular_roughness_gloss (invert_float)]      [amount default = 1.0]
+//                              |
+//                             (out)
+//                              v
+//   [NG.specular_roughness_output]                        [output → invert node]
+//                              |
+//                              v
+//   [ND_standard_surface.specular_roughness]              [input → NG output]
+//
+// ND_invert_float computes `out = amount - in`, so with the default
+// `amount = 1.0` the result is `1.0 - glossiness = roughness` — the
+// canonical V-Ray → MaterialX convention flip. Verified via hython:
+//   mx.getNodeDef("ND_invert_float").getActiveInput("amount")
+//     -> Input(type=float, default='1.0')
+//
+// No colorspace attribute on the tiledimage. Glossiness is a raw scalar
+// (0..1), not a color — an sRGB → linear decode would silently gamma-shift
+// the value. The existing type gate in `_EnrichMtlxDocFromMaxMaterial` only
+// authors `colorspace="srgb_texture"` when `mtlxType == "color3"`, and we
+// author `"float"` here for the same reason.
+
+// MAX-MTLX-GLOSSINESS-INVERT-018: MAXScript helper that probes VRayMtl's
+// canonical glossiness texmap slots. Returns pipe-delimited lines
+// `<mtlxInput>|<absolute file path>`, one per discovered map. Empty result
+// when no V-Ray glossiness map is discoverable on any sub-material.
+//
+// Reuses `unwrapBlendMaterialSubMtls` defined by the earlier
+// `discoverMaxMtlxTexmapsFn` invocation (MAX-MTLX-001) — the MAXScript
+// runtime persists global fn definitions across `ExecuteMAXScriptScript`
+// calls within a single writer Write() pass, and MTLX-012's
+// `discoverMaxMtlxBumpStrengthFn` already relies on the same persistence
+// (see line ~1809).
+//
+// Ordering inside the slotMap: `texmap_reflectionGlossiness` before
+// `texmap_refractionGlossiness` so a VRayMtl authoring BOTH maps
+// still emits BOTH inverted-roughness paths (they target DIFFERENT
+// ND_standard_surface inputs — reflection → specular_roughness,
+// refraction → transmission_extra_roughness — so first-hit-wins does
+// NOT collide between them; the seenInputs dedupe tracks them
+// independently).
+//
+// Uses the same FileResolutionManager resolver call as MAX-TEX-003 so
+// mixed-case texture paths agree with the UsdPreviewSurface side's
+// `inputs:file` on the dual-network export.
+static const TSTR discoverMaxVRayGlossinessMapsFn = LR"(
+    fn discoverMaxVRayGlossinessMaps materialAnimHandle = (
+        local m = getAnimByHandle materialAnimHandle
+        local result = ""
+        if m == undefined then return result
+        local subMtls = unwrapBlendMaterialSubMtls m #() 0
+        local slotMap = #(
+            #("texmap_reflectionGlossiness",  "specular_roughness"),
+            #("texmap_refractionGlossiness",  "transmission_extra_roughness")
+        )
+        local seenInputs = #()
+        for currentMat in subMtls do (
+            for entry in slotMap do (
+                local propName  = entry[1]
+                local mtlxInput = entry[2]
+                if (isProperty currentMat propName) then (
+                    local tex = getProperty currentMat propName
+                    if tex != undefined then (
+                        local fname = resolveMaxTexmapFilename tex 0
+                        if fname != undefined and fname != "" then (
+                            local resolved = fname
+                            local resolverOk = false
+                            try (
+                                resolverOk = FileResolutionManager.getFullFilePath &resolved #bitmap
+                            ) catch (
+                                resolverOk = false
+                            )
+                            if resolverOk and resolved != undefined and resolved != "" then (
+                                fname = resolved
+                            )
+                            if (findItem seenInputs mtlxInput) == 0 then (
+                                append seenInputs mtlxInput
+                                result += (mtlxInput + "|" + fname + "\n")
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        return result
+    )
+    discoverMaxVRayGlossinessMaps )";
+
+// MAX-MTLX-GLOSSINESS-INVERT-018: parses one line of the
+// discoverMaxVRayGlossinessMaps output into (mtlxInput, filePath).
+static bool _ParseGlossinessLine(
+    const std::string& line,
+    std::string&       mtlxInput,
+    std::string&       filePath)
+{
+    auto pipe = line.find('|');
+    if (pipe == std::string::npos) {
+        return false;
+    }
+    mtlxInput = line.substr(0, pipe);
+    filePath = line.substr(pipe + 1);
+    while (!filePath.empty()
+           && (filePath.back() == '\r' || filePath.back() == '\n'
+               || filePath.back() == ' ')) {
+        filePath.pop_back();
+    }
+    return !mtlxInput.empty() && !filePath.empty();
+}
+
+// MAX-MTLX-GLOSSINESS-INVERT-018: for each VRayMtl glossiness texmap the
+// MAXScript probe surfaces, scaffold an ND_tiledimage_float + ND_invert_float
+// pair inside the shader's NodeGraph and wire the NG output for the target
+// roughness input to the invert node. See the block comment above the
+// MAXScript helper for the graph shape.
+//
+// Returns the number of (tiledimage, invert) pairs authored. Zero when the
+// material has no V-Ray glossiness maps or when every target roughness input
+// was already wired by MAX-MTLX-001's direct slotMap (polarity-correct
+// roughness spelling wins).
+size_t _WireVRayGlossinessAsInvertedRoughness(
+    const MaterialX::DocumentPtr& mtlxDoc,
+    const MaterialX::NodePtr&     shaderNode,
+    AnimHandle                    animHandle)
+{
+    if (!mtlxDoc || !shaderNode) {
+        return 0;
+    }
+
+    FPValue rvalue;
+    rvalue.Init();
+    std::wstringstream ss;
+    ss << discoverMaxVRayGlossinessMapsFn << animHandle << L'\0';
+    ExecuteMAXScriptScript(
+        ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue);
+    auto discovery = MaxUsd::MaxStringToUsdString(rvalue.s);
+    if (discovery.empty()) {
+        return 0;
+    }
+
+    size_t      injected = 0;
+    std::string line;
+    for (size_t start = 0; start <= discovery.size();) {
+        auto nl = discovery.find('\n', start);
+        if (nl == std::string::npos) {
+            line = discovery.substr(start);
+            start = discovery.size() + 1;
+        } else {
+            line = discovery.substr(start, nl - start);
+            start = nl + 1;
+        }
+        if (line.empty()) {
+            continue;
+        }
+        std::string mtlxInput, filePath;
+        if (!_ParseGlossinessLine(line, mtlxInput, filePath)) {
+            continue;
+        }
+
+        // Respect MAX-MTLX-001's direct wiring: if a polarity-correct
+        // roughness map (`roughness_map` for specular_roughness or
+        // MTLX-011's `trans_roughness_map` for transmission_extra_roughness)
+        // was already discovered on this material, MTLX-001 already wired
+        // the correct tiledimage into the shader input. Do NOT overwrite
+        // it with an inverted glossiness path. Surgical-scope invariant.
+        if (!_IsShaderInputDangling(mtlxDoc, shaderNode, mtlxInput)) {
+            continue;
+        }
+
+        // Locate or create the NodeGraph feeding this shader input.
+        auto                    shaderInput = shaderNode->getInput(mtlxInput);
+        MaterialX::NodeGraphPtr ng;
+        std::string             outputName;
+        if (shaderInput) {
+            ng = _GetInputNodeGraph(mtlxDoc, shaderNode, mtlxInput);
+            outputName = shaderInput->getOutputString();
+        }
+        if (outputName.empty()) {
+            outputName = mtlxInput + "_output";
+        }
+        if (!ng) {
+            for (auto candidate : mtlxDoc->getNodeGraphs()) {
+                if (candidate->getOutput(outputName)) {
+                    ng = candidate;
+                    break;
+                }
+            }
+        }
+        if (!ng) {
+            auto ngName = "NG_" + shaderNode->getName();
+            ng = mtlxDoc->getNodeGraph(ngName);
+            if (!ng) {
+                ng = mtlxDoc->addNodeGraph(ngName);
+            }
+        }
+        if (!ng) {
+            continue;
+        }
+
+        // Author the ND_tiledimage_float carrying the glossiness texture.
+        // Name is namespaced with `_gloss` so a subsequent MTLX-001 pass on
+        // the same NG (unlikely — MTLX-001 already ran) cannot silently
+        // collide with the standard `img_<slotname>` naming.
+        auto imgName = "img_" + mtlxInput + "_gloss";
+        auto imgNode = ng->getNode(imgName);
+        if (!imgNode) {
+            imgNode = ng->addNode("tiledimage", imgName, "float");
+        }
+        if (!imgNode) {
+            continue;
+        }
+        imgNode->setNodeDefString("ND_tiledimage_float");
+        auto fileInput = imgNode->getInput("file");
+        if (!fileInput) {
+            fileInput = imgNode->addInput("file", "filename");
+        }
+        if (fileInput) {
+            fileInput->setValueString(filePath);
+            // No `colorspace` attribute — glossiness is a raw scalar, not a
+            // color. The type gate in _EnrichMtlxDocFromMaxMaterial does
+            // the same for other float slots.
+        }
+
+        // Author the ND_invert_float that converts glossiness (0=rough,
+        // 1=smooth) to roughness (0=smooth, 1=rough).
+        //   out = amount - in
+        //   amount default = 1.0 (verified against MaterialX stdlib)
+        // So `in = tiledimage_float` gives `out = 1.0 - glossiness`, the
+        // canonical V-Ray → MaterialX convention flip.
+        auto invName = "invert_" + mtlxInput + "_gloss";
+        auto invNode = ng->getNode(invName);
+        if (!invNode) {
+            invNode = ng->addNode("invert", invName, "float");
+        }
+        if (!invNode) {
+            continue;
+        }
+        invNode->setNodeDefString("ND_invert_float");
+        auto invIn = invNode->getInput("in");
+        if (!invIn) {
+            invIn = invNode->addInput("in", "float");
+        }
+        if (invIn) {
+            invIn->setNodeName(imgName);
+            if (invIn->hasAttribute("value")) {
+                invIn->removeAttribute("value");
+            }
+            if (invIn->hasAttribute("nodegraph")) {
+                invIn->removeAttribute("nodegraph");
+            }
+            // Clear any stale `output` reference — a fresh node has none,
+            // but a re-invocation might.
+            if (!invIn->getOutputString().empty()) {
+                invIn->setOutputString("");
+            }
+        }
+
+        // Route the NodeGraph output through the invert node (NOT the raw
+        // tiledimage). This is the critical wiring: without it, the graph
+        // would author a polished-vs-frosted flip in the exported USD.
+        auto output = ng->getOutput(outputName);
+        if (!output) {
+            output = ng->addOutput(outputName, "float");
+        }
+        if (output) {
+            output->setNodeName(invName);
+            if (output->hasAttribute("nodegraph")) {
+                output->removeAttribute("nodegraph");
+            }
+        }
+
+        // Ensure the shader input references NG + output. Defensive against
+        // exports that emitted a bare constant `value` opinion; matches the
+        // MTLX-001 injection contract.
+        if (shaderInput) {
+            shaderInput->setNodeGraphString(ng->getName());
+            shaderInput->setOutputString(outputName);
+            if (shaderInput->hasAttribute("value")) {
+                shaderInput->removeAttribute("value");
+            }
+        }
+
+        ++injected;
+    }
+    return injected;
+}
+
 // Adds a node graph input to a USD node graph based on a MaterialX input.
 void _AddNodeGraphInput(
     const MaterialX::InputPtr& input,
@@ -2307,6 +2630,22 @@ void MtlxShaderWriter::Write()
     // when no bump-strength property is discoverable or when the discovered
     // value equals the port default (1.0) — the exported doc stays clean.
     _ApplyBumpStrengthToNormalmaps(mtlxDoc, shaderNode, animHandle);
+
+    // MAX-MTLX-GLOSSINESS-INVERT-018: V-Ray's glossiness maps
+    // (`texmap_reflectionGlossiness` for specular_roughness,
+    // `texmap_refractionGlossiness` for transmission_extra_roughness) use the
+    // INVERSE convention of ND_standard_surface roughness (V-Ray: 0=rough,
+    // 1=smooth; MaterialX: 0=smooth, 1=rough). MAX-MTLX-011 explicitly scoped
+    // these V-Ray-only slots out of the standard slotMap because wiring them
+    // directly would produce a semantically inverted map — polished chrome
+    // rendering as brushed, frosted glass rendering as polished. Post-fix,
+    // this pass discovers V-Ray glossiness maps and scaffolds an
+    // ND_invert_float node between the tiledimage and the NG output for the
+    // roughness input. `_IsShaderInputDangling` gates the fix so materials
+    // whose polarity-correct roughness map was already discovered by
+    // MAX-MTLX-001 (`roughness_map` / `trans_roughness_map`) keep their
+    // direct wiring — this pass is a no-op for those.
+    _WireVRayGlossinessAsInvertedRoughness(mtlxDoc, shaderNode, animHandle);
 
     _SetShaderInfoAttributes(shaderNode, shaderSchema);
     _AddDependentNodes(shaderNode, collectedNodes, GetUsdStage(), parentPath);
