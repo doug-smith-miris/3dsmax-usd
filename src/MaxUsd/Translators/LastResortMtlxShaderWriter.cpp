@@ -200,23 +200,38 @@ struct VRayLightMtlProbe
 // all five modes. Ceiling of 30 chosen empirically: enough headroom for LED
 // emitters to visibly dominate a scene, low enough that a default Karma render
 // with a mid-range exposure does not flat-white every emitter pixel.
-static constexpr float kEmissionCeiling = 30.0f;
+// MAX-LIT-DIMNESS-014: The arena's fixtures + area lights are ALL units=0 (default) — verified on the
+// box (Hexagonal ceiling lights mult=50, area lights mult 1.5..85). Two dimness causes were measured:
+// (1) the old ceiling of 30 CLAMPED the mult=50 ceiling fixtures down to 30 (a 1.67x loss on the main
+// room light), and (2) V-Ray's default-unit multiplier does not map 1:1 to a Karma nit — V-Ray's color
+// mapping brightens beyond the raw radiance, so a units=0 light reads ~2x too dim in Karma. Fix: raise
+// the ceiling so mult<=~500 fixtures pass through, and apply a shared units=0 calibration gain
+// (kUnits0Gain) — the SAME gain the area-light path (VRayLightWriter) applies — so both emission paths
+// track V-Ray. kUnits0Gain is the single knob to tune against the vray-baseline mean (~62/255).
+static constexpr float kEmissionCeiling = 1000.0f;
+static constexpr float kUnits0Gain      = 2.3f; // default-mode V-Ray -> Karma calibration (tunable)
 
 static float _NormalizeEmissionWeight(float multiplier, int units)
 {
-    float w = multiplier;
+    constexpr float PI = 3.14159265358979323846f;
+    constexpr float K  = 683.0f; // photopic peak lm/W
+    float           w  = multiplier;
     switch (units) {
-    case 1: // lumens: divide by photopic peak (683 lm/W) to get watt-equivalent
-        w = multiplier / 683.0f;
+    case 1: // lumens (total luminous flux) -> nit-scale (Lambertian): / pi
+        w = multiplier / PI;
         break;
-    case 2: // luminance (lm/m^2/sr = cd/m^2 * pi): divide by pi
-        w = multiplier / 3.14159265358979323846f;
-        break;
-    case 0: // default (arbitrary 0-1 color scale): author intent
-    case 3: // radiant power (watts): pass through
-    case 4: // radiance (W/m^2/sr): pass through
-    default:
+    case 2: // lm/m^2/sr = cd/m^2 = nits: already the target scale, pass through
         w = multiplier;
+        break;
+    case 3: // watts (total radiant flux) -> lumens (x683) -> nits (/pi)
+        w = (multiplier * K) / PI;
+        break;
+    case 4: // W/m^2/sr radiance -> luminance via photopic peak
+        w = multiplier * K;
+        break;
+    case 0: // default (arbitrary artistic scale): apply the units=0 calibration gain
+    default:
+        w = multiplier * kUnits0Gain;
         break;
     }
     if (w > kEmissionCeiling) {

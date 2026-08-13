@@ -525,6 +525,12 @@ TfToken _ClassifyVRayLight(const VRayLightProbe& probe)
 constexpr float kIntensityPi         = 3.14159265358979323846f;
 constexpr float kIntensityPhotopicK  = 683.0f;   // Photopic peak, lm/W.
 constexpr float kIntensityCeiling    = 10000.0f; // nit-scale, tone-mapper safe.
+// MAX-LIT-DIMNESS-014: default-mode (units=0) V-Ray lights don't map 1:1 to a Karma nit — V-Ray's
+// color mapping brightens beyond the raw radiance. This calibration gain (shared conceptually with
+// LastResortMtlxShaderWriter's kUnits0Gain — keep the two in sync) brings units=0 area lights up to
+// match the vray-baseline. The arena's area lights are ALL units=0 (mult 1.5..85), so this is the
+// dominant lever for the ~2x aerial dimness. Single knob to tune against baseline mean (~62/255).
+constexpr float kUnits0Gain          = 2.3f;
 
 float _NormalizeVRayLightIntensity(float multiplier, int units, bool hasUnits)
 {
@@ -532,8 +538,8 @@ float _NormalizeVRayLightIntensity(float multiplier, int units, bool hasUnits)
     float base = multiplier;
     if (hasUnits) {
         switch (units) {
-        case 0: // Default: arbitrary artistic scale.
-            base = multiplier;
+        case 0: // Default: arbitrary artistic scale -> apply units=0 calibration gain (see above).
+            base = multiplier * kUnits0Gain;
             break;
         case 1: // Lumens (total luminous flux) -> nits (Lambertian).
             base = multiplier / kIntensityPi;
