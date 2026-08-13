@@ -156,6 +156,12 @@ static const TSTR discoverVRayLightMtlFn = LR"(
                 local fname = undefined
                 if (classOf tex) == Bitmaptexture then (
                     fname = tex.filename
+                ) else if (isProperty tex #HDRIMapName) and ((getProperty tex #HDRIMapName) != undefined) and ((getProperty tex #HDRIMapName) != "") then (
+                    -- MAX-MTLX-VRAYHDRI-015: V-Ray graphic screens (Buzz/City LED boards, scoreboard)
+                    -- drive their VRayLightMtl emission via a VRayHDRI/VRayBitmap map whose path is in
+                    -- .HDRIMapName, not .filename -> without this the texmap dropped and the screen
+                    -- emitted a flat white tint. Probed before #filename so the V-Ray path wins.
+                    fname = getProperty tex #HDRIMapName
                 ) else if (isProperty tex #filename) then (
                     fname = getProperty tex #filename
                 ) else if (isProperty tex #bitmap) then (
@@ -209,7 +215,7 @@ struct VRayLightMtlProbe
 // (kUnits0Gain) — the SAME gain the area-light path (VRayLightWriter) applies — so both emission paths
 // track V-Ray. kUnits0Gain is the single knob to tune against the vray-baseline mean (~62/255).
 static constexpr float kEmissionCeiling = 1000.0f;
-static constexpr float kUnits0Gain      = 2.3f; // default-mode V-Ray -> Karma calibration (tunable)
+static constexpr float kUnits0Gain      = 3.0f; // default-mode V-Ray -> Karma calibration (tunable)
 
 static float _NormalizeEmissionWeight(float multiplier, int units)
 {

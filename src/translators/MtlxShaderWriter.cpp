@@ -305,6 +305,16 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         local cls = classOf tex
         -- Leaf detectors first (identical to the pre-fix behavior).
         if cls == Bitmaptexture then return tex.filename
+        -- MAX-MTLX-VRAYHDRI-015: V-Ray arch-viz maps (VRayHDRI / VRayBitmap) store their file path in
+        -- .HDRIMapName, NOT .filename/.bitmap. Without this leaf a texture-driven VRayMtl diffuse slot
+        -- resolves to nothing -> the dangling NodeGraph output is pruned to the material's flat
+        -- placeholder constant (the green SEAT_FAB_BASE / EAST_TILE_BLUE / WALL_PAINT_WHITE symptom, and
+        -- the flat-white graphic screens). Probed before the generic #filename branch so the V-Ray
+        -- canonical property wins over an empty/legacy #filename on the same node.
+        if (isProperty tex #HDRIMapName) then (
+            local hn = getProperty tex #HDRIMapName
+            if hn != undefined and hn != "" then return hn
+        )
         if (isProperty tex #filename) then (
             local fname = getProperty tex #filename
             if fname != undefined and fname != "" then return fname

@@ -530,7 +530,7 @@ constexpr float kIntensityCeiling    = 10000.0f; // nit-scale, tone-mapper safe.
 // LastResortMtlxShaderWriter's kUnits0Gain — keep the two in sync) brings units=0 area lights up to
 // match the vray-baseline. The arena's area lights are ALL units=0 (mult 1.5..85), so this is the
 // dominant lever for the ~2x aerial dimness. Single knob to tune against baseline mean (~62/255).
-constexpr float kUnits0Gain          = 2.3f;
+constexpr float kUnits0Gain          = 3.0f;
 
 float _NormalizeVRayLightIntensity(float multiplier, int units, bool hasUnits)
 {
