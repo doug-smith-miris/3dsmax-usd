@@ -71,6 +71,14 @@ namespace {
 //   useTemp|<bool>          -- true if temperature is the active driver
 //   iesFile|<path>          -- VRayIES: IES profile path (may be empty)
 //   sunTurbidity|<float>    -- VRaySun: atmosphere turbidity multiplier
+//   units|<int>             -- VRayLight units enum (MAX-LIT-INTENSITY-UNITS-005):
+//                              0 = default (0-1 color multiplier, arbitrary scale)
+//                              1 = lumens (total luminous flux)
+//                              2 = lm/m²/sr = cd/m² = nits (luminance;
+//                                  matches USD's physical convention on area lights
+//                                  with normalize=true)
+//                              3 = watts (total radiant flux)
+//                              4 = W/m²/sr (radiance)
 //
 // Any line whose value cannot be probed is omitted. Absent lines mean
 // "use the GenLight default" in the caller.
@@ -113,6 +121,9 @@ static const TSTR discoverMaxVrayLightFn = LR"(
         if (isProperty obj #turbidity) then (
             result += ("sunTurbidity|" + ((getProperty obj #turbidity) as string) + "\n")
         )
+        if (isProperty obj #units) then (
+            result += ("units|" + ((getProperty obj #units) as string) + "\n")
+        )
         if (isProperty obj #enabled) then (
             result += ("enabled|" + ((getProperty obj #enabled) as string) + "\n")
         )
@@ -143,6 +154,16 @@ struct VRayLightProbe
     std::string iesFile;
     bool        hasEnabled { false };
     bool        enabled { true };
+    // MAX-LIT-INTENSITY-UNITS-005: VRayLight `.units` selector.
+    //   0 = default (0-1 color, arbitrary scale)
+    //   1 = lumens (total luminous flux)
+    //   2 = lm/m²/sr = cd/m² = nits (matches UsdLux normalize=true convention)
+    //   3 = watts (total radiant flux)
+    //   4 = W/m²/sr (radiance)
+    // hasUnits=false means the source scene had no `.units` (very old V-Ray or
+    // a light class without the property) -> treat as mode 0 (pass-through).
+    bool        hasUnits { false };
+    int         units { 0 };
 };
 
 VRayLightProbe _ProbeVRayLight(INode* node)
@@ -219,6 +240,16 @@ VRayLightProbe _ProbeVRayLight(INode* node)
                     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 }
                 probe.enabled = !(v == "false" || v == "0");
+            } else if (key == "units") {
+                // MAX-LIT-INTENSITY-UNITS-005: only the documented 0..4 modes
+                // are honored; anything outside that range falls back to 0
+                // (author-scale pass-through) rather than trusting a
+                // malformed manifest to drive a physical normalization.
+                const int u = std::stoi(val);
+                if (u >= 0 && u <= 4) {
+                    probe.hasUnits = true;
+                    probe.units = u;
+                }
             }
         } catch (const std::exception&) {
             // Ignore parse errors — the field stays at its default.
@@ -253,9 +284,13 @@ VRayLightProbe _ProbeVRayLight(INode* node)
 //                       — MUST NOT author: shaping:ies:file, width, height, angle
 //   unknown          -> RectLight     (V-Ray's out-of-box default; must not drop)
 //
-// Intensity is passed through VERBATIM from GenLight::GetIntensity() on every
-// branch — no unit conversion, no scaling. IES asset path is written verbatim
-// via SdfAssetPath — no relative rewriting or drive-letter normalization.
+// Intensity is normalized to UsdLux's physical (nit-scale) convention via
+// `_NormalizeVRayLightIntensity` (MAX-LIT-INTENSITY-UNITS-005). The
+// normalization key is `.units` (0..4), NOT the light shape — so the value
+// applied is IDENTICAL across every branch above (rect/sphere/disk/distant/dome),
+// preserving the original MAX-LIT-003 "no per-branch scaling" invariant. IES
+// asset path is written verbatim via SdfAssetPath — no relative rewriting or
+// drive-letter normalization.
 // A wildcard refactor that widens any of these branches must fail the
 // MAX-LIT-003 scope-audit test suite (src/Tests/Integration/test_miris_max_lit_003.py)
 // BEFORE landing — that's the safety catch.
@@ -297,6 +332,92 @@ TfToken _ClassifyVRayLight(const VRayLightProbe& probe)
     // Unknown VRayLight subtype: prefer RectLight (V-Ray's default `type`
     // out of the box is Plane, so this recovers the common case).
     return pxr::MaxUsdPrimTypeTokens->RectLight;
+}
+
+// MAX-LIT-INTENSITY-UNITS-005 — normalize VRayLight's intensity value to
+// UsdLux's physical convention (candela / nit-scale, with normalize=true).
+//
+// Prior to this fix, `GenLight::GetIntensity()` was passed VERBATIM to
+// `UsdLuxLight.inputs:intensity`. But VRayLight has a `.units` selector that
+// changes the meaning of that scalar entirely — the same multiplier of `2000`
+// means 2000 lumens (units=1) OR 2000 nits (units=2) OR 2000 watts (units=3),
+// which differ by orders of magnitude in physical brightness. A scoreboard
+// authored at `.multiplier=2000, .units=1` (2000 lumens) and a jumbotron at
+// `.multiplier=2000, .units=2` (2000 nits) emitted at the SAME USD intensity
+// pre-fix, so Karma rendered them identically — both saturating past its
+// tone-mapper's headroom for the units=2 case where the value is physically
+// plausible, and orders-of-magnitude too bright for the units=1 case where
+// the value was total flux, not surface luminance.
+//
+// USD/UsdLux with `normalize=true` (which the writer sets on every branch —
+// see the Write() body's normalize author) treats the intensity scalar as a
+// per-unit-area radiance analog: for area lights the value acts as
+// cd/m² (nit) scale, which IS the physical convention units=2 already
+// represents (lm/m²/sr = cd/m² = nit). Other units need conversion:
+//
+//   units=0 (default 0-1 color):    pass-through — mode 0 is
+//                                    "arbitrary artistic scale", not
+//                                    physical; nothing to convert.
+//   units=1 (lumens, total flux):   divide by pi to approximate a
+//                                    Lambertian emitter's average luminance
+//                                    (nit ≈ lumens / (pi * area); with
+//                                    normalize=true USD handles area, so
+//                                    only the pi factor remains).
+//   units=2 (lm/m²/sr = nits):      pass-through — already USD's convention.
+//   units=3 (watts, radiant flux):  multiply by the photopic-peak luminous
+//                                    efficacy (683 lm/W) to convert to
+//                                    lumens, then divide by pi (as units=1).
+//   units=4 (W/m²/sr, radiance):    multiply by 683 — radiance -> luminance.
+//
+// Then clamp to [0, kIntensityCeiling] so a malformed multiplier can't drive
+// the light past a value that breaks Karma's tone-mapper. The 10000 nit
+// ceiling is empirical: brighter than the peak of the brightest commercial
+// LED wall (~5000 nits), lower than values that reliably flat-white every
+// tone-map operator. `TestIntensityCeiling.test_ceiling_is_10000` in the
+// hython mirror locks this in as a contract; a future Karma tone-mapper
+// change may want it bumped.
+//
+// Negative multipliers clamp to 0 to match Max's non-negative UI convention;
+// hasUnits=false (very old V-Ray or a light class with no `.units` property
+// at all) falls through to units=0 pass-through so pre-`.units` scenes
+// keep their pre-013 behavior.
+constexpr float kIntensityPi         = 3.14159265358979323846f;
+constexpr float kIntensityPhotopicK  = 683.0f;   // Photopic peak, lm/W.
+constexpr float kIntensityCeiling    = 10000.0f; // nit-scale, tone-mapper safe.
+
+float _NormalizeVRayLightIntensity(float multiplier, int units, bool hasUnits)
+{
+    // Non-physical / absent-manifest -> pass-through (with negative clamp).
+    float base = multiplier;
+    if (hasUnits) {
+        switch (units) {
+        case 0: // Default: arbitrary artistic scale.
+            base = multiplier;
+            break;
+        case 1: // Lumens (total luminous flux) -> nits (Lambertian).
+            base = multiplier / kIntensityPi;
+            break;
+        case 2: // lm/m²/sr = cd/m² = nits: already USD's convention.
+            base = multiplier;
+            break;
+        case 3: // Watts -> lumens -> nits.
+            base = (multiplier * kIntensityPhotopicK) / kIntensityPi;
+            break;
+        case 4: // W/m²/sr -> nits via photopic peak.
+            base = multiplier * kIntensityPhotopicK;
+            break;
+        default:
+            base = multiplier;
+            break;
+        }
+    }
+    if (base < 0.f) {
+        base = 0.f;
+    }
+    if (base > kIntensityCeiling) {
+        base = kIntensityCeiling;
+    }
+    return base;
 }
 
 } // namespace
@@ -516,14 +637,22 @@ bool MaxUsdVRayLightWriter::Write(
         }
     }
 
-    // Color + intensity. GenLight gives us both in canonical units; the
-    // temperature branch mirrors PhotometricLightWriter so downstream
-    // consumers treat V-Ray and Autodesk photometric lights identically.
+    // Color + intensity. GenLight gives us the raw multiplier; VRayLight's
+    // `.units` selector determines whether that scalar means lumens, nits,
+    // watts, or a non-physical scale — see `_NormalizeVRayLightIntensity`
+    // above for the full derivation. MAX-LIT-INTENSITY-UNITS-005 routes
+    // every branch (Rect/Sphere/Disk/Distant/Dome) through the same
+    // normalizer so a 2000-lumen scoreboard and a 2000-nit jumbotron no
+    // longer emit at identical USD intensities. The temperature branch
+    // mirrors PhotometricLightWriter so downstream consumers treat V-Ray
+    // and Autodesk photometric lights identically.
     if (genLight != nullptr) {
         Interval  ivColor = FOREVER;
         Interval  ivIntensity = FOREVER;
         const Point3 rgb = genLight->GetRGBColor(timeVal, ivColor);
-        const float  intensity = genLight->GetIntensity(timeVal, ivIntensity);
+        const float  rawIntensity = genLight->GetIntensity(timeVal, ivIntensity);
+        const float  intensity = _NormalizeVRayLightIntensity(
+            rawIntensity, probe.units, probe.hasUnits);
 
         const pxr::GfVec3f usdColor { rgb[0], rgb[1], rgb[2] };
         if (boundableLight) {
