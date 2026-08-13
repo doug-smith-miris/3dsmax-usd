@@ -46,6 +46,7 @@
 #include <render.h>
 #include <stdmat.h>
 #include <triobj.h>
+#include <vector>
 
 namespace MAXUSD_NS_DEF {
 
@@ -62,6 +63,100 @@ class MeshRenderNullView : public View
 public:
     Point2 ViewToScreen(Point3 p) override { return Point2 {}; }
 };
+
+// Build one combined render Mesh from a GeomObject for MAX-MESH-RENDER-001. Instanced generators
+// (RailClone, Forest scatter) expose their geometry as MULTIPLE render-mesh parts — each a unique
+// segment mesh plus a per-instance transform (NumberOfRenderMeshes / GetMultipleRenderMesh /
+// GetMultipleRenderMeshTM). A single GetRenderMesh() call returns only a proxy/box (or nothing) for
+// those, which is why a RailClone seating array exports as a field of cubes. Merge every part —
+// vertices baked through their instance TMs, faces re-indexed, material-ID + smoothing flags carried
+// over via the copied Face — into one Mesh so the full generated geometry reaches USD. Objects that
+// expose a single render mesh (the common case) have NumberOfRenderMeshes()==0 and fall through to the
+// plain GetRenderMesh() path. Returns a newly-allocated Mesh (free with delete) or nullptr when no
+// render geometry is available.
+Mesh* BuildCombinedRenderMesh(GeomObject* geomObj, INode* node, TimeValue t, View& view)
+{
+    const int numParts = geomObj->NumberOfRenderMeshes();
+    if (numParts <= 0) {
+        BOOL  needDelete = FALSE;
+        Mesh* rm = geomObj->GetRenderMesh(t, node, view, needDelete);
+        if (rm == nullptr || rm->getNumVerts() == 0) {
+            if (rm != nullptr && needDelete) {
+                rm->DeleteThis();
+            }
+            return nullptr;
+        }
+        Mesh* out = new Mesh(*rm);
+        if (needDelete) {
+            rm->DeleteThis();
+        }
+        return out;
+    }
+
+    struct Part
+    {
+        Mesh*   mesh;
+        BOOL    needDelete;
+        Matrix3 tm;
+    };
+    std::vector<Part> parts;
+    parts.reserve(numParts);
+    int totalVerts = 0;
+    int totalFaces = 0;
+    for (int i = 0; i < numParts; ++i) {
+        BOOL  needDelete = FALSE;
+        Mesh* pm = geomObj->GetMultipleRenderMesh(t, node, view, needDelete, i);
+        if (pm == nullptr || pm->getNumVerts() == 0 || pm->getNumFaces() == 0) {
+            if (pm != nullptr && needDelete) {
+                pm->DeleteThis();
+            }
+            continue;
+        }
+        Matrix3  tm;
+        Interval iv = FOREVER;
+        tm.IdentityMatrix();
+        geomObj->GetMultipleRenderMeshTM(t, node, view, i, tm, iv);
+        parts.push_back({ pm, needDelete, tm });
+        totalVerts += pm->getNumVerts();
+        totalFaces += pm->getNumFaces();
+    }
+    if (parts.empty() || totalVerts == 0) {
+        for (auto& p : parts) {
+            if (p.needDelete) {
+                p.mesh->DeleteThis();
+            }
+        }
+        return nullptr;
+    }
+
+    Mesh* out = new Mesh();
+    out->setNumVerts(totalVerts);
+    out->setNumFaces(totalFaces);
+    int vOff = 0;
+    int fOff = 0;
+    for (auto& p : parts) {
+        const int nv = p.mesh->getNumVerts();
+        const int nf = p.mesh->getNumFaces();
+        for (int v = 0; v < nv; ++v) {
+            out->setVert(vOff + v, p.tm * p.mesh->getVert(v));
+        }
+        for (int f = 0; f < nf; ++f) {
+            Face& src = p.mesh->faces[f];
+            Face& dst = out->faces[fOff + f];
+            dst = src; // copies smoothing group + material-ID flags
+            dst.v[0] = src.v[0] + vOff;
+            dst.v[1] = src.v[1] + vOff;
+            dst.v[2] = src.v[2] + vOff;
+        }
+        vOff += nv;
+        fOff += nf;
+        if (p.needDelete) {
+            p.mesh->DeleteThis();
+        }
+    }
+    out->InvalidateGeomCache();
+    return out;
+}
 } // namespace
 
 pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
@@ -188,20 +283,22 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
     GeomObject* geomObj = dynamic_cast<GeomObject*>(obj);
     if (!originalTriObject && !originalPolyObject && geomObj != nullptr) {
         MeshRenderNullView nullView;
-        BOOL               renderMeshNeedsDelete = FALSE;
-        Mesh*              renderMesh
-            = geomObj->GetRenderMesh(timeFrame.GetMaxTime(), node, nullView, renderMeshNeedsDelete);
-        if (renderMesh != nullptr && renderMesh->getNumVerts() > 0
-            && (meshFacade == nullptr || renderMesh->getNumVerts() > meshFacade->VertexCount())) {
-            // getMeshFacadeFromTri copies the mesh it is handed, so the render mesh can be released
-            // afterwards if Max asked us to (renderMeshNeedsDelete).
-            meshFacade = getMeshFacadeFromTri(new Mesh { *renderMesh }, true, convertToPoly);
-            // The render mesh is generated for this instant; its validity cannot be described by the
-            // pipeline object's geom-channel intervals, so restrict exported samples to this instant.
-            channelIntervals = GetInstantChannelIntervals(timeFrame.GetMaxTime());
-        }
-        if (renderMesh != nullptr && renderMeshNeedsDelete) {
-            renderMesh->DeleteThis();
+        // BuildCombinedRenderMesh returns a single newly-allocated Mesh (freed with delete): the merged
+        // multi-part render geometry for instanced generators (RailClone/Forest), or the single render
+        // mesh otherwise, or nullptr when none is available.
+        Mesh* renderMesh
+            = BuildCombinedRenderMesh(geomObj, node, timeFrame.GetMaxTime(), nullView);
+        if (renderMesh != nullptr) {
+            if (renderMesh->getNumVerts() > 0
+                && (meshFacade == nullptr || renderMesh->getNumVerts() > meshFacade->VertexCount())) {
+                // getMeshFacadeFromTri takes ownership of (and eventually frees) the mesh it is handed.
+                meshFacade = getMeshFacadeFromTri(renderMesh, true, convertToPoly);
+                // The render mesh is generated for this instant; its validity cannot be described by
+                // the pipeline object's geom-channel intervals, so restrict export to this instant.
+                channelIntervals = GetInstantChannelIntervals(timeFrame.GetMaxTime());
+            } else {
+                delete renderMesh;
+            }
         }
     }
 
