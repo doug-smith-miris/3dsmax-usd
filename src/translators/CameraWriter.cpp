@@ -15,7 +15,10 @@
 //
 #include "CameraWriter.h"
 
+#include <cmath>
 #include <fstream>
+#include <sstream>
+#include <string>
 
 #include <MaxUsd/Translators/primWriter.h>
 #include <MaxUsd/Translators/writeJobContext.h>
@@ -31,7 +34,211 @@
 
 #include <Scene/IPhysicalCamera.h>
 
+#include <maxscript/maxscript.h>
+#include <maxscript/foundation/functions.h>
+#include <maxscript/util/listener.h>
+
 PXR_NAMESPACE_OPEN_SCOPE
+
+namespace {
+
+// MAX-CAM-002: Probe a non-IPhysicalCamera source camera object (i.e. a
+// third-party physical camera such as VRayPhysicalCamera) for the
+// photographic-exposure triple. V-Ray physical cameras do NOT derive from
+// MaxSDK::IPhysicalCamera so the standard `dynamic_cast<IPhysicalCamera*>`
+// path in CameraWriter::Write returns nullptr; before this bite the writer
+// then falls into the "plain camera" else-branch that never authors an
+// exposure and every UsdGeomCamera in a V-Ray-authored scene ships with
+// the schema default exposure=0. That silently under-exposes every
+// downstream Karma / Storm / Hydra render vs. the V-Ray ground truth.
+//
+// The probe is a MAXScript helper we invoke via ExecuteMAXScriptScript
+// (same pattern as MAX-LIT-002's discoverMaxVrayLight). It returns a
+// pipe-delimited manifest, one line per probed field. Absent lines mean
+// "field not authored" and the C++ caller leaves the corresponding has*
+// flag at false. Fields probed:
+//
+//   className|<VRayPhysicalCamera | VRayPhysicalCameraObj | ...>
+//   exposureEnabled|<bool>   -- V-Ray physical-exposure enable flag
+//                              (`.exposure`, a bool). When false, V-Ray
+//                              renders without a per-camera exposure
+//                              response and we must NOT author a value.
+//   exposureValue|<float>    -- direct EV override (`.exposure_value`)
+//                              when the V-Ray plugin authored one. This
+//                              short-circuits the f-number/shutter/ISO
+//                              triple below.
+//   fNumber|<float>          -- aperture f-stop (`.f_number`).
+//   shutterSpeed|<float>     -- inverse shutter time in Hz
+//                              (`.shutter_speed`; e.g. 60 = 1/60 s).
+//   filmSpeed|<float>        -- sensor speed / ISO (`.film_speed`).
+//
+// Anything that isn't a bona-fide V-Ray-style physical camera returns an
+// empty manifest and the caller leaves the schema default in place — the
+// existing "plain camera" warning path is preserved byte-identical.
+static const TSTR discoverMaxCameraExposureFn = LR"(
+    fn discoverMaxCameraExposure nodeAnimHandle = (
+        local n = getAnimByHandle nodeAnimHandle
+        local result = ""
+        if n == undefined then return result
+        local obj = n
+        if (isProperty n #baseobject) then obj = n.baseobject
+        if obj == undefined then return result
+        local cn = (classOf obj) as string
+        result += ("className|" + cn + "\n")
+        if (isProperty obj #exposure) then (
+            local ex = getProperty obj #exposure
+            if ex != undefined then (
+                result += ("exposureEnabled|" + (ex as string) + "\n")
+            )
+        )
+        if (isProperty obj #exposure_value) then (
+            local ev = getProperty obj #exposure_value
+            if ev != undefined then (
+                result += ("exposureValue|" + (ev as string) + "\n")
+            )
+        )
+        if (isProperty obj #f_number) then (
+            result += ("fNumber|" + ((getProperty obj #f_number) as string) + "\n")
+        )
+        if (isProperty obj #shutter_speed) then (
+            result += ("shutterSpeed|" + ((getProperty obj #shutter_speed) as string) + "\n")
+        )
+        if (isProperty obj #film_speed) then (
+            result += ("filmSpeed|" + ((getProperty obj #film_speed) as string) + "\n")
+        )
+        return result
+    )
+    discoverMaxCameraExposure )";
+
+// Parsed manifest returned by discoverMaxCameraExposureFn. Every field is
+// optional; the caller's _ComputeCameraExposureFromProbe treats a missing
+// field as "not authored" and refuses to invent a value.
+struct CameraExposureProbe
+{
+    std::string className;
+    bool        hasExposureEnabled { false };
+    bool        exposureEnabled { true };
+    bool        hasExposureValue { false };
+    float       exposureValue { 0.f };
+    bool        hasFNumber { false };
+    float       fNumber { 0.f };
+    bool        hasShutterSpeed { false };
+    float       shutterSpeed { 0.f };
+    bool        hasFilmSpeed { false };
+    float       filmSpeed { 0.f };
+};
+
+CameraExposureProbe _ProbeCameraExposure(INode* node)
+{
+    CameraExposureProbe probe;
+    if (node == nullptr) {
+        return probe;
+    }
+    const AnimHandle animHandle = ::Animatable::GetHandleByAnim(node);
+    if (animHandle == 0) {
+        return probe;
+    }
+    FPValue rvalue;
+    rvalue.Init();
+    std::wstringstream ss;
+    ss << discoverMaxCameraExposureFn << animHandle << L'\0';
+    ExecuteMAXScriptScript(
+        ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue);
+    const auto manifest = MaxUsd::MaxStringToUsdString(rvalue.s);
+    if (manifest.empty()) {
+        return probe;
+    }
+
+    for (size_t start = 0; start <= manifest.size();) {
+        auto        nl = manifest.find('\n', start);
+        std::string line;
+        if (nl == std::string::npos) {
+            line = manifest.substr(start);
+            start = manifest.size() + 1;
+        } else {
+            line = manifest.substr(start, nl - start);
+            start = nl + 1;
+        }
+        while (!line.empty()
+               && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            continue;
+        }
+        auto pipe = line.find('|');
+        if (pipe == std::string::npos) {
+            continue;
+        }
+        auto key = line.substr(0, pipe);
+        auto val = line.substr(pipe + 1);
+        try {
+            if (key == "className") {
+                probe.className = val;
+            } else if (key == "exposureEnabled") {
+                std::string v = val;
+                for (auto& c : v) {
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+                probe.hasExposureEnabled = true;
+                probe.exposureEnabled = !(v == "false" || v == "0");
+            } else if (key == "exposureValue") {
+                probe.hasExposureValue = true;
+                probe.exposureValue = std::stof(val);
+            } else if (key == "fNumber") {
+                probe.hasFNumber = true;
+                probe.fNumber = std::stof(val);
+            } else if (key == "shutterSpeed") {
+                probe.hasShutterSpeed = true;
+                probe.shutterSpeed = std::stof(val);
+            } else if (key == "filmSpeed") {
+                probe.hasFilmSpeed = true;
+                probe.filmSpeed = std::stof(val);
+            }
+        } catch (const std::exception&) {
+            // Absent / malformed value — leave the field's has* flag at false.
+        }
+    }
+    return probe;
+}
+
+// Turn a parsed CameraExposureProbe into a UsdGeomCamera.exposure value
+// (in stops), matching the existing Autodesk-IPhysicalCamera path's
+// convention of authoring the *photographic* EV directly (see
+// `maxPhysicalCamera->GetEffectiveEV` a few lines below in Write()). The
+// output unit is stops relative to ISO-100 / f/1 / 1-second, i.e.
+// `EV_100 = log2(f_number^2 * shutter_speed * 100 / film_speed)` given
+// V-Ray's shutter_speed convention of 1/N seconds (so a shutter_speed
+// value of 60 encodes t = 1/60 s → f_number^2 / t = f_number^2 * 60).
+//
+// Returns std::pair<bool, float> where the bool indicates whether a
+// value was successfully computed. When false, the caller MUST NOT
+// author an exposure attribute — the schema default 0 is the correct
+// "no exposure metadata authored" state for a plain (non-physical)
+// camera, per the bite scope.
+//
+// The exposure-enabled bool from V-Ray gates the whole result: when the
+// artist disables physical exposure on the V-Ray camera V-Ray renders
+// through a linear response with no per-camera stops adjustment, and
+// authoring a value would drift Karma away from the intended look.
+std::pair<bool, float> _ComputeCameraExposureFromProbe(const CameraExposureProbe& probe)
+{
+    if (probe.hasExposureEnabled && !probe.exposureEnabled) {
+        return { false, 0.f };
+    }
+    if (probe.hasExposureValue) {
+        return { true, probe.exposureValue };
+    }
+    if (probe.hasFNumber && probe.hasShutterSpeed && probe.hasFilmSpeed
+        && probe.fNumber > 0.f && probe.shutterSpeed > 0.f && probe.filmSpeed > 0.f) {
+        const float ev = std::log2(
+            probe.fNumber * probe.fNumber * probe.shutterSpeed * 100.f / probe.filmSpeed);
+        return { true, ev };
+    }
+    return { false, 0.f };
+}
+
+} // anonymous namespace
 
 MaxUsdCameraWriter::MaxUsdCameraWriter(const MaxUsdWriteJobContext& jobCtx, INode* node)
     : MaxUsdPrimWriter(jobCtx, node)
@@ -594,6 +801,22 @@ bool MaxUsdCameraWriter::Write(
                     verticalAperture = w / aspect;
                 }
                 usdCamera.CreateVerticalApertureAttr().Set(verticalAperture);
+            }
+        }
+
+        // MAX-CAM-002: exposure for non-IPhysicalCamera physical cameras
+        // (VRayPhysicalCamera and other third-party plugin cameras that
+        // do not derive from MaxSDK::IPhysicalCamera). Before this bite
+        // the writer left the schema-default exposure=0 on every
+        // V-Ray-authored camera, silently under-exposing all downstream
+        // Karma / Hydra renders vs. the V-Ray ground truth. Plain
+        // (non-physical) cameras with no probeable exposure triple keep
+        // the schema default so the fix is a no-op for them.
+        {
+            const auto probe = _ProbeCameraExposure(sourceNode);
+            const auto exposureResult = _ComputeCameraExposureFromProbe(probe);
+            if (exposureResult.first) {
+                usdCamera.CreateExposureAttr().Set(exposureResult.second, usdTimeCode);
             }
         }
     }
