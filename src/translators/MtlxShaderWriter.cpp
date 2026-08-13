@@ -425,7 +425,8 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
                             append out sub
                         )
                     )
-                )
+)"
+        LR"(                )
             )
         )
         if cls == "VRayOverrideMtl" then (
@@ -529,8 +530,7 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         --     layer as `.texmap_reflectionIOR` / `.texmap_refractionIOR`).
         -- MAX-MTLX-010: anisotropy + anisotropy-rotation maps
         -- (`specular_anisotropy` / `specular_rotation` on
-)"
-        LR"(        -- ND_standard_surface — both float, port defaults 0.0). Prior
+        -- ND_standard_surface — both float, port defaults 0.0). Prior
         -- to this fix the slotMap covered NO anisotropy slots at all,
         -- so every VRayMtl brushed-metal / anisotropic-fabric / carbon-
         -- fiber material silently exported with anisotropy locked at
@@ -556,7 +556,8 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         -- Displacement maps are ALSO silently dropped
         -- (`evidence-slotmap-and-wrappers.md:30`), but ND_standard_surface
         -- has no displacement input (verified via
-        -- `mx.getNodeDef("ND_standard_surface_surfaceshader")` — displacement
+)"
+        LR"(        -- `mx.getNodeDef("ND_standard_surface_surfaceshader")` — displacement
         -- is on the MaterialX <material>'s `outputs:displacement` via
         -- a separate `ND_displacement_float` / `ND_displacement_vector3`
         -- node, not a shader input). A slotMap-only fix like this
@@ -672,7 +673,8 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
             -- right thing (no sRGB decode of scalar roughness).
             #("trans_roughness_map",         "transmission_extra_roughness", "float"),
             #("transRoughnessMap",           "transmission_extra_roughness", "float"),
-            #("transmission_roughness_map",  "transmission_extra_roughness", "float"),
+)"
+        LR"(            #("transmission_roughness_map",  "transmission_extra_roughness", "float"),
             #("transmissionRoughnessMap",    "transmission_extra_roughness", "float"),
             #("sheen_roughness_map",         "sheen_roughness",              "float"),
             #("sheenRoughnessMap",           "sheen_roughness",              "float")
