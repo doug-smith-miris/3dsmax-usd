@@ -863,6 +863,57 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
             #("normalMap",              "normal",             "vector3"),
             #("emit_color_map",         "emission_color",     "color3"),
             #("emissionColorMap",       "emission_color",     "color3"),
+            -- MAX-MTLX-SELFILLUM-NONVRAY-019 additions: scalar
+            -- emission-weight maps on non-VRayLightMtl emissive
+            -- materials. Complements MAX-MTLX-EMISSIVE-UNITS-013
+            -- (which fixes VRayLightMtl weight-into-color baking on
+            -- the LastResortMtlxShaderWriter path — a DIFFERENT
+            -- .cpp file). 019 fixes the non-VRay PhysicalMaterial-
+            -- based / OpenPBR-based emissive path routed through
+            -- THIS writer: the pre-existing `emit_color_map` /
+            -- `emissionColorMap` entries above only cover the
+            -- COLOR emission slot (routed to
+            -- `ND_standard_surface.emission_color`, color3),
+            -- leaving the SCALAR emission-weight map slot
+            -- silently dropped. All entries route to
+            -- `ND_standard_surface.emission` (scalar weight, float,
+            -- port default 0.0) — the port that actually turns the
+            -- emission BRDF on. Symptom pre-fix: LED text signage,
+            -- warm-tungsten practicals, and glowing-edge materials
+            -- authored as PhysicalMaterial / OpenPBR (rather than
+            -- VRayLightMtl) fell through with `emission=0` locked
+            -- at the ND_standard_surface port default, so Karma
+            -- rendered them as unlit surfaces regardless of the
+            -- source scene's self_illum / emission_weight map. See
+            -- `agent/pipeline-runs/40dca678-.../evidence/gaps-audit.md`
+            -- S5. Slot precedence: PhysicalMaterial spellings first
+            -- (`self_illum_map` / `emit_intensity_map`) then OpenPBR
+            -- (`emission_weight_map`, mat_def:236), matching every
+            -- other family in the slotMap. Snake_case before
+            -- camelCase within each spelling family. No colorspace
+            -- attribute is authored (`float` scalar, not `color3` —
+            -- the existing type gate in `_EnrichMtlxDocFromMaxMaterial`
+            -- does the right thing; an sRGB decode of an emission-
+            -- weight scalar would silently dim the emitter by the
+            -- gamma curve). Ordering: placed immediately after the
+            -- emission_color entries so all emission-family slotMap
+            -- entries live in one contiguous block — matches the
+            -- ordering conventions established by MTLX-009 (IOR
+            -- family) and MTLX-011 (transmission-roughness family).
+            -- The wrapper walk (MAX-MTLX-007 `unwrapBlendMaterialSubMtls`,
+            -- extended for Composite / Blend by MTLX-014) applies
+            -- because slotMap iteration lives inside
+            -- `for currentMat in subMtls do` — VRayBlendMtl /
+            -- VRayOverrideMtl / CompositeMtl / stock Blend unwrap
+            -- identically for the new entries, and baseMtl's
+            -- emission weight wins over any coat's / per-ray
+            -- override's under first-hit-wins.
+            #("self_illum_map",         "emission",           "float"),
+            #("selfIllumMap",           "emission",           "float"),
+            #("emit_intensity_map",     "emission",           "float"),
+            #("emitIntensityMap",       "emission",           "float"),
+            #("emission_weight_map",    "emission",           "float"),
+            #("emissionWeightMap",      "emission",           "float"),
             #("refl_color_map",         "specular_color",     "color3"),
             #("specularColorMap",       "specular_color",     "color3"),
             -- MAX-MTLX-VRAYMTL-REFLECTION-TINT-017 addition: VRayMtl
