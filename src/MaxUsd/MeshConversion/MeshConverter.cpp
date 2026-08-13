@@ -182,11 +182,15 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
     // way and is therefore left untouched, while a RailClone box proxy has far fewer vertices than its
     // real seats and is correctly upgraded. Editable meshes/polys never enter this branch, so quad
     // topology and geom-channel validity intervals are preserved for all hand-authored geometry.
-    if (!originalTriObject && !originalPolyObject) {
+    // GetRenderMesh() is declared on GeomObject (the renderable-geometry subclass), not the base
+    // Object, so cast first. Every object that reaches this converter is geometry, but guard the cast
+    // anyway and simply fall back to the viewport mesh if it is somehow not a GeomObject.
+    GeomObject* geomObj = dynamic_cast<GeomObject*>(obj);
+    if (!originalTriObject && !originalPolyObject && geomObj != nullptr) {
         MeshRenderNullView nullView;
         BOOL               renderMeshNeedsDelete = FALSE;
         Mesh*              renderMesh
-            = obj->GetRenderMesh(timeFrame.GetMaxTime(), node, nullView, renderMeshNeedsDelete);
+            = geomObj->GetRenderMesh(timeFrame.GetMaxTime(), node, nullView, renderMeshNeedsDelete);
         if (renderMesh != nullptr && renderMesh->getNumVerts() > 0
             && (meshFacade == nullptr || renderMesh->getNumVerts() > meshFacade->VertexCount())) {
             // getMeshFacadeFromTri copies the mesh it is handed, so the render mesh can be released
