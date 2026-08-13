@@ -48,6 +48,7 @@
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/usd/usdGeom/xformOp.h>
 #include <pxr/usd/usdLux/cylinderLight.h>
+#include <pxr/usd/usdLux/meshLightAPI.h>
 
 #include <maxscript/maxwrapper/mxsobjects.h>
 
@@ -864,11 +865,39 @@ bool USDSceneBuilder::BuildStageFromMaxNodes(
     // Set up instancing properties. This triggers stage notifications, which can dramatically
     // slow down the export, for this reason, we wrap all these in a SdfChangeBlock, so that
     // the stage can process all the notifications at the same time, quickly.
+    // Karma (and other Hydra renderers) CANNOT create geometry lights from instanced
+    // prototypes -- husk logs "Failed to assign source object for the geometry light" and the
+    // mesh silently stops emitting. Arch-viz arenas instance their ceiling fixtures (light
+    // banks, recessed cans, hex fixtures) heavily, so making those prims instanceable disables
+    // ALL of the room lighting. Collect prototypes whose subtree carries a MeshLightAPI once,
+    // then leave their instances de-instanced: the inherit still composes the geometry, we only
+    // skip SetInstanceable, so the geometry light survives. The extra geometry is paid by the
+    // small number of emissive light meshes only.
+    std::set<pxr::SdfPath> meshLightPrototypes;
+    for (const auto& pair : instanceToPrototype) {
+        if (meshLightPrototypes.find(pair.second) != meshLightPrototypes.end()) {
+            continue;
+        }
+        auto protoPrim = stage->GetPrimAtPath(pair.second);
+        if (!protoPrim) {
+            continue;
+        }
+        for (const auto& descendant : pxr::UsdPrimRange::AllPrims(protoPrim)) {
+            if (descendant.HasAPI<pxr::UsdLuxMeshLightAPI>()) {
+                meshLightPrototypes.insert(pair.second);
+                break;
+            }
+        }
+    }
+
     {
         pxr::SdfChangeBlock instancingSetup;
         for (const auto& pair : instanceToPrototype) {
             auto prim = stage->GetPrimAtPath(pair.first);
             prim.GetInherits().AddInherit(pair.second);
+            if (meshLightPrototypes.find(pair.second) != meshLightPrototypes.end()) {
+                continue;
+            }
             prim.SetInstanceable(true);
         }
     }

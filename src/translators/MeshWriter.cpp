@@ -79,6 +79,38 @@ bool _TreeHasTransparentMtl(Mtl* mtl, int depth = 0)
     }
     return false;
 }
+
+// MAX-MTLX-005 (mesh-light guard): true if a VRayLightMtl in the tree has a texture map assigned
+// -- i.e. it is a textured DISPLAY (video board, LED ribbon, backlit signage) rather than a
+// uniform light fixture. A textured emitter driven as a whole-mesh geometry light renders as a
+// flat WHITE panel in Karma (the geometry light samples a single averaged color, not the content
+// image), which is why the center-hung videoboard and ribbon boards blew out. Routed instead
+// through the emission surface shader, the content image shows correctly. Uniform fixtures
+// (recessed cans, bulbs, light banks) have no texmap, so they keep the geometry light and still
+// illuminate the room.
+bool _TreeHasTexturedVRayLight(Mtl* mtl, int depth = 0)
+{
+    if (mtl == nullptr || depth > 8) {
+        return false;
+    }
+    MSTR className;
+    mtl->GetClassName(className);
+    if (wcsstr(className.data(), L"VRayLightMtl") != nullptr) {
+        const int nt = mtl->NumSubTexmaps();
+        for (int i = 0; i < nt; ++i) {
+            if (mtl->GetSubTexmap(i) != nullptr) {
+                return true;
+            }
+        }
+    }
+    const int n = mtl->NumSubMtls();
+    for (int i = 0; i < n; ++i) {
+        if (_TreeHasTexturedVRayLight(mtl->GetSubMtl(i), depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
 } // namespace
 
 MaxUsdMeshWriter::MaxUsdMeshWriter(const MaxUsdWriteJobContext& jobCtx, INode* node)
@@ -148,7 +180,8 @@ bool MaxUsdMeshWriter::Write(
     // fills the room from these emitters. MeshLightAPI derives the emission per-face from the bound
     // material, so only the emissive subset actually emits. Applied once, on the first frame.
     if (time.IsFirstFrame() && _TreeHasVRayLightMtl(sourceNode->GetMtl())
-        && !_TreeHasTransparentMtl(sourceNode->GetMtl())) {
+        && !_TreeHasTransparentMtl(sourceNode->GetMtl())
+        && !_TreeHasTexturedVRayLight(sourceNode->GetMtl())) {
         auto meshPrim = prim.GetPrim();
         if (meshPrim) {
             pxr::UsdLuxMeshLightAPI::Apply(meshPrim);
