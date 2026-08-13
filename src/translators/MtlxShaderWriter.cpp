@@ -388,6 +388,29 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
     --                         color in `LastResortMtlxShaderWriter`; this
     --                         extends the same unwrap to the standard
     --                         texture-map discovery path.
+    --   Composite (stock)   — MAX-MTLX-COMPOSITE-DECAL-014. Stock 3ds Max
+    --                         Composite Mtl. Holds up to 10 sub-materials in
+    --                         `.materialList`; index 1 is the base surface,
+    --                         2..N are overlays stacked upward. Per-layer
+    --                         `.mapEnabled[i]` boolean + `.opacity[i]` scalar
+    --                         gates whether the layer contributes any pixels.
+    --                         Court-line decals (DECAL_/LOGO_ layers on a
+    --                         concrete court PhysicalMaterial base) are the
+    --                         motivating arch-viz use case — pre-014 the
+    --                         entire layer stack was dropped and the
+    --                         Composite fell through to a flat last-resort
+    --                         surface with no textures. Walked base-first so
+    --                         base surface's textures win the first-hit-wins
+    --                         slotMap dedupe; disabled and opacity-0 layers
+    --                         (except the base itself) are skipped.
+    --   Blend (stock)       — MAX-MTLX-COMPOSITE-DECAL-014. Stock 3ds Max
+    --                         Blend material. Two sub-materials (`.map1` is
+    --                         the base, `.map2` is the overlay) mixed by
+    --                         `.mask` texmap + `.mixAmount` scalar. Bicolor
+    --                         floor tiles + two-tone plastics are the
+    --                         motivating arch-viz use case. Walked map1-first
+    --                         so base's textures win first-hit-wins; per-side
+    --                         `.mapNEnabled` flags are respected.
     --
     -- Recursion order is (self, baseMtl-tree, coat_1-tree, ..., coat_9-tree)
     -- so that when the outer loop first-hit-dedupes on `seenInputs`, the
@@ -443,6 +466,97 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
                 )
             )
         )
+)"
+        LR"(
+        -- MAX-MTLX-COMPOSITE-DECAL-014: stock 3ds Max Composite Mtl. Holds
+        -- an ordered stack of up to N sub-materials in `.materialList`;
+        -- index 1 is the base surface, indices 2..N are overlays stacked
+        -- upward. Per-layer `.mapEnabled[i]` boolean + `.opacity[i]` scalar
+        -- gate whether the layer contributes to the composited surface.
+        -- Walk base first so its texture graph wins the first-hit-wins
+        -- slotMap dedupe; then walk 2..N in ascending index order. Skip
+        -- layers whose `.mapEnabled[i]` is false OR (for i > 1) whose
+        -- `.opacity[i]` is exactly 0 — those layers cannot contribute
+        -- pixels to the composited surface ("per-layer opacity respect").
+        -- Base (i == 1) is always walked regardless of its opacity value
+        -- since the base IS the surface an unmasked pixel resolves to.
+        if cls == "Composite" then (
+            if (isProperty m #materialList) then (
+                local ml = getProperty m #materialList
+                if ml != undefined then (
+                    local mEnabled = undefined
+                    local mOpacity = undefined
+                    if (isProperty m #mapEnabled) then (
+                        mEnabled = getProperty m #mapEnabled
+                    )
+                    if (isProperty m #opacity) then (
+                        mOpacity = getProperty m #opacity
+                    )
+                    local n = ml.count
+                    for i = 1 to n do (
+                        local layer = ml[i]
+                        if layer != undefined then (
+                            local enabled = true
+                            if mEnabled != undefined and i <= mEnabled.count then (
+                                if mEnabled[i] == false then enabled = false
+                            )
+                            local op = 100.0
+                            if mOpacity != undefined and i <= mOpacity.count then (
+                                op = mOpacity[i] as float
+                            )
+                            local skip = false
+                            if not enabled then skip = true
+                            if i > 1 and op == 0.0 then skip = true
+                            if not skip then (
+                                for sub in (unwrapBlendMaterialSubMtls layer visited (depth + 1)) do (
+                                    append out sub
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        -- MAX-MTLX-COMPOSITE-DECAL-014: stock 3ds Max Blend material. Two
+        -- sub-materials (`.map1` = base, `.map2` = overlay) mixed by
+        -- `.mask` texmap + `.mixAmount` scalar. Walk `.map1` first so its
+        -- texture graph wins the first-hit-wins slotMap dedupe over
+        -- `.map2`'s. Per-side `.mapNEnabled` flags are respected — a
+        -- disabled sub-material cannot contribute pixels and is skipped.
+        -- The `.mask` / `.mixAmount` values themselves are NOT gates on
+        -- traversal (they control the mix ratio at render time, not
+        -- whether a sub-material's texture data participates in
+        -- discovery).
+        if cls == "Blend" then (
+            if (isProperty m #map1) then (
+                local m1 = getProperty m #map1
+                local m1Enabled = true
+                if (isProperty m #map1Enabled) then (
+                    if (getProperty m #map1Enabled) == false then (
+                        m1Enabled = false
+                    )
+                )
+                if m1 != undefined and m1Enabled then (
+                    for sub in (unwrapBlendMaterialSubMtls m1 visited (depth + 1)) do (
+                        append out sub
+                    )
+                )
+            )
+            if (isProperty m #map2) then (
+                local m2 = getProperty m #map2
+                local m2Enabled = true
+                if (isProperty m #map2Enabled) then (
+                    if (getProperty m #map2Enabled) == false then (
+                        m2Enabled = false
+                    )
+                )
+                if m2 != undefined and m2Enabled then (
+                    for sub in (unwrapBlendMaterialSubMtls m2 visited (depth + 1)) do (
+                        append out sub
+                    )
+                )
+            )
+        )
         return out
     )
     fn discoverMaxMtlxTexmaps materialAnimHandle = (
@@ -491,11 +605,33 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         --                     (VRayLightMtl is separately handled by
         --                     MAX-MTLX-005 in LastResortMtlxShaderWriter).
         --
-        -- Stock 3ds Max classes deliberately excluded:
+        -- Stock 3ds Max classes descended into (MAX-MTLX-COMPOSITE-DECAL-014):
+        --   Composite      — layered stack (base + up to 9 overlays).
+        --                    First-hit-wins so base beats overlays;
+        --                    disabled + opacity-0 layers skipped.
+        --   Blend          — two-sub-mtl mix (map1 base + map2 overlay).
+        --                    map1-first so base beats overlay; disabled
+        --                    sides skipped.
+        --
+        -- Stock 3ds Max classes deliberately EXCLUDED (require different
+        -- combining semantics than the first-hit-wins slotMap dedupe):
         --   Multi/Sub-Object — per-face-ID; MAX-GEO-002/006 owns the
-        --                     GeomSubset partition.
-        --   DoubleSided, Shell Material, Blend (stock), Composite Mtl,
-        --   Top/Bottom, Matte/Shadow — different combining semantics.
+        --                     GeomSubset partition. Descending here would
+        --                     merge face-partitioned materials into a
+        --                     single MaterialX network.
+        --   DoubleSided      — front / back are visually distinct; a
+        --                     first-hit-wins texture merge would smear
+        --                     one face's map onto the other.
+        --   Shell Material   — original / bake pair; the bake side is a
+        --                     rendered output, not a substrate texture.
+        --   Top/Bottom       — separate top / bottom by world-Z; texture
+        --                     precedence depends on face orientation, not
+        --                     wrapping order. A follow-on bite could
+        --                     author a MaterialX `<mix>` split by
+        --                     surface normal.
+        --   Matte/Shadow     — invisible-except-shadows; carries no
+        --                     surface textures the discovery loop can
+        --                     use.
         --
         -- Extending MAX-MTLX-007 to a NEW wrapper class is a SEPARATE
         -- future bite with its own captured corpus of leak values, its
