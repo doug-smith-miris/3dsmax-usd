@@ -43,6 +43,7 @@
 #include <numeric>
 #include <plugapi.h>
 #include <polyobj.h>
+#include <render.h>
 #include <stdmat.h>
 #include <triobj.h>
 
@@ -50,6 +51,18 @@ namespace MAXUSD_NS_DEF {
 
 static const float MAX2USD_CREASE = 10.f;
 static const float USD2MAX_CREASE = 0.1f;
+
+namespace {
+// Object::GetRenderMesh() requires a View, but geometry generation for export does not depend on any
+// real camera/screen. This no-op View just satisfies the interface so render-mesh capable objects
+// (RailClone, Forest scatter, VRayProxy, …) build their full render geometry for us. Mirrors the
+// repo's ViewMock (src/Tests/System/TestHelpers.h). Used only by MAX-MESH-RENDER-001 below.
+class MeshRenderNullView : public View
+{
+public:
+    Point2 ViewToScreen(Point3 p) override { return Point2 {}; }
+};
+} // namespace
 
 pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
     INode*                          node,
@@ -154,6 +167,38 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
         channelIntervals = GetObjectChannelIntervals(polyObj, timeFrame.GetMaxTime());
         meshFacade = std::make_unique<MeshFacade>(&polyObj->GetMesh(), false);
         temporaryObjectFromConvert = polyObj;
+    }
+
+    // MAX-MESH-RENDER-001: procedural "proxy display" objects (RailClone / Forest scatter, VRayProxy,
+    // and similar generators) return a low-detail VIEWPORT mesh from EvalWorldState. RailClone set to
+    // Box display, for instance, yields one axis-aligned bounding box per generated item, so a whole
+    // section of arena seats exports as a field of cubes. Renderers instead call GetRenderMesh() to
+    // obtain the real render geometry. When the source object is NOT natively an editable Tri/Poly
+    // object (so the channel-preserving paths above do not apply), ask for its render mesh; if that
+    // mesh carries strictly more VERTICES than the viewport mesh we just built — or the viewport
+    // object produced no mesh at all — export the render mesh so the USD matches what V-Ray / Karma
+    // actually draw. Vertex count is compared (not face count) so the test is agnostic to whether the
+    // pipeline path produced quads or triangles: a plain Box primitive has the same 8 vertices either
+    // way and is therefore left untouched, while a RailClone box proxy has far fewer vertices than its
+    // real seats and is correctly upgraded. Editable meshes/polys never enter this branch, so quad
+    // topology and geom-channel validity intervals are preserved for all hand-authored geometry.
+    if (!originalTriObject && !originalPolyObject) {
+        MeshRenderNullView nullView;
+        BOOL               renderMeshNeedsDelete = FALSE;
+        Mesh*              renderMesh
+            = obj->GetRenderMesh(timeFrame.GetMaxTime(), node, nullView, renderMeshNeedsDelete);
+        if (renderMesh != nullptr && renderMesh->getNumVerts() > 0
+            && (meshFacade == nullptr || renderMesh->getNumVerts() > meshFacade->VertexCount())) {
+            // getMeshFacadeFromTri copies the mesh it is handed, so the render mesh can be released
+            // afterwards if Max asked us to (renderMeshNeedsDelete).
+            meshFacade = getMeshFacadeFromTri(new Mesh { *renderMesh }, true, convertToPoly);
+            // The render mesh is generated for this instant; its validity cannot be described by the
+            // pipeline object's geom-channel intervals, so restrict exported samples to this instant.
+            channelIntervals = GetInstantChannelIntervals(timeFrame.GetMaxTime());
+        }
+        if (renderMesh != nullptr && renderMeshNeedsDelete) {
+            renderMesh->DeleteThis();
+        }
     }
 
     // Now ready to perform the actual conversion to USDGeomMesh.
