@@ -722,7 +722,17 @@ bool MaxUsdVRayLightWriter::Write(
         if (boundableLight) {
             boundableLight.CreateEnableColorTemperatureAttr().Set(
                 probe.useTemperature, pxr::UsdTimeCode::Default());
-            boundableLight.CreateNormalizeAttr().Set(true, pxr::UsdTimeCode::Default());
+            // normalize=FALSE for area lights (RectLight/DiskLight/SphereLight). Intensity is
+            // normalized to a per-area LUMINANCE (nit / cd/m²) by _NormalizeVRayLightIntensity,
+            // and a nit is radiance-per-unit-area — which is exactly the normalize=false meaning
+            // (emitted radiance = intensity; total power scales with the light's area). This
+            // matches V-Ray's area-light model, where the multiplier is surface luminance and a
+            // bigger light emits more total light. normalize=TRUE (the previous value) instead
+            // holds TOTAL power constant regardless of size, so a large arena fixture spreads its
+            // power over a huge area and renders far too dim — the whole room came in ~half
+            // brightness. Making this a portable value (luminance + normalize=false) means any
+            // Hydra renderer reproduces the intended lighting without external calibration.
+            boundableLight.CreateNormalizeAttr().Set(false, pxr::UsdTimeCode::Default());
         } else if (distantLight) {
             distantLight.CreateEnableColorTemperatureAttr().Set(
                 probe.useTemperature, pxr::UsdTimeCode::Default());
