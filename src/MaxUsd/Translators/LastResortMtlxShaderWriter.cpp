@@ -173,6 +173,27 @@ static const TSTR discoverVRayLightMtlFn = LR"(
                     try ( FileResolutionManager.getFullFilePath &resolved #bitmap ) catch ()
                     if resolved == undefined or resolved == "" then resolved = fname
                     result += ("texmap|" + resolved + "\n")
+                ) else (
+                    -- MAX-MTLX-EMISSIVE-PROCEDURAL-020: the emission map is a
+                    -- procedural (Gradient / Falloff / Noise) with NO file on
+                    -- disk. The arena's suite recessed-downlight material
+                    -- (GLASS-ILUM) drives its glow with a warm Gradient; with no
+                    -- file the texmap dropped and emission fell back to the black
+                    -- `.color`, so every luxury suite exported UNLIT (V-Ray shows
+                    -- them warmly lit). Render the map to a small bitmap and
+                    -- average it to a representative constant emission tint so the
+                    -- suites emit their real color.
+                    try (
+                        local bm = renderMap tex size:[8,8] filter:true
+                        if bm != undefined then (
+                            local ar = 0.0 ; local ag = 0.0 ; local ab = 0.0 ; local np = 0
+                            for ry = 0 to 7 do (
+                                local prow = getPixels bm [0,ry] 8
+                                if prow != undefined do ( for pc in prow do ( if pc != undefined do ( ar += (pc.r as float) ; ag += (pc.g as float) ; ab += (pc.b as float) ; np += 1 ) ) )
+                            )
+                            if np > 0 do result += ("proceduralColor|" + ((ar/np) as string) + "," + ((ag/np) as string) + "," + ((ab/np) as string) + "\n")
+                        )
+                    ) catch ()
                 )
             )
         )
@@ -311,6 +332,20 @@ VRayLightMtlProbe _ProbeVRayLightMtl(Mtl* material)
                 }
             } else if (key == "texmap") {
                 probe.texFile = val;
+            } else if (key == "proceduralColor") {
+                // MAX-MTLX-EMISSIVE-PROCEDURAL-020: a procedural emission map
+                // (Gradient/Falloff/Noise) with no file — the averaged map color
+                // in 0-255. This is the material's REAL emissive appearance, so
+                // it overrides the (often black) `.color` slot. Emitted after
+                // "color" so it wins.
+                const auto c1 = val.find(',');
+                const auto c2 = (c1 == std::string::npos) ? std::string::npos : val.find(',', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                    probe.cr = std::stof(val.substr(0, c1)) / 255.f;
+                    probe.cg = std::stof(val.substr(c1 + 1, c2 - c1 - 1)) / 255.f;
+                    probe.cb = std::stof(val.substr(c2 + 1)) / 255.f;
+                    probe.hasColor = true;
+                }
             }
         } catch (const std::exception&) {
             // Ignore parse errors; keep defaults.
