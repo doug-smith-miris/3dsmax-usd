@@ -186,15 +186,16 @@ bool MaxUsdShapeWriter::Write(
 
     pxr::UsdGeomBasisCurves usdCurve(targetPrim);
 
-    // Use the wire color as USD display color.
-    Color             wireColor(sourceNode->GetWireColor());
-    pxr::VtVec3fArray usdDisplayColor = { pxr::GfVec3f(wireColor.r, wireColor.g, wireColor.b) };
+    // MAX-MAT-003-FIX: do NOT author displayColor from the wireframe color. On Revit-imported /
+    // RailClone construction splines the wire color is the Revit category color (green), which Karma
+    // renders as thin green displayColor lines in the aisles/bowl -- the residual green after the mesh
+    // displayColor leak was fixed. Same decision as MeshConverter: no reliable surface color exists for
+    // these curves, so author no displayColor at all (all CreateDisplayColorAttr sites removed).
 
     if (time.IsFirstFrame()) {
         // Currently exported "linear" type curves, as we export the interpolated
         // splines.
         usdCurve.CreateTypeAttr().Set(pxr::TfToken("linear"));
-        usdCurve.CreateDisplayColorAttr().Set(usdDisplayColor);
     }
 
     const auto& timeVal = time.GetMaxTime();
@@ -380,7 +381,6 @@ bool MaxUsdShapeWriter::Write(
                                     pxr::TfToken("BasisCurves")));
                             closedLinearPrim.CreateTypeAttr().Set(pxr::TfToken("linear"));
                             closedLinearPrim.CreateWrapAttr().Set(pxr::TfToken("periodic"));
-                            closedLinearPrim.CreateDisplayColorAttr().Set(usdDisplayColor);
                         }
                         numNewPrim++;
                     }
@@ -399,7 +399,6 @@ bool MaxUsdShapeWriter::Write(
                                     pxr::TfToken("BasisCurves")));
                             openCubicPrim.CreateTypeAttr().Set(pxr::TfToken("cubic"));
                             openCubicPrim.CreateWrapAttr().Set(pxr::TfToken("nonperiodic"));
-                            openCubicPrim.CreateDisplayColorAttr().Set(usdDisplayColor);
                         }
                         numNewPrim++;
                     }
@@ -409,7 +408,6 @@ bool MaxUsdShapeWriter::Write(
                             pxr::TfToken("BasisCurves")));
                         closedCubicPrim.CreateTypeAttr().Set(pxr::TfToken("cubic"));
                         closedCubicPrim.CreateWrapAttr().Set(pxr::TfToken("periodic"));
-                        closedCubicPrim.CreateDisplayColorAttr().Set(usdDisplayColor);
                     }
                 }
 
