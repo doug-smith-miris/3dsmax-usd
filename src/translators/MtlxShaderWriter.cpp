@@ -372,7 +372,8 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         )
         return undefined
     )
-    -- MAX-MTLX-OPACITY-ALPHA-018: walk the same wrapper chain as
+)"
+        LR"(    -- MAX-MTLX-OPACITY-ALPHA-018: walk the same wrapper chain as
     -- resolveMaxTexmapFilename and return the leaf Bitmaptexture's monoOutput
     -- (0 = RGB Intensity, 1 = Alpha). When an opacity slot's leaf bitmap uses
     -- its ALPHA channel for the mono value (the standard alpha-cutout decal
@@ -397,7 +398,8 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         if nested != undefined then return (resolveMaxTexmapMono nested (depth + 1))
         return 0
     )
-    -- MAX-MTLX-007: expand a possibly-wrapped material into the ordered list
+)"
+        LR"(    -- MAX-MTLX-007: expand a possibly-wrapped material into the ordered list
     -- of concrete sub-materials whose PhysicalMaterial / VRayMtl slot map
     -- carries the actual texture maps. Non-wrapper materials return a
     -- 1-element list (`#(m)`) so PhysicalMaterial / OpenPBR / VRayMtl /
