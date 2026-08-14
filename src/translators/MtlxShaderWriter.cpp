@@ -372,6 +372,31 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
         )
         return undefined
     )
+    -- MAX-MTLX-OPACITY-ALPHA-018: walk the same wrapper chain as
+    -- resolveMaxTexmapFilename and return the leaf Bitmaptexture's monoOutput
+    -- (0 = RGB Intensity, 1 = Alpha). When an opacity slot's leaf bitmap uses
+    -- its ALPHA channel for the mono value (the standard alpha-cutout decal
+    -- setup: white-RGB logo/text bitmap whose shape lives only in alpha), a
+    -- plain ND_tiledimage_float reads RGB luminance (white -> fully opaque),
+    -- silently dropping the cutout (BUZZ/CITY marquee, DR_PEPPER, laser-cut
+    -- logos exported as solid white cards). Detecting mono==1 lets the emit
+    -- tag the type "float_a" so the C++ authoring reads the real alpha channel.
+    fn resolveMaxTexmapMono tex depth = (
+        if tex == undefined or depth > 8 then return 0
+        if (classOf tex) == Bitmaptexture then (
+            if (isProperty tex #monoOutput) then return (getProperty tex #monoOutput)
+            return 0
+        )
+        local nested = undefined
+        if (isProperty tex #map) then nested = getProperty tex #map
+        if nested == undefined and (isProperty tex #map1) then nested = getProperty tex #map1
+        if nested == undefined and (isProperty tex #normal_map) then nested = getProperty tex #normal_map
+        if nested == undefined and (isProperty tex #bump_map) then nested = getProperty tex #bump_map
+        if nested == undefined and (isProperty tex #baseTex) then nested = getProperty tex #baseTex
+        if nested == undefined and (isProperty tex #sourceA) then nested = getProperty tex #sourceA
+        if nested != undefined then return (resolveMaxTexmapMono nested (depth + 1))
+        return 0
+    )
     -- MAX-MTLX-007: expand a possibly-wrapped material into the ordered list
     -- of concrete sub-materials whose PhysicalMaterial / VRayMtl slot map
     -- carries the actual texture maps. Non-wrapper materials return a
@@ -1123,9 +1148,20 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
                             -- subMtls` loop this makes baseMtl's textures win
                             -- over any coat's — the correct precedence for
                             -- layered arch-viz materials.
+                            -- MAX-MTLX-OPACITY-ALPHA-018: for opacity slots whose
+                            -- leaf bitmap outputs its ALPHA channel (monoOutput==1),
+                            -- tag the type "float_a" so the C++ authoring reads the
+                            -- real alpha (ND_tiledimage_vector4 + extract idx 3)
+                            -- instead of RGB luminance (white -> always opaque).
+                            local effType = mtlxType
+                            if mtlxInput == "opacity" then (
+                                local monoV = 0
+                                try ( monoV = resolveMaxTexmapMono tex 0 ) catch ( monoV = 0 )
+                                if monoV == 1 then effType = "float_a"
+                            )
                             if (findItem seenInputs mtlxInput) == 0 then (
                                 append seenInputs mtlxInput
-                                result += (mtlxInput + "|" + mtlxType + "|" + fname + "\n")
+                                result += (mtlxInput + "|" + effType + "|" + fname + "\n")
                             )
                         )
                     )
@@ -1291,11 +1327,22 @@ size_t _EnrichMtlxDocFromMaxMaterial(
             continue;
         }
 
+        // MAX-MTLX-OPACITY-ALPHA-018: the discovery script tags opacity sourced
+        // from a bitmap's ALPHA channel (Max Bitmaptexture monoOutput==1) as
+        // "float_a". A plain ND_tiledimage_float reads RGB luminance, so a
+        // white-RGB logo/text decal whose shape lives only in alpha exports
+        // fully opaque (BUZZ/CITY marquee, DR_PEPPER, laser-cut logos). For
+        // that case author an ND_tiledimage_vector4 (full RGBA read) feeding an
+        // ND_extract_vector4 at index 3 (alpha) so opacity gets the real mask.
+        const bool        isAlphaOpacity = (mtlxType == "float_a");
+        const std::string imageType      = isAlphaOpacity ? "vector4" : mtlxType;
+        const std::string outType        = isAlphaOpacity ? "float" : mtlxType;
+
         // Create the tiledimage node inside the NodeGraph.
         auto imgName = "img_" + mtlxInput;
         auto imgNode = ng->getNode(imgName);
         if (!imgNode) {
-            imgNode = ng->addNode("tiledimage", imgName, mtlxType);
+            imgNode = ng->addNode("tiledimage", imgName, imageType);
         }
         if (!imgNode) {
             continue;
@@ -1306,26 +1353,55 @@ size_t _EnrichMtlxDocFromMaxMaterial(
         // this attribute, so without it info:id serializes empty and the node is inert —
         // MaterialX can't resolve its type, so it neither renders nor counts as a texture
         // node. Native exporter nodes always set it; match that (ND_tiledimage_<type>).
-        imgNode->setNodeDefString("ND_tiledimage_" + mtlxType);
+        imgNode->setNodeDefString("ND_tiledimage_" + imageType);
         auto fileInput = imgNode->getInput("file");
         if (!fileInput) {
             fileInput = imgNode->addInput("file", "filename");
         }
         if (fileInput) {
             fileInput->setValueString(filePath);
-            if (mtlxType == "color3") {
+            if (imageType == "color3") {
                 // Match the color space authoring the MaterialX exporter would use.
                 fileInput->setAttribute("colorspace", "srgb_texture");
             }
         }
 
-        // Wire the NodeGraph output to the newly-created tiledimage.
+        // For alpha-sourced opacity, insert an ND_extract_vector4 (index 3)
+        // between the RGBA image and the NodeGraph output so opacity reads alpha.
+        std::string sourceNodeName = imgName;
+        if (isAlphaOpacity) {
+            auto extName = "extract_" + mtlxInput;
+            auto extNode = ng->getNode(extName);
+            if (!extNode) {
+                extNode = ng->addNode("extract", extName, "float");
+            }
+            if (extNode) {
+                extNode->setNodeDefString("ND_extract_vector4");
+                auto inp = extNode->getInput("in");
+                if (!inp) {
+                    inp = extNode->addInput("in", "vector4");
+                }
+                if (inp) {
+                    inp->setNodeName(imgName);
+                }
+                auto idx = extNode->getInput("index");
+                if (!idx) {
+                    idx = extNode->addInput("index", "integer");
+                }
+                if (idx) {
+                    idx->setValueString("3");
+                }
+                sourceNodeName = extName;
+            }
+        }
+
+        // Wire the NodeGraph output to the source node (image, or alpha extract).
         auto output = ng->getOutput(outputName);
         if (!output) {
-            output = ng->addOutput(outputName, mtlxType);
+            output = ng->addOutput(outputName, outType);
         }
         if (output) {
-            output->setNodeName(imgName);
+            output->setNodeName(sourceNodeName);
             // Clear any stale nodegraph reference that would fight the direct
             // connection.
             if (output->hasAttribute("nodegraph")) {
