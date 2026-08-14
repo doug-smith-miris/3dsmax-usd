@@ -409,12 +409,14 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
             // renderer evaluates the material. Only fall back to the wireframe color when NO material is
             // bound (there is no better representational color then, and displayColor-only consumers need
             // something). Verified: stripping the leaked displayColor removes all the spurious green.
-            if (!usdMesh.GetDisplayColorAttr().IsAuthored() && node->GetMtl() == nullptr) {
-                const Color         displayColorSrc = Color(node->GetWireColor());
-                pxr::VtVec3fArray usdDisplayColor = { pxr::GfVec3f(
-                    displayColorSrc.r, displayColorSrc.g, displayColorSrc.b) };
-                usdMesh.CreateDisplayColorAttr().Set(usdDisplayColor);
-            }
+            // ...and the no-material fallback (node->GetWireColor()) is ALSO wrong: on Revit-imported
+            // geometry the wireframe color is the Revit category/layer color (e.g. a green on the aisle
+            // steps), which Karma/Hydra then render as displayColor -- the residual green after the
+            // material-bound case was fixed. There is no reliable "surface color" to author here, and
+            // the strip test proved that authoring NO displayColor renders cleanly (bound meshes use
+            // their material; material-less meshes take the renderer's neutral default). So do not
+            // author primvars:displayColor at all. (Left as an explicit no-op with rationale rather than
+            // deleting the block, to make the deliberate decision visible.)
         }
 
         // If the object is a temporary object from a conversion, need to delete it now.
