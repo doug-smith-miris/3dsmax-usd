@@ -399,13 +399,18 @@ pxr::UsdGeomMesh MeshConverter::ConvertToUSDMesh(
             // specific accessor. For a MultiMtl it returns the first
             // sub-material's diffuse, which is still more representative
             // of the artist's intent than the viewport wireframe color.
-            if (!usdMesh.GetDisplayColorAttr().IsAuthored()) {
-                Color displayColorSrc;
-                if (Mtl* boundMtl = node->GetMtl()) {
-                    displayColorSrc = boundMtl->GetDiffuse();
-                } else {
-                    displayColorSrc = Color(node->GetWireColor());
-                }
+            // MAX-MAT-003-FIX (displayColor leak): the prior code authored displayColor from
+            // boundMtl->GetDiffuse(). For a texture-driven material (VRayMtl/PhysicalMaterial with a
+            // bitmap in the diffuse slot) GetDiffuse() returns only the flat PLACEHOLDER constant sitting
+            // under the texture -- frequently a wrong color (e.g. the green on SEAT_FAB_BASE / the whole
+            // bleacher bowl). Karma/Hydra then render that placeholder as displayColor OVER the correctly
+            // bound UsdShade material, tinting every textured surface. A bound material IS the
+            // authoritative surface color, so do NOT author displayColor when one is present -- the
+            // renderer evaluates the material. Only fall back to the wireframe color when NO material is
+            // bound (there is no better representational color then, and displayColor-only consumers need
+            // something). Verified: stripping the leaked displayColor removes all the spurious green.
+            if (!usdMesh.GetDisplayColorAttr().IsAuthored() && node->GetMtl() == nullptr) {
+                const Color         displayColorSrc = Color(node->GetWireColor());
                 pxr::VtVec3fArray usdDisplayColor = { pxr::GfVec3f(
                     displayColorSrc.r, displayColorSrc.g, displayColorSrc.b) };
                 usdMesh.CreateDisplayColorAttr().Set(usdDisplayColor);
