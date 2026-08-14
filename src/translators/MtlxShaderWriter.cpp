@@ -1390,6 +1390,35 @@ static const TSTR discoverMaxMtlxConstantsFn = LR"(
         local m = getAnimByHandle materialAnimHandle
         local result = ""
         if m == undefined then return result
+        -- MAX-MTLX-VRAYCOLOR-016: a VRayColor solid-color node carries no file, so the filename resolver
+        -- drops it and base_color falls back to the material's placeholder diffuse (a wrong color -- e.g.
+        -- the green on WALL-PAINT-WHITE's aisles). Read the VRayColor's actual output color (red/green/
+        -- blue * rgb_multiplier, 0-1) so it can be authored as the base_color constant. Walks the common
+        -- wrapper carriers to reach a nested VRayColor.
+        fn getVRayColorRGB tex depth = (
+            if tex == undefined or depth > 6 then ( undefined ) else (
+                if ((classof tex) as string) == "VRayColor" then (
+                    local mlt = (try (getProperty tex #rgb_multiplier) catch (1.0))
+                    if mlt == undefined then mlt = 1.0
+                    local rr = (try ((getProperty tex #red) * mlt) catch (undefined))
+                    local gg = (try ((getProperty tex #green) * mlt) catch (undefined))
+                    local bb = (try ((getProperty tex #blue) * mlt) catch (undefined))
+                    if rr == undefined then ( undefined ) else (
+                        if rr > 1.0 do rr = 1.0
+                        if gg > 1.0 do gg = 1.0
+                        if bb > 1.0 do bb = 1.0
+                        ((rr as string) + "," + (gg as string) + "," + (bb as string))
+                    )
+                ) else (
+                    local nx = undefined
+                    if (isProperty tex #map) then nx = getProperty tex #map
+                    if nx == undefined and (isProperty tex #map1) then nx = getProperty tex #map1
+                    if nx == undefined and (isProperty tex #sourceA) then nx = getProperty tex #sourceA
+                    if nx == undefined and (isProperty tex #baseTex) then nx = getProperty tex #baseTex
+                    if nx != undefined then ( getVRayColorRGB nx (depth + 1) ) else ( undefined )
+                )
+            )
+        )
         -- Slot map: (Max PhysicalMaterial/OpenPBR property name,
         --           ND_standard_surface input name,
         --           MaterialX type token)
@@ -1413,6 +1442,13 @@ static const TSTR discoverMaxMtlxConstantsFn = LR"(
             #("cutoutOpacity",      "opacity",            "float")
         )
         local seenInputs = #()
+        -- MAX-MTLX-VRAYCOLOR-016: if the diffuse/base_color slot is a VRayColor solid-color node, author
+        -- ITS color as base_color and mark the input seen so the slotMap loop below won't overwrite it
+        -- with the material's placeholder diffuse.
+        local bcMap = (try (getProperty m #base_color_map) catch (undefined))
+        if bcMap == undefined do ( bcMap = (try (getProperty m #texmap_diffuse) catch (undefined)) )
+        local vcRGB = (try (getVRayColorRGB bcMap 0) catch (undefined))
+        if vcRGB != undefined do ( result += ("base_color|color3|" + vcRGB + "\n"); append seenInputs "base_color" )
         for entry in slotMap do (
             local propName  = entry[1]
             local mtlxInput = entry[2]
