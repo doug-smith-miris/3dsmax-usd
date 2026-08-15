@@ -236,7 +236,7 @@ struct VRayLightMtlProbe
 // (kUnits0Gain) — the SAME gain the area-light path (VRayLightWriter) applies — so both emission paths
 // track V-Ray. kUnits0Gain is the single knob to tune against the vray-baseline mean (~62/255).
 static constexpr float kEmissionCeiling = 1000.0f;
-static constexpr float kUnits0Gain      = 3.0f; // default-mode V-Ray -> Karma calibration (tunable)
+static constexpr float kUnits0Gain      = 3.8f; // default-mode V-Ray -> Karma calibration (tunable)
 
 static float _NormalizeEmissionWeight(float multiplier, int units)
 {
