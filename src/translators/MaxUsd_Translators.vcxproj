@@ -28,6 +28,7 @@
     <ClInclude Include="SkinMorpherWriter.h" />
     <ClInclude Include="StageWriter.h" />
     <ClInclude Include="SunPositionerWriter.h" />
+    <ClInclude Include="VRayDecalWriter.h" />
     <ClInclude Include="VRayLightWriter.h" />
   </ItemGroup>
   <ItemGroup>
@@ -56,6 +57,7 @@
     <ClCompile Include="SkinMorpherWriter.cpp" />
     <ClCompile Include="StageWriter.cpp" />
     <ClCompile Include="SunPositionerWriter.cpp" />
+    <ClCompile Include="VRayDecalWriter.cpp" />
     <ClCompile Include="VRayLightWriter.cpp" />
   </ItemGroup>
   <ItemGroup>

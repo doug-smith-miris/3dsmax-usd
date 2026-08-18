@@ -28,6 +28,8 @@
                   # StageWriter - any USDStage class object
                   # SkeletonWriter - any dependent skin modifier node, or morpher
                   # SkinMorpherWriter - only support skinning of object that can/should be converted to meshes, exclude shapes
+                  # VRayDecalWriter - any GEOMOBJECT whose class name is VRayDecal; emits the
+                  #     projected patch conformed to the receiving surface (MAX-VRAYDECAL-021)
                   # MeshWriter - any object convertible to TriObject, exclude shapes
                   # CameraWriter - all Camera class objects
                   # ShapeWriter - any Shape class objects
