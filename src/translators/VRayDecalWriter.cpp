@@ -199,17 +199,39 @@ static const TSTR discoverMaxVrayDecalFn = LR"(
             )
         )
 
-        local eps = 0.002
-        if (dep * 0.001) > eps do eps = dep * 0.001
         local inv = inverse tm
+        local lnv = normalize (((cen + nrmAvg) * inv) - (cen * inv))
+
+        -- UV HANDEDNESS. The C++ side always assigns st (0,0) (1,0) (1,1) (0,1) to the four corners
+        -- in emitted order, so the corner order here decides which way the artwork reads. Viewed
+        -- from the side the patch normal points to, u must increase to the RIGHT, i.e. along
+        -- cross(up, n). In the decal's own frame up is +Y and n is +/-Z, so:
+        --     n = +Z  ->  u runs along +X   (emit corners -x,+x,+x,-x as below)
+        --     n = -Z  ->  u runs along -X   (emit them mirrored)
+        -- Assigning +X unconditionally rendered Dr Pepper and Hornets as MIRROR IMAGES -- caught
+        -- only by looking at the render, since the patch geometry and UVs were each individually
+        -- correct. BUZZ and CITY happened to sit on +Z receivers and looked right, which is exactly
+        -- how a handedness bug hides.
+        local ord = #(1, 2, 3, 4)
+        if lnv.z < 0.0 do ord = #(2, 1, 4, 3)
+
+        -- LIFT off the receiver. 0.02 ft (~6 mm) rather than the 0.002 ft (0.6 mm) first shipped.
+        -- This is PRECAUTIONARY, not a fix for an observed defect: 0.002 ft rendered the Dr Pepper
+        -- patch cleanly with no z-fighting, and a test at 0.02 changed nothing (the frame used to
+        -- judge it turned out to be occluded, so it proved neither way). 0.6 mm is simply a thin
+        -- margin against renderer ray bias at these scene coordinates (~220 ft from origin), and
+        -- 6 mm is still under 12% of the CLOSEST measured receiver standoff (0.169 ft), so the
+        -- patch cannot read as floating.
+        local eps = 0.02
+        if (dep * 0.01) > eps do eps = dep * 0.01
         local qs = ""
         for i = 1 to 4 do (
-            local p = (hitP[i] + (hitN[i] * eps)) * inv
+            local p = (hitP[ord[i]] + (hitN[ord[i]] * eps)) * inv
             if i > 1 do qs += ";"
             qs += ((formattedPrint p.x format:".6f") + "," + (formattedPrint p.y format:".6f") + "," + (formattedPrint p.z format:".6f"))
         )
         result += ("quad|" + qs + "\n")
-        local lnv = normalize (((cen + nrmAvg) * inv) - (cen * inv))
+        result += ("flipU|" + ((lnv.z < 0.0) as string) + "\n")
         result += ("nrm|" + (formattedPrint lnv.x format:".6f") + "," + (formattedPrint lnv.y format:".6f") + "," + (formattedPrint lnv.z format:".6f") + "\n")
         result
     )

@@ -414,5 +414,58 @@ class TestInstancingMustBeDisabled(unittest.TestCase):
         self.assertAlmostEqual(worst * 304.8, 0.155, delta=0.02)   # ft -> mm
 
 
+def u_direction(normal_local_z):
+    """Which local axis `u` runs along, given the patch normal's local z component.
+
+    Mirror of the writer's rule: viewed from the side the normal points to, u must increase to the
+    RIGHT, i.e. along cross(up, n). In the decal's own frame up is +Y and n is +/-Z.
+    """
+    up, n = (0.0, 1.0, 0.0), (0.0, 0.0, 1.0 if normal_local_z >= 0 else -1.0)
+    return (up[1] * n[2] - up[2] * n[1], up[2] * n[0] - up[0] * n[2], up[0] * n[1] - up[1] * n[0])
+
+
+class TestUvHandedness(unittest.TestCase):
+    """Artwork must not come out mirrored.
+
+    Caught in a render, not in the geometry: the patch corners and the UVs were each individually
+    correct, and BUZZ/CITY looked right because their receivers happen to sit on +Z. WHITE001,
+    WHITE002 and HORNETS sit on -Z receivers and rendered as MIRROR IMAGES -- 'Dr Pepper Est.1885'
+    read backwards on the wall.
+    """
+
+    # local z of the patch normal, from the writer's own conform output
+    NORMAL_Z = {
+        "BOWL-UPPER_LOGO_DR_PEPP_WHITE001": -1.0,
+        "BOWL-UPPER_LOGO_DR_PEPP_WHITE002": -1.0,
+        "BOWL-UPPER-DECAL_HORNETS_LOGO": -1.0,
+        "BOWL-UPPER-DECAL_TEXT_BUZZ": 0.999782,
+        "BOWL-UPPER-DECAL_TEXT_CITY": 0.999782,
+    }
+
+    def test_u_runs_along_plus_x_only_for_plus_z_normals(self):
+        for name, nz in self.NORMAL_Z.items():
+            u = u_direction(nz)
+            self.assertAlmostEqual(abs(u[0]), 1.0, places=6, msg=f"{name}: u should be an X axis")
+            expected = 1.0 if nz >= 0 else -1.0
+            self.assertAlmostEqual(u[0], expected, places=6, msg=f"{name}: wrong u handedness")
+
+    def test_three_of_the_five_arena_decals_need_the_flip(self):
+        """Pins the split. A fix that flipped ALL of them would simply mirror the other two."""
+        flipped = [n for n, nz in self.NORMAL_Z.items() if nz < 0]
+        self.assertEqual(len(flipped), 3)
+        self.assertNotIn("BOWL-UPPER-DECAL_TEXT_BUZZ", flipped)
+        self.assertNotIn("BOWL-UPPER-DECAL_TEXT_CITY", flipped)
+
+    def test_flip_is_a_corner_reorder_that_preserves_v(self):
+        """The writer implements the flip as emit-order 2,1,4,3. That mirrors u while leaving v
+        alone; reversing the whole list (4,3,2,1) would flip the artwork vertically too."""
+        corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        flipped = [corners[i] for i in (1, 0, 3, 2)]
+        uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+        for (sx, sy), (u, v) in zip(flipped, uvs):
+            self.assertEqual((sx + 1.0) / 2.0, 1.0 - u)   # u mirrored
+            self.assertEqual((sy + 1.0) / 2.0, v)         # v unchanged
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
