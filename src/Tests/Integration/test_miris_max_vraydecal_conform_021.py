@@ -386,5 +386,33 @@ class TestMeasuredConformOutput(unittest.TestCase):
                             f"{name}: normal should point back toward the decal origin")
 
 
+class TestInstancingMustBeDisabled(unittest.TestCase):
+    """A conformed patch is NOT a pure function of the object, so decals must not be instanced.
+
+    The exporter instances nodes that share a base object: the mesh is authored once into a
+    `_class_` prototype every instance inherits, and only the FIRST instance reaches Write().
+    WHITE001 and WHITE002 share a VRayDecal object and were instanced that way, so WHITE002
+    silently reused WHITE001's patch (and produced no writer log line at all, which is how the
+    problem surfaced).
+    """
+
+    # Each decal's own conform, from the standalone run of the shipped MAXScript.
+    WHITE001_Z = (0.324539, 0.324554)
+    WHITE002_Z = (0.325043, 0.325027)
+
+    def test_the_two_instanced_decals_conform_differently(self):
+        """They land on different walls, so their patches genuinely differ. Small here only
+        because the club is symmetric — which is luck, not correctness."""
+        self.assertNotEqual(self.WHITE001_Z, self.WHITE002_Z)
+
+    def test_the_shared_patch_error_is_small_but_real(self):
+        """Pins the actual magnitude so the claim stays honest: 0.0005 ft is about 0.15 mm, i.e.
+        invisible in this scene. The fix is for the general case, not this measurement."""
+        worst = max(abs(a - b) for a, b in zip(self.WHITE001_Z, self.WHITE002_Z))
+        self.assertLess(worst, 0.001)
+        self.assertGreater(worst, 0.0)
+        self.assertAlmostEqual(worst * 304.8, 0.155, delta=0.02)   # ft -> mm
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -57,6 +57,26 @@ public:
 
     TfToken GetPrimType() override;
 
+    /**
+     * \brief Decals must never be instanced.
+     *
+     * Automatic instancing authors the mesh ONCE into a `_class_` prototype that every instance
+     * inherits, and -- per InstancingRequirement::Default -- "only the first instance will hit the
+     * Write() method". That is sound for an ordinary object, whose geometry is a pure function of
+     * the object itself. A decal's patch is not: it is conformed to whatever surface it is
+     * projected onto, so two nodes sharing one VRayDecal object can still need different patches.
+     *
+     * Measured on the arena: BOWL-UPPER_LOGO_DR_PEPP_WHITE001/002 share an object and were
+     * instanced, so WHITE002 silently reused WHITE001's patch. Their own conforms differ (local z
+     * 0.324539 vs 0.325043) -- only by 0.15 mm here, because the club walls are symmetric, but
+     * that is luck, not correctness. Two instanced decals on differently-angled walls would put a
+     * visibly wrong patch on one of them.
+     */
+    MaxUsd::InstancingRequirement RequiresInstancing() override
+    {
+        return MaxUsd::InstancingRequirement::NoInstancing;
+    }
+
     WStr GetWriterName() override { return L"V-Ray decal writer"; };
 };
 
