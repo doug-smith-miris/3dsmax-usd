@@ -28,6 +28,7 @@
     <ClInclude Include="SkinMorpherWriter.h" />
     <ClInclude Include="StageWriter.h" />
     <ClInclude Include="SunPositionerWriter.h" />
+    <ClInclude Include="VRayUnits.h" />
     <ClInclude Include="VRayLightWriter.h" />
   </ItemGroup>
   <ItemGroup>

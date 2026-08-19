@@ -15,6 +15,8 @@
 //
 #include "VRayLightWriter.h"
 
+#include "VRayUnits.h"
+
 #include <MaxUsd/Translators/primWriter.h>
 #include <MaxUsd/Translators/writeJobContext.h>
 #include <MaxUsd/Utilities/Logging.h>
@@ -522,49 +524,13 @@ TfToken _ClassifyVRayLight(const VRayLightProbe& probe)
 // hasUnits=false (very old V-Ray or a light class with no `.units` property
 // at all) falls through to units=0 pass-through so pre-`.units` scenes
 // keep their pre-013 behavior.
-constexpr float kIntensityPi         = 3.14159265358979323846f;
-constexpr float kIntensityPhotopicK  = 683.0f;   // Photopic peak, lm/W.
-constexpr float kIntensityCeiling    = 10000.0f; // nit-scale, tone-mapper safe.
-// MAX-LIT-DIMNESS-014: default-mode (units=0) V-Ray lights don't map 1:1 to a Karma nit — V-Ray's
-// color mapping brightens beyond the raw radiance. This calibration gain (shared conceptually with
-// LastResortMtlxShaderWriter's kUnits0Gain — keep the two in sync) brings units=0 area lights up to
-// match the vray-baseline. The arena's area lights are ALL units=0 (mult 1.5..85), so this is the
-// dominant lever for the ~2x aerial dimness. Single knob to tune against baseline mean (~62/255).
-constexpr float kUnits0Gain          = 3.8f;
-
+// MAX-LIT-GEOLIGHT-022: the unit conversion now lives in VRayUnits.h so the light-OBJECT path
+// (here), the light-MATERIAL surface path, and the geometry-light path in MeshWriter all use one
+// implementation. Previously each carried its own copy with a "keep the two in sync" comment, and
+// they drifted -- a geometry light emitted at the default 1.0 while its own surface carried 190.
 float _NormalizeVRayLightIntensity(float multiplier, int units, bool hasUnits)
 {
-    // Non-physical / absent-manifest -> pass-through (with negative clamp).
-    float base = multiplier;
-    if (hasUnits) {
-        switch (units) {
-        case 0: // Default: arbitrary artistic scale -> apply units=0 calibration gain (see above).
-            base = multiplier * kUnits0Gain;
-            break;
-        case 1: // Lumens (total luminous flux) -> nits (Lambertian).
-            base = multiplier / kIntensityPi;
-            break;
-        case 2: // lm/m²/sr = cd/m² = nits: already USD's convention.
-            base = multiplier;
-            break;
-        case 3: // Watts -> lumens -> nits.
-            base = (multiplier * kIntensityPhotopicK) / kIntensityPi;
-            break;
-        case 4: // W/m²/sr -> nits via photopic peak.
-            base = multiplier * kIntensityPhotopicK;
-            break;
-        default:
-            base = multiplier;
-            break;
-        }
-    }
-    if (base < 0.f) {
-        base = 0.f;
-    }
-    if (base > kIntensityCeiling) {
-        base = kIntensityCeiling;
-    }
-    return base;
+    return MaxUsdVRay::UnitsToNits(multiplier, units, hasUnits);
 }
 
 } // namespace
