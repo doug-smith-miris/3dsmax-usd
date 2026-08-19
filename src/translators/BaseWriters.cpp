@@ -22,7 +22,6 @@
 #include "SkinMorpherWriter.h"
 #include "StageWriter.h"
 #include "SunPositionerWriter.h"
-#include "VRayDecalWriter.h"
 #include "VRayLightWriter.h"
 
 #include <MaxUsd/Translators/PrimWriterRegistry.h>
@@ -43,10 +42,6 @@ TF_REGISTRY_FUNCTION(MaxUsdPrimWriterRegistry)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdSkeletonWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdSkinMorpherWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdShapeWriter)
-    // MAX-VRAYDECAL-021: ahead of MeshWriter, which claimed VRayDecal as a Fallback (the class
-    // is TriObject-convertible) and exported its 8-vertex gizmo BOX wearing the artwork, while
-    // the surface the decal actually projects onto kept its placeholder material.
-    MAXUSD_REGISTER_BASEWRITER(MaxUsdVRayDecalWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdMeshWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdCameraWriter)
     MAXUSD_REGISTER_BASEWRITER(MaxUsdPhotometricLightWriter)
