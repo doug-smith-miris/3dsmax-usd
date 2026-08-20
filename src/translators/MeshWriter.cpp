@@ -27,6 +27,7 @@
 #include <pxr/pxr.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
+#include <pxr/usd/usdLux/lightAPI.h>
 #include <pxr/usd/usdLux/meshLightAPI.h>
 
 #include <Materials/mtl.h>
@@ -303,7 +304,11 @@ bool MaxUsdMeshWriter::Write(
         && !_TreeHasTexturedVRayLight(sourceNode->GetMtl())) {
         auto meshPrim = prim.GetPrim();
         if (meshPrim) {
-            auto lightAPI = pxr::UsdLuxMeshLightAPI::Apply(meshPrim);
+            pxr::UsdLuxMeshLightAPI::Apply(meshPrim);
+            // intensity/color live on UsdLuxLightAPI, not MeshLightAPI. MeshLightAPI declares
+            // LightAPI as a BUILT-IN api schema, so applying it auto-applies LightAPI and this
+            // wrapper is valid -- but the attributes must be created through LightAPI.
+            pxr::UsdLuxLightAPI lightAPI(meshPrim);
 
             // MAX-LIT-GEOLIGHT-022: author the light's own intensity and colour rather than
             // leaving them at the schema defaults. Applying the API alone yields intensity 1.0,
