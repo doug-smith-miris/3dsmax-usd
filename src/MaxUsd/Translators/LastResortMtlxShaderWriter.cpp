@@ -133,6 +133,9 @@ static const TSTR discoverVRayLightMtlFn = LR"(
         if (isProperty m #multiplier) then (
             result += ("multiplier|" + ((getProperty m #multiplier) as string) + "\n")
         )
+        if (isProperty m #compensateExposure) then (
+            result += ("compensate|" + ((getProperty m #compensateExposure) as string) + "\n")
+        )
         -- MAX-MTLX-EMISSIVE-UNITS-013: VRayLightMtl.units controls the absolute-scale
         -- interpretation of `.multiplier`. Author-side values (V-Ray SDK):
         --   0 = Default (arbitrary scale on a 0-1 color; typical multipliers 1..200)
@@ -210,6 +213,9 @@ struct VRayLightMtlProbe
     // 4 = W/m^2/sr. Absent -> treat as 0 (default) so pre-`units` V-Ray
     // scenes retain the existing behavior.
     int         units { 0 };
+    // MAX-LIT-COMPENSATE-023: V-Ray's "compensate camera exposure" flag on the light material.
+    // Set on ALL 16 VRayLightMtl materials in the Spectrum arena, and previously never read.
+    bool        compensateExposure { false };
     bool        hasColor { false };
     float       cr { 0.f }, cg { 0.f }, cb { 0.f }; // emission color in [0,1]
     std::string texFile;
@@ -238,7 +244,7 @@ struct VRayLightMtlProbe
 static constexpr float kEmissionCeiling = 1000.0f;
 static constexpr float kUnits0Gain      = 3.8f; // default-mode V-Ray -> Karma calibration (tunable)
 
-static float _NormalizeEmissionWeight(float multiplier, int units)
+static float _NormalizeEmissionWeight(float multiplier, int units, bool compensateExposure)
 {
     // NB: 'PI' is a Max SDK macro — use prefixed locals (mirrors kIntensityPi in VRayLightWriter).
     constexpr float kEmitPi = 3.14159265358979323846f;
@@ -257,9 +263,15 @@ static float _NormalizeEmissionWeight(float multiplier, int units)
     case 4: // W/m^2/sr radiance -> luminance via photopic peak
         w = multiplier * kEmitK;
         break;
-    case 0: // default (arbitrary artistic scale): apply the units=0 calibration gain
+    case 0: // default (arbitrary artistic scale)
     default:
-        w = multiplier * kUnits0Gain;
+        // MAX-LIT-COMPENSATE-023: kUnits0Gain exists because "V-Ray's colour mapping brightens
+        // beyond the raw radiance". When the material ITSELF compensates for camera exposure that
+        // brightening is already accounted for, so applying the gain double-counts it. Measured on
+        // the arena: the jumbotron (SCOREBOARD-VIDEO, mult 1.0, compensateExposure=true) rendered
+        // 3.2x brighter than the V-Ray baseline against a gain of 3.8 -- almost exactly the gain
+        // applied where it should not have been. Suite glazing measured 5.2x hot, same cause.
+        w = compensateExposure ? multiplier : (multiplier * kUnits0Gain);
         break;
     }
     if (w > kEmissionCeiling) {
@@ -314,6 +326,8 @@ VRayLightMtlProbe _ProbeVRayLightMtl(Mtl* material)
                 probe.isLightMtl = (val == "1");
             } else if (key == "multiplier") {
                 probe.multiplier = std::stof(val);
+            } else if (key == "compensate") {
+                probe.compensateExposure = (val == "true" || val == "True");
             } else if (key == "units") {
                 // MAX-MTLX-EMISSIVE-UNITS-013: 0..4 expected; clamp anything
                 // outside that range to 0 (default mode) rather than trusting
@@ -454,7 +468,7 @@ void LastResortMtlxShaderWriter::Write()
         // weight (per ND_standard_surface convention) and normalize per VRayLightMtl.units
         // so LED-jumbotron-style HDR multipliers don't blow the emission_color tint to
         // saturated white. `emission_color` stays the raw 0..1 tint in BOTH tiers.
-        const float emissionWeight = _NormalizeEmissionWeight(emit.multiplier, emit.units);
+        const float emissionWeight = _NormalizeEmissionWeight(emit.multiplier, emit.units, emit.compensateExposure);
 
         if (!emit.texFile.empty()) {
             // Tier 2: texture-driven emission. Author an ND_tiledimage_color3 sibling shader
