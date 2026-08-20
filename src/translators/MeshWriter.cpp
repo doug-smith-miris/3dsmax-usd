@@ -21,7 +21,6 @@
 #include <MaxUsd/Translators/primWriter.h>
 #include <MaxUsd/Translators/writeJobContext.h>
 #include <MaxUsd/Utilities/Logging.h>
-#include <MaxUsd/Utilities/TranslationUtils.h>
 
 #include <pxr/base/gf/vec3f.h>
 #include <pxr/pxr.h>
@@ -32,10 +31,7 @@
 
 #include <Materials/mtl.h>
 #include <max.h>
-#include <maxscript/maxscript.h>
 
-#include <sstream>
-#include <string>
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -90,11 +86,18 @@ Mtl* _FindVRayLightMtl(Mtl* mtl, int depth = 0)
     return nullptr;
 }
 
-// MAX-LIT-GEOLIGHT-022: read a VRayLightMtl's colour + multiplier via MAXScript. V-Ray is a
-// third-party plugin whose SDK we cannot link, and the property set differs between builds, so this
-// follows the probe pattern MaxUsdVRayLightWriter already uses for V-Ray light objects. Returns
-// false if the material could not be read at all, in which case the caller leaves the light alone
-// rather than authoring a guess.
+// MAX-LIT-GEOLIGHT-022: read a VRayLightMtl's colour + multiplier through the Max SDK param
+// blocks, NOT through MAXScript.
+//
+// The first version of this called ExecuteMAXScriptScript, mirroring what MaxUsdVRayLightWriter does
+// for V-Ray light OBJECTS. That crashed the export with EXCEPTION_ACCESS_VIOLATION reading 0x620.
+// The light writer gets away with it because it runs over a handful of lights; the mesh write path
+// runs over tens of thousands of meshes and is not guaranteed to be on the main thread, and the
+// MAXScript interpreter is not thread-safe. Reading the param block directly has no such
+// constraint, and avoids the scripting engine entirely.
+//
+// Parameter internal names differ between V-Ray builds, so match case-insensitively on a substring
+// rather than pinning exact spellings.
 struct VRayLightMtlProbe
 {
     float multiplier = 1.0f;
@@ -103,71 +106,53 @@ struct VRayLightMtlProbe
     bool  valid = false;
 };
 
-static const TSTR discoverVRayLightMtlFn = LR"(
-    fn discoverVRayLightMtl mtlAnimHandle = (
-        local m = getAnimByHandle mtlAnimHandle
-        local result = ""
-        if m == undefined then return result
-        if (isProperty m #multiplier) do result += ("multiplier|" + ((getProperty m #multiplier) as string) + "\n")
-        if (isProperty m #color) do (
-            local c = getProperty m #color
-            result += ("color|" + (c.r as string) + "," + (c.g as string) + "," + (c.b as string) + "\n")
-        )
-        if (isProperty m #compensateExposure) do result += ("compensate|" + ((getProperty m #compensateExposure) as string) + "\n")
-        result
-    )
-    discoverVRayLightMtl )";
-
 VRayLightMtlProbe _ProbeVRayLightMtl(Mtl* mtl)
 {
     VRayLightMtlProbe probe;
     if (mtl == nullptr) {
         return probe;
     }
-    const AnimHandle handle = ::Animatable::GetHandleByAnim(mtl);
-    if (handle == 0) {
-        return probe;
-    }
-    FPValue rvalue;
-    rvalue.Init();
-    std::wstringstream ss;
-    ss << discoverVRayLightMtlFn << handle << L'\0';
-    ExecuteMAXScriptScript(ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue);
-    const auto manifest = MaxUsd::MaxStringToUsdString(rvalue.s);
-    if (manifest.empty()) {
-        return probe;
-    }
-    std::stringstream lines(manifest);
-    std::string       line;
-    while (std::getline(lines, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
-            line.pop_back();
-        }
-        const auto pipe = line.find('|');
-        if (pipe == std::string::npos) {
+    const int numBlocks = mtl->NumParamBlocks();
+    for (int b = 0; b < numBlocks; ++b) {
+        IParamBlock2* pb = mtl->GetParamBlock(b);
+        if (pb == nullptr) {
             continue;
         }
-        const auto key = line.substr(0, pipe);
-        const auto val = line.substr(pipe + 1);
-        try {
-            if (key == "multiplier") {
-                probe.multiplier = std::stof(val);
-                probe.valid = true;
-            } else if (key == "color") {
-                const auto c1 = val.find(',');
-                const auto c2 = val.find(',', c1 + 1);
-                if (c1 != std::string::npos && c2 != std::string::npos) {
-                    // Max colours are 0-255; UsdLux inputs:color is 0-1.
-                    probe.r = std::stof(val.substr(0, c1)) / 255.0f;
-                    probe.g = std::stof(val.substr(c1 + 1, c2 - c1 - 1)) / 255.0f;
-                    probe.b = std::stof(val.substr(c2 + 1)) / 255.0f;
+        ParamBlockDesc2* desc = pb->GetDesc();
+        if (desc == nullptr) {
+            continue;
+        }
+        for (int i = 0; i < desc->count; ++i) {
+            const ParamDef& pd = desc->paramdefs[i];
+            if (pd.int_name == nullptr) {
+                continue;
+            }
+            const MCHAR* nm = pd.int_name;
+            Interval iv = FOREVER;
+            if (_wcsicmp(nm, _T("multiplier")) == 0) {
+                float v = 1.0f;
+                if (pb->GetValue(pd.ID, 0, v, iv)) {
+                    probe.multiplier = v;
                     probe.valid = true;
                 }
-            } else if (key == "compensate") {
-                probe.compensateExposure = (val == "true" || val == "True");
+            } else if (_wcsicmp(nm, _T("color")) == 0) {
+                Point3 c(1.f, 1.f, 1.f);
+                if (pb->GetValue(pd.ID, 0, c, iv)) {
+                    // Max exposes colours as 0-1 through the SDK but 0-255 through MAXScript, and
+                    // V-Ray builds have differed. Normalise only when the values clearly exceed 1.
+                    const float maxc = (c.x > c.y ? (c.x > c.z ? c.x : c.z) : (c.y > c.z ? c.y : c.z));
+                    const float k = (maxc > 1.001f) ? (1.0f / 255.0f) : 1.0f;
+                    probe.r = c.x * k;
+                    probe.g = c.y * k;
+                    probe.b = c.z * k;
+                    probe.valid = true;
+                }
+            } else if (wcsstr(nm, _T("ompensate")) != nullptr) { // compensateExposure / compensate_exposure
+                int v = 0;
+                if (pb->GetValue(pd.ID, 0, v, iv)) {
+                    probe.compensateExposure = (v != 0);
+                }
             }
-        } catch (...) {
-            // leave the field at its default; `valid` stays false unless something parsed
         }
     }
     return probe;
@@ -299,7 +284,14 @@ bool MaxUsdMeshWriter::Write(
     // instead of relying on brute-force emissive-surface hits — which is how V-Ray's light cache
     // fills the room from these emitters. MeshLightAPI derives the emission per-face from the bound
     // material, so only the emissive subset actually emits. Applied once, on the first frame.
-    if (time.IsFirstFrame() && _TreeHasVRayLightMtl(sourceNode->GetMtl())
+    // MAX-LIT-GEOLIGHT-022: a HIDDEN node must never become a light. Without this guard the export
+    // turns hidden emitters into geometry lights that illuminate the scene from nowhere -- the two
+    // white medallions on the studio's `Z-STUFF` layer (z-prefixed layers are never meant to render)
+    // came through as invisible prims still emitting, lighting the Dr Pepper club wall with no
+    // visible source. UseUSDVisibility already authors visibility=invisible for these; the light has
+    // to go too, because a UsdLux light is not suppressed by the visibility of the mesh it rides on.
+    const bool nodeHidden = sourceNode->IsNodeHidden(TRUE);
+    if (time.IsFirstFrame() && !nodeHidden && _TreeHasVRayLightMtl(sourceNode->GetMtl())
         && !_TreeHasTransparentMtl(sourceNode->GetMtl())
         && !_TreeHasTexturedVRayLight(sourceNode->GetMtl())) {
         auto meshPrim = prim.GetPrim();
