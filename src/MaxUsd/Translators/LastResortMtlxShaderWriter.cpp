@@ -63,6 +63,12 @@
 #include "ShadingModeRegistry.h"
 #include "WriteJobContext.h"
 
+// The shared V-Ray unit converter. Relative rather than <translators/VRayUnits.h> because no
+// cross-directory include from this tree exists yet to establish that src/ is an include root.
+// FOLLOW-UP: VRayUnits.h is now used by both trees and would sit more naturally under
+// MaxUsd/Utilities/ -- a move, not a behaviour change, so not folded into this fix.
+#include "../../translators/VRayUnits.h"
+
 #include <MaxUsd/DebugCodes.h>
 #include <MaxUsd/Utilities/Logging.h>
 #include <MaxUsd/Utilities/TranslationUtils.h>
@@ -242,45 +248,18 @@ struct VRayLightMtlProbe
 // (kUnits0Gain) — the SAME gain the area-light path (VRayLightWriter) applies — so both emission paths
 // track V-Ray. kUnits0Gain is the single knob to tune against the vray-baseline mean (~62/255).
 static constexpr float kEmissionCeiling = 1000.0f;
-static constexpr float kUnits0Gain      = 3.8f; // default-mode V-Ray -> Karma calibration (tunable)
+// kUnits0Gain lives in translators/VRayUnits.h -- ONE definition, shared with the light path.
 
 static float _NormalizeEmissionWeight(float multiplier, int units, bool compensateExposure)
 {
-    // NB: 'PI' is a Max SDK macro — use prefixed locals (mirrors kIntensityPi in VRayLightWriter).
-    constexpr float kEmitPi = 3.14159265358979323846f;
-    constexpr float kEmitK  = 683.0f; // photopic peak lm/W
-    float           w       = multiplier;
-    switch (units) {
-    case 1: // lumens (total luminous flux) -> nit-scale (Lambertian): / pi
-        w = multiplier / kEmitPi;
-        break;
-    case 2: // lm/m^2/sr = cd/m^2 = nits: already the target scale, pass through
-        w = multiplier;
-        break;
-    case 3: // watts (total radiant flux) -> lumens (x683) -> nits (/pi)
-        w = (multiplier * kEmitK) / kEmitPi;
-        break;
-    case 4: // W/m^2/sr radiance -> luminance via photopic peak
-        w = multiplier * kEmitK;
-        break;
-    case 0: // default (arbitrary artistic scale)
-    default:
-        // MAX-LIT-COMPENSATE-023: kUnits0Gain exists because "V-Ray's colour mapping brightens
-        // beyond the raw radiance". When the material ITSELF compensates for camera exposure that
-        // brightening is already accounted for, so applying the gain double-counts it. Measured on
-        // the arena: the jumbotron (SCOREBOARD-VIDEO, mult 1.0, compensateExposure=true) rendered
-        // 3.2x brighter than the V-Ray baseline against a gain of 3.8 -- almost exactly the gain
-        // applied where it should not have been. Suite glazing measured 5.2x hot, same cause.
-        w = compensateExposure ? multiplier : (multiplier * kUnits0Gain);
-        break;
-    }
-    if (w > kEmissionCeiling) {
-        w = kEmissionCeiling;
-    }
-    if (w < 0.0f) {
-        w = 0.0f;
-    }
-    return w;
+    // MAX-LIT-COMPENSATE-023 / MAX-LIT-GEOLIGHT-022: this used to be a second, hand-maintained copy
+    // of the V-Ray unit conversion, with a comment asking the reader to keep it in sync with the
+    // light path. It drifted anyway -- compensateExposure landed here and not there, so the same
+    // VRayLightMtl produced an emissive surface and a geometry light 3.8x apart. There is now one
+    // converter. An emission WEIGHT and a light INTENSITY still clamp on different scales, so the
+    // ceiling is passed in; everything above the clamp is shared.
+    return MaxUsdVRay::UnitsToNits(
+        multiplier, units, /*hasUnits*/ true, compensateExposure, kEmissionCeiling);
 }
 
 VRayLightMtlProbe _ProbeVRayLightMtl(Mtl* material)

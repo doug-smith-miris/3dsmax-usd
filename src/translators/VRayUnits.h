@@ -55,12 +55,30 @@ constexpr float kUnits0Gain  = 3.8f;
 ///                   NOTE: a VRayLightMtl exposes no units either, but callers should still pass
 ///                   units=0 / hasUnits=true for it, because the emissive-surface path applies the
 ///                   units=0 gain -- a light and its own surface must not disagree.
-inline float UnitsToNits(float multiplier, int units, bool hasUnits)
+/// \param compensateExposure the VRayLightMtl `compensateExposure` flag. See MAX-LIT-COMPENSATE-023
+///                   below: when the material already compensates for camera exposure, kUnits0Gain
+///                   double-counts that brightening. Defaults to false for callers with no such
+///                   flag (light OBJECTS), which is the pre-existing behaviour.
+/// \param ceiling    clamp for the returned value. Defaults to the nit-scale kCeiling; the emissive
+///                   -surface path passes its own lower ceiling, since an emission WEIGHT and a
+///                   light INTENSITY are clamped on different scales even though the conversion
+///                   between them is identical.
+inline float UnitsToNits(
+    float multiplier,
+    int   units,
+    bool  hasUnits,
+    bool  compensateExposure = false,
+    float ceiling = kCeiling)
 {
     float base = multiplier;
     if (hasUnits) {
         switch (units) {
-        case 0: base = multiplier * kUnits0Gain; break;          // artistic scale -> calibrated
+        // MAX-LIT-COMPENSATE-023: kUnits0Gain exists because V-Ray's colour mapping brightens
+        // beyond the raw radiance. When the emitter ITSELF compensates for camera exposure that
+        // brightening is already accounted for, so applying the gain double-counts it. Gated to
+        // units=0 on purpose: for lumens/watts the multiplier is an absolute physical quantity and
+        // exposure is the camera's business, not the value's.
+        case 0: base = compensateExposure ? multiplier : (multiplier * kUnits0Gain); break;
         case 1: base = multiplier / kPi; break;                  // lumens -> nits (Lambertian)
         case 2: base = multiplier; break;                        // cd/m2 == nits already
         case 3: base = (multiplier * kPhotopicK) / kPi; break;   // watts -> lumens -> nits
@@ -71,8 +89,8 @@ inline float UnitsToNits(float multiplier, int units, bool hasUnits)
     if (base < 0.f) {
         base = 0.f;   // Max's UI is non-negative
     }
-    if (base > kCeiling) {
-        base = kCeiling;
+    if (base > ceiling) {
+        base = ceiling;
     }
     return base;
 }

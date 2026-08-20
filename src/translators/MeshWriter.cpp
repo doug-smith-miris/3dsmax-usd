@@ -323,7 +323,11 @@ bool MaxUsdMeshWriter::Write(
             const auto probe = _ProbeVRayLightMtl(_FindVRayLightMtl(sourceNode->GetMtl()));
             if (probe.valid) {
                 const float intensity
-                    = MaxUsdVRay::UnitsToNits(probe.multiplier, /*units*/ 0, /*hasUnits*/ true);
+                    = MaxUsdVRay::UnitsToNits(
+                        probe.multiplier,
+                        /*units*/ 0,
+                        /*hasUnits*/ true,
+                        probe.compensateExposure);
                 lightAPI.CreateIntensityAttr().Set(intensity);
                 lightAPI.CreateColorAttr().Set(pxr::GfVec3f(probe.r, probe.g, probe.b));
                 // Logged at Warn so it lands in the export log regardless of level -- this line is

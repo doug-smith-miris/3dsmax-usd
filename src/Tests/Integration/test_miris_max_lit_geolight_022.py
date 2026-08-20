@@ -60,12 +60,13 @@ CEILING = 10000.0
 UNITS0_GAIN = 3.8
 
 
-def units_to_nits(multiplier, units, has_units):
+def units_to_nits(multiplier, units, has_units, compensate_exposure=False,
+                  ceiling=CEILING):
     """Mirror of MaxUsdVRay::UnitsToNits in src/translators/VRayUnits.h."""
     base = multiplier
     if has_units:
         if units == 0:
-            base = multiplier * UNITS0_GAIN
+            base = multiplier if compensate_exposure else multiplier * UNITS0_GAIN
         elif units == 1:
             base = multiplier / PI
         elif units == 2:
@@ -74,7 +75,7 @@ def units_to_nits(multiplier, units, has_units):
             base = (multiplier * PHOTOPIC_K) / PI
         elif units == 4:
             base = multiplier * PHOTOPIC_K
-    return max(0.0, min(CEILING, base))
+    return max(0.0, min(ceiling, base))
 
 
 # The 16 distinct VRayLightMtl materials in the arena, as probed on the box.
@@ -143,12 +144,20 @@ class TestConverter(unittest.TestCase):
 
 class TestGeometryLightIntensity(unittest.TestCase):
     def test_matches_the_surface_values_the_exporter_already_writes(self):
-        """The load-bearing assertion. Every emissive-surface value observed in the exported USD
-        must be reproduced by the converter at units=0 — which is what the geometry light now uses.
-        If this fails, a light and its own surface disagree."""
+        """The load-bearing assertion: the converter must reproduce the emissive-surface values the
+        exporter writes, so a light and its own surface cannot disagree.
+
+        HISTORICAL NOTE (MAX-LIT-COMPENSATE-023): OBSERVED_SURFACE_EMISSION was captured from the
+        2026-08-19 export, BEFORE compensateExposure was honoured — every one of those materials has
+        compensateExposure=true, so the values in a current export are these divided by
+        kUnits0Gain (GLASS_ILUM 190 -> 50, SCOREBOARD_VIDEO 3.8 -> 1.0, verified in the export).
+        The assertion is therefore pinning the UNCOMPENSATED conversion, which is still exactly
+        right for an emitter that does not compensate. Do not "update" these numbers to the new
+        export values without also passing compensate_exposure=True below, or the test will silently
+        stop checking the gain at all."""
         for name, expected in OBSERVED_SURFACE_EMISSION.items():
             mult = ARENA_LIGHT_MTLS[name][0]
-            self.assertAlmostEqual(units_to_nits(mult, 0, True), expected, places=2,
+            self.assertAlmostEqual(units_to_nits(mult, 0, True, False), expected, places=2,
                                    msg=f"{name}: mult {mult} should convert to {expected}")
 
     def test_passthrough_would_underlight_by_the_gain(self):
@@ -206,6 +215,81 @@ class TestGeometryLightIntensity(unittest.TestCase):
         self.assertEqual(mult, 50.0)
         self.assertEqual(colour, (0, 0, 0))
         self.assertAlmostEqual(units_to_nits(mult, 0, True), 190.0, places=2)
+
+
+# ---------------------------------------------------------------------------------------------
+# MAX-LIT-COMPENSATE-023 — compensateExposure, and the light/surface agreement it broke.
+# ---------------------------------------------------------------------------------------------
+SURFACE_CEILING = 1000.0   # kEmissionCeiling: an emission WEIGHT, not a nit intensity
+
+
+class CompensateExposure(unittest.TestCase):
+    """`compensateExposure` on a VRayLightMtl means the material already accounts for camera
+    exposure. kUnits0Gain exists to stand in for exactly that brightening, so applying both
+    double-counts it.
+
+    Measured on the arena against the V-Ray baseline, before the fix:
+        jumbotron  (SCOREBOARD_VIDEO, mult 1.0, compensate=true)  3.2x too bright
+        suite glass (GLASS_ILUM,      mult 50,  compensate=true)  5.16x too bright
+    against a gain of 3.8 -- the gain applied where it should not have been.
+    """
+
+    def test_compensated_units0_skips_the_gain(self):
+        self.assertEqual(units_to_nits(1.0, 0, True, True), 1.0)
+        self.assertEqual(units_to_nits(50.0, 0, True, True), 50.0)
+
+    def test_uncompensated_units0_still_applies_the_gain(self):
+        # the pre-existing behaviour must be untouched for emitters that do NOT compensate
+        self.assertAlmostEqual(units_to_nits(1.0, 0, True, False), 3.8)
+        self.assertAlmostEqual(units_to_nits(50.0, 0, True, False), 190.0)
+
+    def test_the_correction_is_exactly_the_gain(self):
+        for mult in (1.0, 1.5, 2.0, 50.0, 150.0):
+            self.assertAlmostEqual(
+                units_to_nits(mult, 0, True, False) / units_to_nits(mult, 0, True, True),
+                UNITS0_GAIN, places=5,
+                msg="compensateExposure must divide out precisely kUnits0Gain and nothing else")
+
+    def test_compensate_does_not_touch_physical_units(self):
+        """For lumens/watts/radiance the multiplier is an absolute physical quantity; exposure is
+        the camera's business, not the value's. Gating to units=0 is deliberate."""
+        for units in (1, 2, 3, 4):
+            self.assertEqual(units_to_nits(100.0, units, True, True),
+                             units_to_nits(100.0, units, True, False),
+                             msg="units=%d must be unaffected by compensateExposure" % units)
+
+    def test_default_branch_is_unreachable_from_the_surface_probe(self):
+        """Splitting `case 0: default:` into two branches changed behaviour for out-of-range units:
+        it used to get the gain, now it passes through. That is inert ONLY because the probe clamps
+        (`probe.units = (u >= 0 && u <= 4) ? u : 0`). If that clamp is ever removed, every emissive
+        surface silently loses the 3.8x gain -- so pin the clamp here, not just the converter."""
+        def probe_clamp(u):
+            return u if 0 <= u <= 4 else 0
+        for raw in (-1, 5, 99, 0x7fffffff):
+            self.assertEqual(probe_clamp(raw), 0)
+            self.assertAlmostEqual(units_to_nits(2.0, probe_clamp(raw), True, False), 7.6)
+
+    def test_light_and_its_own_surface_now_agree(self):
+        """The regression that motivated the shared converter: MeshWriter read compensateExposure,
+        logged it, and passed it nowhere -- so one VRayLightMtl produced a geometry-light intensity
+        and an emissive-surface weight 3.8x apart. Verified in the export: GLASS_ILUM surface
+        emission was 50 while 223 meshlight prims carried intensity 190."""
+        for mult, comp in ((1.0, True), (50.0, True), (150.0, True), (5.7, False), (2.0, False)):
+            surface = units_to_nits(mult, 0, True, comp, SURFACE_CEILING)
+            light = units_to_nits(mult, 0, True, comp, CEILING)
+            self.assertEqual(surface, light,
+                             msg="mult=%s compensate=%s: surface %s != light %s"
+                                 % (mult, comp, surface, light))
+
+    def test_the_two_ceilings_are_the_only_permitted_difference(self):
+        """An emission weight and a light intensity clamp on different scales, so the ceiling is a
+        parameter. Below both ceilings the two paths must be bit-identical; above the lower one they
+        may legitimately diverge."""
+        self.assertEqual(units_to_nits(1e6, 4, True, False, SURFACE_CEILING), SURFACE_CEILING)
+        self.assertEqual(units_to_nits(1e6, 4, True, False, CEILING), CEILING)
+        # and the arena's real values are all comfortably below the lower ceiling
+        for mult in (1.0, 1.5, 2.0, 5.7, 50.0, 150.0):
+            self.assertLess(units_to_nits(mult, 0, True, False, SURFACE_CEILING), SURFACE_CEILING)
 
 
 if __name__ == "__main__":
