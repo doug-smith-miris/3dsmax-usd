@@ -290,7 +290,12 @@ bool MaxUsdMeshWriter::Write(
     // came through as invisible prims still emitting, lighting the Dr Pepper club wall with no
     // visible source. UseUSDVisibility already authors visibility=invisible for these; the light has
     // to go too, because a UsdLux light is not suppressed by the visibility of the mesh it rides on.
-    const bool nodeHidden = sourceNode->IsNodeHidden(TRUE);
+    // Match the exporter's OWN visibility test exactly: USDSceneBuilder authors
+    // visibility=invisible from `node->IsNodeHidden()` with no argument. Passing TRUE asks
+    // "hidden FROM THE RENDERER", which consults the .renderable flag -- and in this scene
+    // .renderable is true on all 29,295 objects, so TRUE reported every node as visible and the
+    // guard never fired. The two hidden medallions still became geometry lights as a result.
+    const bool nodeHidden = sourceNode->IsNodeHidden();
     if (time.IsFirstFrame() && !nodeHidden && _TreeHasVRayLightMtl(sourceNode->GetMtl())
         && !_TreeHasTransparentMtl(sourceNode->GetMtl())
         && !_TreeHasTexturedVRayLight(sourceNode->GetMtl())) {
