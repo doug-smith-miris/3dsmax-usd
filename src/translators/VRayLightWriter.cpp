@@ -15,6 +15,8 @@
 //
 #include "VRayLightWriter.h"
 
+#include <algorithm>   // std::max, for the MAX-LIT-AFFECT-025 contribution clamp
+
 #include "VRayUnits.h"
 
 #include <MaxUsd/Translators/primWriter.h>
@@ -179,6 +181,30 @@ static const TSTR discoverMaxVrayLightFn = LR"(
                 result += ("shadowColor|" + ((sc2.r / 255.0) as string) + "," + ((sc2.g / 255.0) as string) + "," + ((sc2.b / 255.0) as string) + "\n")
             )
         )
+        -- MAX-LIT-AFFECT-025: V-Ray's per-channel gating. A VRayLight can be excluded from
+        -- diffuse, from specular, or from reflections independently, each with its own
+        -- contribution multiplier. Measured on the Spectrum Center arena (185 VRayLights):
+        --   affect_specular=false     49
+        --   affect_diffuse=false      48
+        --   affect_reflections=false 168
+        --   non-unity contribution   167
+        -- None of it was being read, so every one of those lights lit channels V-Ray never
+        -- lets it light.
+        if (isProperty obj #affect_diffuse) then (
+            result += ("affectDiffuse|" + ((getProperty obj #affect_diffuse) as string) + "\n")
+        )
+        if (isProperty obj #affect_specular) then (
+            result += ("affectSpecular|" + ((getProperty obj #affect_specular) as string) + "\n")
+        )
+        if (isProperty obj #affect_reflections) then (
+            result += ("affectReflections|" + ((getProperty obj #affect_reflections) as string) + "\n")
+        )
+        if (isProperty obj #diffuse_contribution) then (
+            result += ("diffuseContribution|" + ((getProperty obj #diffuse_contribution) as string) + "\n")
+        )
+        if (isProperty obj #specular_contribution) then (
+            result += ("specularContribution|" + ((getProperty obj #specular_contribution) as string) + "\n")
+        )
         if (isProperty obj #enabled) then (
             result += ("enabled|" + ((getProperty obj #enabled) as string) + "\n")
         )
@@ -235,6 +261,15 @@ struct VRayLightProbe
     bool        areaShadow { true };
     bool        hasShadowColor { false };
     float       shadowColor[3] { 0.f, 0.f, 0.f };
+    // MAX-LIT-AFFECT-025 — per-channel gating. Defaults are the V-Ray defaults (all channels
+    // on, unity contribution), so a light class exposing none of these behaves exactly as
+    // before this change.
+    bool        hasAffect { false };
+    bool        affectDiffuse { true };
+    bool        affectSpecular { true };
+    bool        affectReflections { true };
+    float       diffuseContribution { 1.f };
+    float       specularContribution { 1.f };
 };
 
 VRayLightProbe _ProbeVRayLight(INode* node)
@@ -311,6 +346,27 @@ VRayLightProbe _ProbeVRayLight(INode* node)
                     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 }
                 probe.enabled = !(v == "false" || v == "0");
+            } else if (key == "affectDiffuse") {
+                probe.hasAffect = true;
+                probe.affectDiffuse = !(val == "false" || val == "0");
+            } else if (key == "affectSpecular") {
+                probe.hasAffect = true;
+                probe.affectSpecular = !(val == "false" || val == "0");
+            } else if (key == "affectReflections") {
+                probe.hasAffect = true;
+                probe.affectReflections = !(val == "false" || val == "0");
+            } else if (key == "diffuseContribution") {
+                try {
+                    probe.hasAffect = true;
+                    probe.diffuseContribution = std::stof(val);
+                } catch (...) {
+                }
+            } else if (key == "specularContribution") {
+                try {
+                    probe.hasAffect = true;
+                    probe.specularContribution = std::stof(val);
+                } catch (...) {
+                }
             } else if (key == "units") {
                 // MAX-LIT-INTENSITY-UNITS-005: only the documented 0..4 modes
                 // are honored; anything outside that range falls back to 0
@@ -713,6 +769,46 @@ bool MaxUsdVRayLightWriter::Write(
             domeLight.CreateEnableColorTemperatureAttr().Set(
                 probe.useTemperature, pxr::UsdTimeCode::Default());
             domeLight.CreateNormalizeAttr().Set(true, pxr::UsdTimeCode::Default());
+        }
+
+        // MAX-LIT-AFFECT-025 — per-channel gating, BEFORE the off-state block below so that a
+        // disabled light still ends at zero regardless of what it says here.
+        //
+        // A VRayLight can be excluded from diffuse, specular or reflections independently, each
+        // with its own contribution multiplier, and none of it was reaching USD. UsdLuxLightAPI has
+        // the matching controls -- `inputs:diffuse` and `inputs:specular`, both defaulting to 1.0.
+        //
+        // What this fixes, measured on the Spectrum Center arena: LT-BOWL_FILL_BBALL is a 62.5x35ft
+        // invisible fill directly over the court with affect_specular=false and
+        // affect_reflections=false -- diffuse-only in V-Ray. Exported as a plain RectLight it lit
+        // specular too, which BOTH over-brightened the court (~1.8x the V-Ray reference) and smeared
+        // its clear-coat into a broad dull sheen instead of crisp reflections. "Court is too bright"
+        // and "court is missing its gloss" were one defect.
+        //
+        // Scope: 49 of the file's 185 lights have affect_specular=false, 48 have
+        // affect_diffuse=false, and 167 carry a non-unity contribution. This is a scene-wide
+        // correction, not a one-light patch.
+        //
+        // LIMITATION, deliberately not papered over: UsdLux has no separate reflection control, so
+        // affect_reflections cannot be expressed independently of affect_specular. 168 lights here
+        // set it false. When specular is ON but reflections are OFF we keep specular -- dropping it
+        // would lose the highlight V-Ray does render. That case stays slightly over-bright in
+        // reflections and needs a renderer-specific attribute to fix properly.
+        if (probe.hasAffect) {
+            const float diffuseVal
+                = probe.affectDiffuse ? std::max(0.f, probe.diffuseContribution) : 0.f;
+            const float specularVal
+                = probe.affectSpecular ? std::max(0.f, probe.specularContribution) : 0.f;
+            if (boundableLight) {
+                boundableLight.CreateDiffuseAttr().Set(diffuseVal, pxr::UsdTimeCode::Default());
+                boundableLight.CreateSpecularAttr().Set(specularVal, pxr::UsdTimeCode::Default());
+            } else if (distantLight) {
+                distantLight.CreateDiffuseAttr().Set(diffuseVal, pxr::UsdTimeCode::Default());
+                distantLight.CreateSpecularAttr().Set(specularVal, pxr::UsdTimeCode::Default());
+            } else if (domeLight) {
+                domeLight.CreateDiffuseAttr().Set(diffuseVal, pxr::UsdTimeCode::Default());
+                domeLight.CreateSpecularAttr().Set(specularVal, pxr::UsdTimeCode::Default());
+            }
         }
 
         // Off-state handling — zero-out diffuse + specular when the light
