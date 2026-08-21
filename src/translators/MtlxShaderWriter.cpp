@@ -14,6 +14,8 @@
 // limitations under the License.
 //
 #include <MaxUsd/Utilities/MaxSupportUtils.h>
+
+#include <cmath>   // std::fabs, for the MAX-MTLX-OUTPUTAMT-026 unity guard
 #ifdef IS_MAX2025_OR_GREATER
 #include <MaxUsd/Translators/ShaderWriter.h>
 #include <MaxUsd/Translators/ShaderWriterRegistry.h>
@@ -1161,9 +1163,34 @@ static const TSTR discoverMaxMtlxTexmapsFn = LR"(
                                 try ( monoV = resolveMaxTexmapMono tex 0 ) catch ( monoV = 0 )
                                 if monoV == 1 then effType = "float_a"
                             )
+                            -- MAX-MTLX-OUTPUTAMT-026: a texmap can carry a StandardTextureOutput
+                            -- (`.output`) whose `output_amount` SCALES the sampled map. Nothing
+                            -- downstream read it, so anything layered on top of a bitmap was
+                            -- silently dropped -- the same class of loss as the Color_Correction
+                            -- wrapper's adjustments.
+                            --
+                            -- This is how V-Ray's per-slot texmap multiplier survives the Scene
+                            -- Converter. ConvertScene discards
+                            -- `texmap_reflectionGlossiness_multiplier` outright (the converted
+                            -- PhysicalMaterial keeps no `roughness_map_amt`), so scene prep
+                            -- re-applies the recorded percentage onto `output_amount`. Emitting it
+                            -- here is what makes that recovery actually reach the USD.
+                            --
+                            -- Measured on the Spectrum Center arena: 9 materials carry a non-unity
+                            -- multiplier -- BBALL-COURT_HORNETS at 30%, WALNUT-WOOD 85%, WALNUT and
+                            -- EAST-BAR_WOOD 50%. The court was exporting roughness 0.50 where the
+                            -- scene says 0.50 x 30% = 0.15, i.e. 3.3x too rough, which is why the
+                            -- floor rendered flat and no light-side fix ever changed it.
+                            local outAmt = 1.0
+                            try (
+                                local op = (getProperty tex #output)
+                                if op != undefined and (isProperty op #output_amount) do (
+                                    outAmt = (getProperty op #output_amount)
+                                )
+                            ) catch ( outAmt = 1.0 )
                             if (findItem seenInputs mtlxInput) == 0 then (
                                 append seenInputs mtlxInput
-                                result += (mtlxInput + "|" + effType + "|" + fname + "\n")
+                                result += (mtlxInput + "|" + effType + "|" + fname + "|" + (outAmt as string) + "\n")
                             )
                         )
                     )
@@ -1179,8 +1206,14 @@ static bool _ParseTexmapLine(
     const std::string& line,
     std::string&       mtlxInput,
     std::string&       mtlxType,
-    std::string&       filePath)
+    std::string&       filePath,
+    float*             outputAmount = nullptr)
 {
+    // MAX-MTLX-OUTPUTAMT-026: the 4th field (texmap Output amount) is OPTIONAL. A 3-field line
+    // yields 1.0, so any caller or probe that predates this change behaves exactly as before.
+    if (outputAmount) {
+        *outputAmount = 1.0f;
+    }
     auto pipe1 = line.find('|');
     if (pipe1 == std::string::npos) {
         return false;
@@ -1191,7 +1224,19 @@ static bool _ParseTexmapLine(
     }
     mtlxInput = line.substr(0, pipe1);
     mtlxType = line.substr(pipe1 + 1, pipe2 - pipe1 - 1);
-    filePath = line.substr(pipe2 + 1);
+    auto pipe3 = line.find('|', pipe2 + 1);
+    if (pipe3 == std::string::npos) {
+        filePath = line.substr(pipe2 + 1);
+    } else {
+        filePath = line.substr(pipe2 + 1, pipe3 - pipe2 - 1);
+        if (outputAmount) {
+            try {
+                *outputAmount = std::stof(line.substr(pipe3 + 1));
+            } catch (...) {
+                *outputAmount = 1.0f;
+            }
+        }
+    }
     // trim trailing whitespace / CR
     while (!filePath.empty()
            && (filePath.back() == '\r' || filePath.back() == '\n'
@@ -1286,7 +1331,8 @@ size_t _EnrichMtlxDocFromMaxMaterial(
             continue;
         }
         std::string mtlxInput, mtlxType, filePath;
-        if (!_ParseTexmapLine(line, mtlxInput, mtlxType, filePath)) {
+        float outputAmount = 1.0f;
+        if (!_ParseTexmapLine(line, mtlxInput, mtlxType, filePath, &outputAmount)) {
             continue;
         }
 
@@ -1394,6 +1440,61 @@ size_t _EnrichMtlxDocFromMaxMaterial(
                     idx->setValueString("3");
                 }
                 sourceNodeName = extName;
+            }
+        }
+
+        // MAX-MTLX-OUTPUTAMT-026: honour the texmap's Output amount by inserting a multiply
+        // between the sampled map and the NodeGraph output. MaterialX's tiledimage has no gain
+        // input, so a node is the only way to express it -- same shape as the ND_invert_float
+        // scaffold that MAX-MTLX-GLOSSINESS-INVERT-018 uses for the glossiness convention flip.
+        //
+        // Why this matters: V-Ray's per-slot texmap multiplier does not survive ConvertScene, so
+        // scene prep records it pre-conversion and re-applies it onto `output_amount`. Without
+        // this block that recovery is inert -- verified the hard way: setting output_amount alone
+        // changed nothing in the exported USD, because nothing read it.
+        //
+        // Guarded on != 1.0 so every material that does not use the feature emits a byte-identical
+        // graph. Also skipped for the alpha-opacity path: an alpha mask is a shape, and scaling it
+        // would make a binary cutout translucent rather than dimmer.
+        if (!isAlphaOpacity && std::fabs(outputAmount - 1.0f) > 1e-6f) {
+            const std::string mulName = "mul_" + mtlxInput + "_amt";
+            auto              mulNode = ng->getNode(mulName);
+            if (!mulNode) {
+                mulNode = ng->addNode("multiply", mulName, outType);
+            }
+            if (mulNode) {
+                // Verified against the MaterialX stdlib:
+                //   ND_multiply_float      in1 float,  in2 float
+                //   ND_multiply_color3FA   in1 color3, in2 FLOAT   <- the "FA" (float-argument)
+                //   ND_multiply_vector4FA  in1 vector4, in2 FLOAT     variant, not the same-type one
+                // So a scalar amount needs the FA form for every non-float channel; using plain
+                // ND_multiply_color3 would demand a color3 in2 and silently mistype the graph.
+                mulNode->setNodeDefString(
+                    outType == "float" ? "ND_multiply_float" : "ND_multiply_" + outType + "FA");
+                auto in1 = mulNode->getInput("in1");
+                if (!in1) {
+                    in1 = mulNode->addInput("in1", outType);
+                }
+                if (in1) {
+                    in1->setNodeName(sourceNodeName);
+                    if (in1->hasAttribute("value")) {
+                        in1->removeAttribute("value");
+                    }
+                }
+                // in2 is a float even for the color3 form (ND_multiply_color3FA), so author the
+                // scalar and let the nodedef string above pick the matching variant.
+                auto in2 = mulNode->getInput("in2");
+                if (!in2) {
+                    in2 = mulNode->addInput("in2", "float");
+                }
+                if (in2) {
+                    in2->setValueString(std::to_string(outputAmount));
+                }
+                sourceNodeName = mulName;
+                MaxUsd::Log::Info(
+                    "MAX-MTLX-OUTPUTAMT-026: scaled {0} by texmap Output amount {1}",
+                    mtlxInput,
+                    outputAmount);
             }
         }
 
