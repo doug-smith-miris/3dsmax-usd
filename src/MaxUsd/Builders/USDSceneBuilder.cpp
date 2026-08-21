@@ -1099,14 +1099,31 @@ MaxUsd::PrimDefVectorPtr USDSceneBuilder::ProcessNode(
                 pxr::UsdGeomXformable xFormPrim(prim);
 
                 // Setup the USD visibility, from the Max node's hidden state, if requested.
-                // MAX-LIT-HIDDEN-GATE-004 — do not author visibility=invisible for lights.
-                // A hidden Max light node should still contribute to the rendered stage; the
-                // prior gate (up at line ~885) let hidden lights REACH this point but this
-                // branch then blanked them by authoring invisible on the UsdLux xform, which
-                // defeats the exporter's own light-writer output. Skip the author when the
-                // source object is a Max light.
-                if (context.node->IsNodeHidden() && buildOptions.GetUseUSDVisibility()
-                    && !isLightNode) {
+                //
+                // MAX-LIT-HIDDEN-VIS-024 — lights are NO LONGER exempt from this.
+                //
+                // MAX-LIT-HIDDEN-GATE-004 used to add `&& !isLightNode` here, on the reasoning
+                // that "a hidden Max light node should still contribute to the rendered stage".
+                // That is wrong, and it is wrong in the direction that silently adds light: 3ds Max
+                // does not render hidden objects, and neither does V-Ray -- the Spectrum Center
+                // baseline script has to unhide the whole scene or "V-Ray renders an empty frame".
+                // So a hidden light must not illuminate, and this exemption was the reason it did.
+                //
+                // Measured consequence (Spectrum Center arena, 2026-08-21): every one of the 185
+                // VRayLights in that file is authored hidden. With the exemption in place they all
+                // exported fully active, including LT-DR-PEPPER_LOGO_BACKLIT -- a pure-red
+                // (0.465, 0, 0.019) sphere light sitting on layer Z-STUFF, i.e. one the studio's
+                // z-prefix "never render" convention excludes twice over. It washed the wall beside
+                // the BUZZ CITY sign red, against a V-Ray reference that is blue there.
+                //
+                // Note what is NOT changed: the gates at ~935 and ~1506 still let a hidden light be
+                // WRITTEN. That is deliberate -- the prim, its transform and its parameters are
+                // preserved, so the light survives a round trip and can be re-shown by clearing
+                // visibility, exactly like a hidden mesh. It simply does not light the scene, which
+                // is what the source scene says. Verified that Hydra/Karma honours visibility on a
+                // UsdLux prim rather than ignoring it: marking these lights invisible moved the
+                // court region from 2.01x the V-Ray reference to 0.31x, so the attribute is live.
+                if (context.node->IsNodeHidden() && buildOptions.GetUseUSDVisibility()) {
                     xFormPrim.MakeInvisible(pxr::UsdTimeCode::Default());
                 }
 
