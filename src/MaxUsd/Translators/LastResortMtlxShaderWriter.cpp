@@ -70,6 +70,7 @@
 #include "../../translators/VRayUnits.h"
 
 #include <MaxUsd/DebugCodes.h>
+#include <MaxUsd/Utilities/PortableAssetPath.h>
 #include <MaxUsd/Utilities/Logging.h>
 #include <MaxUsd/Utilities/TranslationUtils.h>
 
@@ -459,9 +460,10 @@ void LastResortMtlxShaderWriter::Write()
             UsdShadeShader texShader = UsdShadeShader::Define(GetUsdStage(), texPath);
             if (texShader) {
                 texShader.CreateIdAttr(VtValue(kNdTiledImageColor3Id));
-                texShader
-                    .CreateInput(pxr::TfToken("file"), pxr::SdfValueTypeNames->Asset)
-                    .Set(pxr::SdfAssetPath(emit.texFile));
+                // MAX-TEX-004: layer-relative, so the emission texture travels with the asset.
+                texShader.CreateInput(pxr::TfToken("file"), pxr::SdfValueTypeNames->Asset)
+                    .Set(pxr::SdfAssetPath(
+                        MaxUsd::PortableAssetPath::MakePortable(emit.texFile, GetUsdStage())));
                 texShader.CreateInput(pxr::TfToken("uvtiling"), pxr::SdfValueTypeNames->Float2)
                     .Set(pxr::GfVec2f(1.f, 1.f));
                 const auto texOut

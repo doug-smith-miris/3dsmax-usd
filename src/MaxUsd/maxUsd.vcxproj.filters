@@ -85,6 +85,9 @@
     <ClCompile Include="Utilities\MaterialUtils.cpp">
       <Filter>Source Files\Utilities</Filter>
     </ClCompile>
+    <ClCompile Include="Utilities\PortableAssetPath.cpp">
+      <Filter>Source Files\Utilities</Filter>
+    </ClCompile>
     <ClCompile Include="Utilities\MathUtils.cpp">
       <Filter>Source Files\Utilities</Filter>
     </ClCompile>
@@ -409,6 +412,9 @@
       <Filter>Header Files\Utilities</Filter>
     </ClInclude>
     <ClInclude Include="Utilities\MaterialUtils.h">
+      <Filter>Header Files\Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="Utilities\PortableAssetPath.h">
       <Filter>Header Files\Utilities</Filter>
     </ClInclude>
     <ClInclude Include="Utilities\MathUtils.h">

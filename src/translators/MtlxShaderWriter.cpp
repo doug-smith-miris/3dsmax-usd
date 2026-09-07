@@ -14,6 +14,7 @@
 // limitations under the License.
 //
 #include <MaxUsd/Utilities/MaxSupportUtils.h>
+#include <MaxUsd/Utilities/PortableAssetPath.h>
 
 #include <cmath>   // std::fabs, for the MAX-MTLX-OUTPUTAMT-026 unity guard
 #ifdef IS_MAX2025_OR_GREATER
@@ -1407,7 +1408,12 @@ size_t _EnrichMtlxDocFromMaxMaterial(
             fileInput = imgNode->addInput("file", "filename");
         }
         if (fileInput) {
-            fileInput->setValueString(filePath);
+            // MAX-TEX-004: author a path that survives leaving this machine. MAX-TEX-003 resolves
+            // the bitmap through Max's file resolver, which returns where the file actually is --
+            // on an arch-viz workstation, a mapped drive -- so the authored value came out as
+            // `Y:\denver\...`. Resolution was never the gap; portability was.
+            fileInput->setValueString(
+                MaxUsd::PortableAssetPath::MakePortable(filePath, GetUsdStage()));
             if (imageType == "color3") {
                 // Match the color space authoring the MaterialX exporter would use.
                 fileInput->setAttribute("colorspace", "srgb_texture");
@@ -2002,7 +2008,9 @@ size_t _WireDanglingNormalmapInputs(
             fileInput = imgNode->addInput("file", "filename");
         }
         if (fileInput) {
-            fileInput->setValueString(normalFilePath);
+            // MAX-TEX-004: same portability treatment as the colour and float image nodes.
+            fileInput->setValueString(
+                MaxUsd::PortableAssetPath::MakePortable(normalFilePath, GetUsdStage()));
             // The MaterialX exporter tags color3 filename inputs with
             // colorspace="srgb_texture" to route them through the sRGB
             // decode. For a normal map the raw texels ARE the tangent-space
@@ -2497,7 +2505,12 @@ size_t _WireVRayGlossinessAsInvertedRoughness(
             fileInput = imgNode->addInput("file", "filename");
         }
         if (fileInput) {
-            fileInput->setValueString(filePath);
+            // MAX-TEX-004: author a path that survives leaving this machine. MAX-TEX-003 resolves
+            // the bitmap through Max's file resolver, which returns where the file actually is --
+            // on an arch-viz workstation, a mapped drive -- so the authored value came out as
+            // `Y:\denver\...`. Resolution was never the gap; portability was.
+            fileInput->setValueString(
+                MaxUsd::PortableAssetPath::MakePortable(filePath, GetUsdStage()));
             // No `colorspace` attribute — glossiness is a raw scalar, not a
             // color. The type gate in _EnrichMtlxDocFromMaxMaterial does
             // the same for other float slots.
