@@ -127,6 +127,64 @@ line for it alongside the wrapper rules.
 
 ---
 
+## MAX-MTLX-GLOSSINESS-CONNECTED-032 — an already-connected gloss map is still not inverted
+
+**Status:** measured, small, unfixed. Found while predicting the coverage of
+`MAX-MTLX-GLOSSINESS-GATE-029` / `-SCALAR-030`; recorded rather than fixed
+because the build box is starting.
+
+### Measurement
+
+Counting how the MaterialX roughness inputs are actually authored in the two
+current packages:
+
+| file | `specular_roughness` constant | connected |
+|---|---|---|
+| `generic-arena-package/generic-arena-bball.usda` | 457 | 14 |
+| `ext-package/generic-arena-exterior.usda` | 389 | 18 |
+
+`transmission_extra_roughness`, `coat_roughness` and `diffuse_roughness` are
+authored **zero** times in either file, constant or connected — so the two
+slots our slotMaps do not cover cost nothing today.
+
+### The gap
+
+029 and 030 both own the CONSTANT population, which is 457 / 389 — the
+overwhelming majority, and the one the 0.85 median came from. Neither touches
+the 14 / 18 **connected** inputs:
+
+* `_IsShaderInputConnected` returns true for them, so 029 defers (by design —
+  it cannot tell a raw gloss map wired by the native path from a
+  polarity-correct roughness map wired by MAX-MTLX-001);
+* 030 defers for the same reason, and its probe also skips any slot holding a
+  texmap.
+
+If the native `MtlxIOUtil.ExportMtlxString` wired a raw V-Ray glossiness map
+straight into `specular_roughness`, that connection carries inverted
+polarity and both passes leave it alone. That is what
+`bake_mtlx_channel_conversions.py` describes when it says the MaterialX half
+"still feeds the raw gloss [...] maps into `specular_roughness`".
+
+### Fix shape
+
+Splice an `ND_invert_float` into the EXISTING graph rather than authoring a
+new one: find the node currently driving the input's NodeGraph output, insert
+an invert between it and the output, and leave everything upstream untouched.
+
+The discriminator is the same one 018's probe already computes and then
+throws away: `discoverMaxVRayGlossinessMapsFn` reports which Max slot the map
+came from. If the Max-side slot is `texmap_reflectionGlossiness` /
+`texmap_refractionGlossiness`, the connection carries glossiness and needs
+the invert; if MAX-MTLX-001 wired it from `roughness_map` /
+`trans_roughness_map`, it does not. So the fix is to compare the probe's slot
+against the wiring, not to guess from the graph.
+
+Needs no new Max facts — unlike MAX-MTLX-HEIGHTNORMAL-031, everything
+required is already in the 018 probe's output. It was left out only because
+the constant population is 30x larger and the box was waiting.
+
+---
+
 ## Closed as NOT exporter gaps
 
 Recorded so they are not re-litigated.
