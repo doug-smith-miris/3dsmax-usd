@@ -20,6 +20,10 @@
 #include <filesystem>
 #include <system_error>
 
+// TF_WARN expands to pxr-namespaced helpers (TfCallContext, Tf_PostWarningHelper), and this file
+// lives in MAXUSD_NS_DEF rather than the pxr namespace, so the directive is required.
+PXR_NAMESPACE_USING_DIRECTIVE
+
 namespace fs = std::filesystem;
 
 namespace MAXUSD_NS_DEF {

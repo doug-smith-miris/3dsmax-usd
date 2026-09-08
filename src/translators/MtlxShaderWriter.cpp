@@ -1300,7 +1300,9 @@ bool _IsShaderInputDangling(
 size_t _EnrichMtlxDocFromMaxMaterial(
     const MaterialX::DocumentPtr& mtlxDoc,
     const MaterialX::NodePtr&     shaderNode,
-    AnimHandle                    animHandle)
+    AnimHandle                    animHandle,
+    // MAX-TEX-004: needed to make an authored texture path relative to the layer being written.
+    const pxr::UsdStageRefPtr&    stage)
 {
     if (!mtlxDoc || !shaderNode) {
         return 0;
@@ -1413,7 +1415,7 @@ size_t _EnrichMtlxDocFromMaxMaterial(
             // on an arch-viz workstation, a mapped drive -- so the authored value came out as
             // `Y:\denver\...`. Resolution was never the gap; portability was.
             fileInput->setValueString(
-                MaxUsd::PortableAssetPath::MakePortable(filePath, GetUsdStage()));
+                MaxUsd::PortableAssetPath::MakePortable(filePath, stage));
             if (imageType == "color3") {
                 // Match the color space authoring the MaterialX exporter would use.
                 fileInput->setAttribute("colorspace", "srgb_texture");
@@ -1899,7 +1901,9 @@ size_t _PruneDanglingNodeGraphOutputs(
 size_t _WireDanglingNormalmapInputs(
     const MaterialX::DocumentPtr& mtlxDoc,
     const MaterialX::NodePtr&     shaderNode,
-    AnimHandle                    animHandle)
+    AnimHandle                    animHandle,
+    // MAX-TEX-004: needed to make an authored texture path relative to the layer being written.
+    const pxr::UsdStageRefPtr&    stage)
 {
     if (!mtlxDoc || !shaderNode) {
         return 0;
@@ -2010,7 +2014,7 @@ size_t _WireDanglingNormalmapInputs(
         if (fileInput) {
             // MAX-TEX-004: same portability treatment as the colour and float image nodes.
             fileInput->setValueString(
-                MaxUsd::PortableAssetPath::MakePortable(normalFilePath, GetUsdStage()));
+                MaxUsd::PortableAssetPath::MakePortable(normalFilePath, stage));
             // The MaterialX exporter tags color3 filename inputs with
             // colorspace="srgb_texture" to route them through the sRGB
             // decode. For a normal map the raw texels ARE the tangent-space
@@ -2411,7 +2415,9 @@ static bool _ParseGlossinessLine(
 size_t _WireVRayGlossinessAsInvertedRoughness(
     const MaterialX::DocumentPtr& mtlxDoc,
     const MaterialX::NodePtr&     shaderNode,
-    AnimHandle                    animHandle)
+    AnimHandle                    animHandle,
+    // MAX-TEX-004: needed to make an authored texture path relative to the layer being written.
+    const pxr::UsdStageRefPtr&    stage)
 {
     if (!mtlxDoc || !shaderNode) {
         return 0;
@@ -2510,7 +2516,7 @@ size_t _WireVRayGlossinessAsInvertedRoughness(
             // on an arch-viz workstation, a mapped drive -- so the authored value came out as
             // `Y:\denver\...`. Resolution was never the gap; portability was.
             fileInput->setValueString(
-                MaxUsd::PortableAssetPath::MakePortable(filePath, GetUsdStage()));
+                MaxUsd::PortableAssetPath::MakePortable(filePath, stage));
             // No `colorspace` attribute — glossiness is a raw scalar, not a
             // color. The type gate in _EnrichMtlxDocFromMaxMaterial does
             // the same for other float slots.
@@ -2890,7 +2896,7 @@ void MtlxShaderWriter::Write()
     // NodeGraph output instead of leaving the NodeGraph with declared but
     // unconnected outputs. No-op when the doc is already fully populated or
     // when the material has no Bitmap-backed slots.
-    _EnrichMtlxDocFromMaxMaterial(mtlxDoc, shaderNode, animHandle);
+    _EnrichMtlxDocFromMaxMaterial(mtlxDoc, shaderNode, animHandle, GetUsdStage());
 
     // MAX-MTLX-002: after MAX-MTLX-001 has restored every wire-able slot,
     // some shader inputs still reference NodeGraph outputs with no source
@@ -2908,7 +2914,7 @@ void MtlxShaderWriter::Write()
     // material renders with no normal mapping. Walk the normalmap nodes
     // in this shader's NodeGraphs and wire their `in` from the Max
     // material's normal-map Bitmap slot.
-    _WireDanglingNormalmapInputs(mtlxDoc, shaderNode, animHandle);
+    _WireDanglingNormalmapInputs(mtlxDoc, shaderNode, animHandle, GetUsdStage());
 
     // MAX-MTLX-012: the ND_normalmap_float sub-shader's `scale` (bump-strength
     // multiplier) is dropped alongside `in` by MtlxIOUtil.ExportMtlxString, so
@@ -2938,7 +2944,7 @@ void MtlxShaderWriter::Write()
     // whose polarity-correct roughness map was already discovered by
     // MAX-MTLX-001 (`roughness_map` / `trans_roughness_map`) keep their
     // direct wiring — this pass is a no-op for those.
-    _WireVRayGlossinessAsInvertedRoughness(mtlxDoc, shaderNode, animHandle);
+    _WireVRayGlossinessAsInvertedRoughness(mtlxDoc, shaderNode, animHandle, GetUsdStage());
 
     _SetShaderInfoAttributes(shaderNode, shaderSchema);
     _AddDependentNodes(shaderNode, collectedNodes, GetUsdStage(), parentPath);
