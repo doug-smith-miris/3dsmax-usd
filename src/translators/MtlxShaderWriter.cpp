@@ -2643,6 +2643,267 @@ size_t _WireVRayGlossinessAsInvertedRoughness(
     return injected;
 }
 
+// MAX-MTLX-GLOSSINESS-SCALAR-030: MAXScript helper that probes VRayMtl's
+// SCALAR glossiness parameters -- the numbers, not the maps. Returns
+// pipe-delimited lines `<mtlxInput>|<raw glossiness>`, one per discovered
+// parameter. Empty result when no sub-material exposes a scalar glossiness
+// that this pass owns.
+//
+// This is the companion to discoverMaxVRayGlossinessMapsFn
+// (MAX-MTLX-GLOSSINESS-INVERT-018). That probe reports texmaps; a VRayMtl
+// with a bare glossiness NUMBER and no map emits nothing from it, so 018 --
+// even with its gate corrected by MAX-MTLX-GLOSSINESS-GATE-029 -- never sees
+// the scalar. On the Spectrum Center interior that is the majority case: of
+// 371 MaterialX surfaces carrying a constant `specular_roughness`, only ~65
+// have a reflection-glossiness map.
+//
+// Three things this probe deliberately handles:
+//
+//  1. Both property spellings. VRayMtl has carried `reflection_glossiness`
+//     across recent releases and `reflectionGlossiness` in older ones, and a
+//     scene migrated forward can present either. `isProperty` decides; the
+//     underscore spelling is tried first.
+//
+//  2. `brdf_useRoughness`. VRayMtl can be told to interpret these very
+//     parameters AS ROUGHNESS rather than glossiness. When that toggle is on
+//     the stored number is already MaterialX-polarity and inverting it would
+//     be a second bug in the opposite direction, so the whole material is
+//     skipped -- the native MtlxIOUtil value is then already correct.
+//
+//  3. Slots that hold a map are skipped, because 018 owns those. The C++
+//     side also declines to overwrite a wired input, so this is belt and
+//     braces; the probe-side skip keeps the two passes from even competing.
+//
+// Reuses `unwrapBlendMaterialSubMtls` defined by the earlier
+// `discoverMaxMtlxTexmapsFn` invocation (MAX-MTLX-001) -- the MAXScript
+// runtime persists global fn definitions across `ExecuteMAXScriptScript`
+// calls within a single writer Write() pass, the same persistence
+// MTLX-012 and 018 already rely on.
+//
+// Emits the RAW glossiness. The 1 - g inversion is done in C++ where the
+// polarity convention is documented and where the formatting is
+// locale-controlled; every other probe in this file likewise reports raw
+// Max state rather than pre-cooked MaterialX values.
+static const TSTR discoverMaxVRayGlossinessScalarsFn = LR"(
+    fn discoverMaxVRayGlossinessScalars materialAnimHandle = (
+        local m = getAnimByHandle materialAnimHandle
+        local result = ""
+        if m == undefined then return result
+        local subMtls = unwrapBlendMaterialSubMtls m #() 0
+        local slotMap = #(
+            #("reflection_glossiness", "reflectionGlossiness",
+              "texmap_reflectionGlossiness", "specular_roughness"),
+            #("refraction_glossiness", "refractionGlossiness",
+              "texmap_refractionGlossiness", "transmission_extra_roughness")
+        )
+        local seenInputs = #()
+        for currentMat in subMtls do (
+            local useRoughness = false
+            if (isProperty currentMat "brdf_useRoughness") then (
+                try (
+                    useRoughness = ((getProperty currentMat "brdf_useRoughness") == true)
+                ) catch (
+                    useRoughness = false
+                )
+            )
+            if not useRoughness then (
+                for entry in slotMap do (
+                    local mtlxInput = entry[4]
+                    if (findItem seenInputs mtlxInput) == 0 then (
+                        local hasMap = false
+                        if (isProperty currentMat entry[3]) then (
+                            try (
+                                hasMap = ((getProperty currentMat entry[3]) != undefined)
+                            ) catch (
+                                hasMap = false
+                            )
+                        )
+                        if not hasMap then (
+                            local gloss = undefined
+                            for spelling in #(entry[1], entry[2]) while gloss == undefined do (
+                                if (isProperty currentMat spelling) then (
+                                    try (
+                                        gloss = getProperty currentMat spelling
+                                    ) catch (
+                                        gloss = undefined
+                                    )
+                                )
+                            )
+                            if gloss != undefined and (isKindOf gloss Number) then (
+                                append seenInputs mtlxInput
+                                result += (mtlxInput + "|"
+                                    + (formattedPrint (gloss as float) format:".6f")
+                                    + "\n")
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        return result
+    )
+    discoverMaxVRayGlossinessScalars )";
+
+// MAX-MTLX-GLOSSINESS-SCALAR-030: parses one glossiness value into [0,1].
+// Out-of-range readings are clamped rather than rejected: V-Ray's own UI
+// clamps glossiness to [0,1], but a scene driven by script or migrated from
+// an older release can hold a value outside it, and a clamp keeps the
+// authored roughness inside the ND_standard_surface domain. A non-numeric
+// string means the MAXScript env returned something unexpected -- treat it
+// as "no scalar" and let the caller no-op on that input.
+static bool _ParseGlossinessScalar(const std::string& s, float& out)
+{
+    if (s.empty()) {
+        return false;
+    }
+    try {
+        size_t pos = 0;
+        out = std::stof(s, &pos);
+        if (pos == 0) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    if (out < 0.0f) {
+        out = 0.0f;
+    }
+    if (out > 1.0f) {
+        out = 1.0f;
+    }
+    return true;
+}
+
+// MAX-MTLX-GLOSSINESS-SCALAR-030: formats a value in [0,1] as a MaterialX
+// float literal WITHOUT going through the C locale.
+//
+// `std::to_string(float)` and `snprintf("%f")` both honour LC_NUMERIC for the
+// decimal separator. 3ds Max initialises the C locale from the OS on some
+// releases, so on a workstation set to a comma-decimal locale -- entirely
+// ordinary for an arch-viz shop -- those would emit `0,150000`, which is not
+// valid MaterialX float syntax and would be silently dropped or misparsed
+// downstream. Formatting from integers sidesteps it: `std::to_string(long)`
+// never involves a decimal separator.
+static std::string _FormatUnitFloat(float v)
+{
+    if (v < 0.0f) {
+        v = 0.0f;
+    }
+    if (v > 1.0f) {
+        v = 1.0f;
+    }
+    const long   scaled = static_cast<long>(v * 1000000.0f + 0.5f);
+    std::string  frac = std::to_string(scaled % 1000000L);
+    if (frac.size() < 6) {
+        frac.insert(0, 6 - frac.size(), '0');
+    }
+    // Trim trailing zeros but keep at least one decimal place, so the
+    // authored text reads `0.15` rather than `0.150000`.
+    while (frac.size() > 1 && frac.back() == '0') {
+        frac.pop_back();
+    }
+    return std::to_string(scaled / 1000000L) + "." + frac;
+}
+
+// MAX-MTLX-GLOSSINESS-SCALAR-030: replace the scalar V-Ray glossiness that
+// `MtlxIOUtil.ExportMtlxString` stamped into the roughness-family inputs of
+// ND_standard_surface with the MaterialX-polarity equivalent, 1 - glossiness.
+//
+// Where the 0.85 comes from. `reflectionGlossiness` appears nowhere in this
+// file outside the texmap code, and the constant table used by
+// `discoverMaxMtlxConstantsFn` maps only properties literally named
+// `roughness` / `Roughness` (PhysicalMaterial and OpenPBR, which are already
+// on the correct polarity and need no inversion). We were never authoring the
+// scalar at all. It arrives from Autodesk's native
+// `MtlxIOUtil.ExportMtlxString` VRayMtl -> standard_surface conversion, which
+// copies V-Ray's glossiness number into `specular_roughness` verbatim without
+// inverting it. So this fix must OVERRIDE the native value; there is no
+// mapping of ours to correct.
+//
+// The existing constant pass cannot do it. It is gated on
+//
+//     if (input->getValueString().empty()) { ... }
+//
+// -- deliberately, so a discovered Max constant never clobbers a native one.
+// That is right for every other slot and wrong for exactly this family, which
+// is why the override lives here instead of as another slotMap entry.
+//
+// Runs AFTER `_WireVRayGlossinessAsInvertedRoughness` so the texmap pass
+// claims its inputs first: once 018 has wired an invert graph,
+// `_IsShaderInputConnected` is true here and this pass defers. The MAXScript
+// probe also skips slots holding a map, so the two cannot collide.
+//
+// Returns the number of inputs re-authored.
+size_t _InvertVRayGlossinessScalars(
+    const MaterialX::DocumentPtr& mtlxDoc,
+    const MaterialX::NodePtr&     shaderNode,
+    AnimHandle                    animHandle)
+{
+    if (!mtlxDoc || !shaderNode) {
+        return 0;
+    }
+
+    FPValue rvalue;
+    rvalue.Init();
+    std::wstringstream ss;
+    ss << discoverMaxVRayGlossinessScalarsFn << animHandle << L'\0';
+    ExecuteMAXScriptScript(
+        ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue);
+    auto discovery = MaxUsd::MaxStringToUsdString(rvalue.s);
+    if (discovery.empty()) {
+        return 0;
+    }
+
+    size_t      inverted = 0;
+    std::string line;
+    for (size_t start = 0; start <= discovery.size();) {
+        auto nl = discovery.find('\n', start);
+        if (nl == std::string::npos) {
+            line = discovery.substr(start);
+            start = discovery.size() + 1;
+        } else {
+            line = discovery.substr(start, nl - start);
+            start = nl + 1;
+        }
+        if (line.empty()) {
+            continue;
+        }
+
+        // Same two-field split as 018's texmap lines; the second field is a
+        // number here rather than a path.
+        std::string mtlxInput, glossStr;
+        if (!_ParseGlossinessLine(line, mtlxInput, glossStr)) {
+            continue;
+        }
+
+        // Never overwrite a real connection. MAX-MTLX-001's polarity-correct
+        // roughness map and 018's invert graph both land here as a wired
+        // input, and both already carry the right polarity.
+        if (_IsShaderInputConnected(mtlxDoc, shaderNode, mtlxInput)) {
+            continue;
+        }
+
+        float gloss = 0.0f;
+        if (!_ParseGlossinessScalar(glossStr, gloss)) {
+            continue;
+        }
+
+        // V-Ray: 1 = smooth. MaterialX specular_roughness: 0 = smooth.
+        const float roughness = 1.0f - gloss;
+
+        auto input = shaderNode->getInput(mtlxInput);
+        if (!input) {
+            input = shaderNode->addInput(mtlxInput, "float");
+        }
+        if (!input || input->getType() != "float") {
+            continue;
+        }
+        input->setValueString(_FormatUnitFloat(roughness));
+        ++inverted;
+    }
+    return inverted;
+}
+
 // Adds a node graph input to a USD node graph based on a MaterialX input.
 void _AddNodeGraphInput(
     const MaterialX::InputPtr& input,
@@ -3002,6 +3263,17 @@ void MtlxShaderWriter::Write()
     // MAX-MTLX-001 (`roughness_map` / `trans_roughness_map`) keep their
     // direct wiring — this pass is a no-op for those.
     _WireVRayGlossinessAsInvertedRoughness(mtlxDoc, shaderNode, animHandle, GetUsdStage());
+
+    // MAX-MTLX-GLOSSINESS-SCALAR-030: the same polarity clash, one level down
+    // -- a VRayMtl whose glossiness is a NUMBER rather than a map. The pass
+    // above sees nothing for those materials, and on the Spectrum Center
+    // interior they are the majority: 371 MaterialX surfaces carry a constant
+    // `specular_roughness`, only ~65 have a reflection-glossiness map. The
+    // uninverted number arrives from Autodesk's native
+    // MtlxIOUtil.ExportMtlxString conversion, so this OVERRIDES rather than
+    // fills a gap. Must run after the texmap pass: once that has wired an
+    // invert graph the input reads as connected and this defers.
+    _InvertVRayGlossinessScalars(mtlxDoc, shaderNode, animHandle);
 
     _SetShaderInfoAttributes(shaderNode, shaderSchema);
     _AddDependentNodes(shaderNode, collectedNodes, GetUsdStage(), parentPath);
