@@ -43,6 +43,20 @@ struct export_layer_visibility_test
         LayerManager.newLayerFromName name
     ),
 
+    -- MAXScript cannot parse a chained call like foo().bar(), so every intermediate is named.
+    function isAuthored imageable =
+    (
+        local attr = imageable.GetVisibilityAttr()
+        attr.HasAuthoredValue()
+    ),
+
+    function computedVis stage primPath =
+    (
+        local prim = stage.GetPrimAtPath(primPath)
+        local imageable = pyUsdGeom.Imageable(prim)
+        imageable.ComputeVisibility()
+    ),
+
     public
     function setup =
     (
@@ -64,10 +78,13 @@ struct export_layer_visibility_test
         layerOff.addNode offBox
         layerOff.on = false
 
-        -- The point of the test: the object's own hidden flag is untouched. Only the layer is
-        -- off, which is precisely the case IsNodeHidden() cannot see.
-        assert_false offBox.isHidden message:"Test setup is wrong: the object itself must not be hidden."
-        assert_false (isNodeHidden offBox) message:"Test setup assumes isNodeHidden() is blind to layers."
+        -- The point of the test: nothing here ever touches the object's own hidden flag. The ONLY
+        -- thing hiding offLayerBox is its layer, which is precisely the case the C++
+        -- INode::IsNodeHidden() cannot see. (There is no MAXScript equivalent of that call to
+        -- assert against -- `isNodeHidden` is SDK-only -- so the assertion that matters is the
+        -- exported USD below.)
+        assert_true (not layerOff.on) message:"Test setup is wrong: the layer must be switched off."
+        assert_true layerOn.on message:"Test setup is wrong: the control layer must stay on."
 
         USDExporter.ExportFile testFilePath exportOptions:exportOptions
 
@@ -76,15 +93,13 @@ struct export_layer_visibility_test
         local offPrim = stage.GetPrimAtPath("/offLayerBox")
         assert_true (offPrim.IsValid()) message:"The layer-hidden object should still be exported, just invisible."
         local offImageable = pyUsdGeom.Imageable(offPrim)
-        assert_equal "invisible" (offImageable.ComputeVisibility()) \
-            message:"An object on a switched-off layer must export as invisible."
-        assert_true (offImageable.GetVisibilityAttr().HasAuthoredValue()) \
-            message:"Visibility must be authored, not merely inherited from a default."
+        local offVis = offImageable.ComputeVisibility()
+        assert_equal "invisible" offVis message:"An object on a switched-off layer must export as invisible."
+        assert_true (isAuthored offImageable) message:"Visibility must be authored, not merely inherited from a default."
 
         -- And the control: a sibling on a layer that is on must be untouched.
-        local onImageable = pyUsdGeom.Imageable(stage.GetPrimAtPath("/onLayerBox"))
-        assert_equal "inherited" (onImageable.ComputeVisibility()) \
-            message:"An object on a visible layer must not be made invisible."
+        local onVis = computedVis stage "/onLayerBox"
+        assert_equal "inherited" onVis message:"An object on a visible layer must not be made invisible."
     ),
 
     function test_nested_layer_hidden_exports_invisible = (
@@ -104,9 +119,8 @@ struct export_layer_visibility_test
         USDExporter.ExportFile testFilePath exportOptions:exportOptions
 
         stage = pyUsd.Stage.Open(testFilePath)
-        local imageable = pyUsdGeom.Imageable(stage.GetPrimAtPath("/nestedLayerBox"))
-        assert_equal "invisible" (imageable.ComputeVisibility()) \
-            message:"An object whose ancestor layer is off must export as invisible."
+        local vis = computedVis stage "/nestedLayerBox"
+        assert_equal "invisible" vis message:"An object whose ancestor layer is off must export as invisible."
     ),
 
     function test_layer_visibility_respects_option = (
@@ -127,9 +141,9 @@ struct export_layer_visibility_test
         USDExporter.ExportFile testFilePath exportOptions:opts
 
         stage = pyUsd.Stage.Open(testFilePath)
-        local imageable = pyUsdGeom.Imageable(stage.GetPrimAtPath("/optionOffBox"))
-        assert_false (imageable.GetVisibilityAttr().HasAuthoredValue()) \
-            message:"With UseUSDVisibility off, no visibility should be authored for a layer-hidden object."
+        local prim = stage.GetPrimAtPath("/optionOffBox")
+        local imageable = pyUsdGeom.Imageable(prim)
+        assert_true (not (isAuthored imageable)) message:"With UseUSDVisibility off, no visibility should be authored for a layer-hidden object."
     ),
 
     function teardown = (
