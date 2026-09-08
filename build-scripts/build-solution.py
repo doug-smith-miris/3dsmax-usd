@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 import os
+import re
 import subprocess
 import argparse
 
@@ -103,14 +104,90 @@ def build_command(args:argparse.Namespace) -> list:
 
     return cmd
 
+# MAX-BUILD-DEPLOY-028 -----------------------------------------------------------------------
+# Projects that ship nothing. A failure confined to these must not stop the plugin being packaged.
+#
+# The two unit-test projects have been failing on a missing `gtest/gtest.h` for weeks. Because
+# `main()` exited on ANY non-zero msbuild result, the package step never ran, and the DLLs sat
+# unused in `build\bin\` while 3ds Max kept loading `maxUsd.dll` from 2026-08-21. Four fix IDs
+# (MAX-TEX-004, MAX-MTLX-OUTPUTAMT-026, MAX-LIT-AFFECT-025, MAX-LIT-HIDDEN-VIS-024) were absent
+# from the exporter that produced the baseline masters, while every log said the build succeeded.
+TEST_ONLY_PROJECTS = {
+    'usd.unit.test.vcxproj',
+    'usd.system.test.vcxproj',
+    'ufe.unit.test.vcxproj',
+}
+
+# msbuild appends `[<full path>.vcxproj]` to every diagnostic. That suffix is the only place it
+# says WHICH project a failure belongs to.
+_PROJECT_IN_DIAGNOSTIC = re.compile(r'\[([^\]\r\n]*\.vcxproj)\]\s*$')
+
+
+def failed_projects(output_lines):
+    """Basenames of the .vcxproj files named on error lines, lowercased."""
+    failed = set()
+    for line in output_lines:
+        low = line.lower()
+        if ' error ' not in low and not low.lstrip().startswith('error'):
+            continue
+        match = _PROJECT_IN_DIAGNOSTIC.search(line.rstrip())
+        if match:
+            # Split on BOTH separators rather than os.path.basename: msbuild emits Windows paths,
+            # and this logic is unit-tested on macOS where os.path would not split them at all.
+            leaf = re.split(r'[\\/]', match.group(1).strip())[-1]
+            failed.add(leaf.lower())
+    return failed
+
+
+def deploy_decision(build_ok, failed):
+    """(should_package, reason).
+
+    A deliverable failure blocks packaging; a failure confined to the test projects does not.
+    An unattributable failure also blocks -- if we cannot tell what broke, we do not ship it.
+    """
+    if build_ok:
+        return True, 'build succeeded'
+    if not failed:
+        return False, 'build failed and no project could be identified from the output'
+    blocking = sorted(p for p in failed if p not in TEST_ONLY_PROJECTS)
+    if blocking:
+        return False, 'deliverable projects failed: ' + ', '.join(blocking)
+    return True, 'only test projects failed (' + ', '.join(sorted(failed)) + ')'
+
+
+def report_deploy_state(build_ok, reason, packaged, package_requested):
+    """Say what happened to the artefacts, always, in a form nobody can skim past.
+
+    The original failure mode was silence: a build that logged success, packaged nothing, and left
+    Max loading a three-week-old DLL. An unmissable closing statement is the actual fix.
+    """
+    bar = '=' * 78
+    lines = [bar]
+    lines.append('  BUILD %s -- %s' % ('OK' if build_ok else 'FAILED', reason))
+    if packaged:
+        lines.append('  PACKAGED: yes. Install it into 3ds Max or the plugin stays unchanged.')
+    elif not package_requested:
+        lines.append('  PACKAGED: NO -- --package/-p was not passed, so nothing was staged.')
+        lines.append('  The compiled DLLs are in build\\bin\\ and 3ds Max will keep loading')
+        lines.append('  whatever is already installed. Re-run with --package to stage them.')
+    else:
+        lines.append('  PACKAGED: NO -- blocked by the build result above.')
+    lines.append(bar)
+    print('\n'.join(lines))
+
+
 def build_component(args:argparse.Namespace):
     cmd = build_command(args)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
     print(f"Launching build process\n{proc.args}")
+    captured = []
     for raw_line in proc.stdout:
         print(raw_line, end='')
+        captured.append(raw_line)
     proc.wait()
-    return proc.returncode == 0
+    # The output is kept so the caller can tell WHICH projects failed. Returning only a boolean
+    # is what made a test-only failure indistinguishable from a broken plugin.
+    return proc.returncode == 0, captured
 
 def package(config:str, target:int, version:str, build:int):
     # path to build-scripts
@@ -141,11 +218,23 @@ def package(config:str, target:int, version:str, build:int):
     
 def main():
     args = parse_arguments()
-    if not build_component(args):
+    build_ok, output_lines = build_component(args)
+    should_package, reason = deploy_decision(build_ok, failed_projects(output_lines))
+
+    packaged = False
+    if should_package and args.package:
+        packaged = package(args.configuration, args.target, args.version, args.build)
+
+    report_deploy_state(build_ok, reason, packaged, args.package)
+
+    # A deliverable failure, or a packaging step that was asked for and did not succeed, is a
+    # failed run. A test-only failure is not: the plugin is good and must be allowed to ship.
+    if not should_package:
         exit(1)
-    if args.package:
-        if not package(args.configuration, args.target, args.version, args.build):
-            exit(1)
+    if args.package and not packaged:
+        exit(1)
+    if not build_ok:
+        exit(0)
 
 if __name__ == "__main__":
     main()
