@@ -2643,6 +2643,148 @@ size_t _WireVRayGlossinessAsInvertedRoughness(
     return injected;
 }
 
+// MAX-TEX-005: MAXScript helper that reports texture files the export is
+// about to reference but which DO NOT EXIST on disk. Returns pipe-delimited
+// lines `<Max property name>|<path>`. Empty result -- the overwhelmingly
+// common case -- when every texmap on the material resolves to a real file.
+//
+// Why this exists. On the Spectrum Center interior, 1,286 of 8,667 crowd
+// meshes rendered flat grey. The Max scene asked for
+// `rp_<name>_rigged_<nnn>_dif.jpg`; the delivered texture library ships
+// `RP-FAN-<NAME>_<nnn>_TC0<n>.jpg`. The exporter did nothing wrong -- it
+// authored the path the scene asked for -- but it authored a path to a file
+// that was not there and said nothing, so the mismatch was found by looking
+// at renders days later instead of by reading the export log on the day.
+//
+// That is the generalisable half of the problem. The filename mismatch
+// itself is asset data and is not ours to correct: guessing that
+// `rp_alice_rigged_003_dif.jpg` means `RP-FAN-ALICE_003_TC01.jpg` would be
+// inventing a mapping. Reporting it is ours.
+//
+// Deliberately slot-list-free: it walks `getPropNames` and tests each value
+// with `isKindOf ... textureMap`, so it covers every texmap-bearing property
+// on every material class -- including slots our own slotMaps have never
+// heard of, which are exactly the ones most likely to go unnoticed.
+//
+// Reuses `resolveMaxTexmapFilename` and `unwrapBlendMaterialSubMtls` from the
+// MAX-MTLX-001 probe (the MAXScript runtime persists global fn definitions
+// across ExecuteMAXScriptScript calls within a single writer Write() pass).
+// Uses the same FileResolutionManager call as MAX-TEX-003, so a file that
+// Max CAN find through its own resolver is not reported -- only a genuine
+// absence is.
+static const TSTR discoverMaxMissingTexturesFn = LR"(
+    fn collectMissingTexmapsForMtl currentMat acc = (
+        local propNames = undefined
+        try (
+            propNames = getPropNames currentMat
+        ) catch (
+            propNames = undefined
+        )
+        if propNames == undefined then return acc
+        for pn in propNames do (
+            local v = undefined
+            try (
+                v = getProperty currentMat pn
+            ) catch (
+                v = undefined
+            )
+            if v != undefined and (isKindOf v textureMap) then (
+                local fname = resolveMaxTexmapFilename v 0
+                if fname != undefined and fname != "" then (
+                    local resolved = fname
+                    local resolverOk = false
+                    try (
+                        resolverOk = FileResolutionManager.getFullFilePath &resolved #bitmap
+                    ) catch (
+                        resolverOk = false
+                    )
+                    if not (resolverOk and resolved != undefined and resolved != "") then (
+                        resolved = fname
+                    )
+                    local exists = false
+                    try (
+                        exists = doesFileExist resolved
+                    ) catch (
+                        exists = false
+                    )
+                    if not exists then (
+                        appendIfUnique acc ((pn as string) + "|" + fname)
+                    )
+                )
+            )
+        )
+        return acc
+    )
+    fn discoverMaxMissingTextures materialAnimHandle = (
+        local m = getAnimByHandle materialAnimHandle
+        local result = ""
+        if m == undefined then return result
+        local acc = #()
+        for currentMat in (unwrapBlendMaterialSubMtls m #() 0) do (
+            acc = collectMissingTexmapsForMtl currentMat acc
+        )
+        for entry in acc do result += (entry + "\n")
+        return result
+    )
+    discoverMaxMissingTextures )";
+
+// MAX-TEX-005: report every texture file this material references that is not
+// on disk. Authors NOTHING into the MaterialX document -- it only writes to
+// the Max listener / USD log -- so it cannot change any export output. The
+// worst case for a false positive is a spurious warning line.
+//
+// Returns the number of missing files reported.
+size_t _WarnOnUnresolvableTextures(
+    const MaterialX::NodePtr& shaderNode,
+    AnimHandle                animHandle)
+{
+    if (!shaderNode) {
+        return 0;
+    }
+
+    FPValue rvalue;
+    rvalue.Init();
+    std::wstringstream ss;
+    ss << discoverMaxMissingTexturesFn << animHandle << L'\0';
+    ExecuteMAXScriptScript(
+        ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue);
+    auto discovery = MaxUsd::MaxStringToUsdString(rvalue.s);
+    if (discovery.empty()) {
+        return 0;
+    }
+
+    size_t      reported = 0;
+    std::string line;
+    for (size_t start = 0; start <= discovery.size();) {
+        auto nl = discovery.find('\n', start);
+        if (nl == std::string::npos) {
+            line = discovery.substr(start);
+            start = discovery.size() + 1;
+        } else {
+            line = discovery.substr(start, nl - start);
+            start = nl + 1;
+        }
+        if (line.empty()) {
+            continue;
+        }
+        // Same two-field split as the glossiness lines; here the fields are
+        // a Max property name and a file path.
+        std::string propName, filePath;
+        if (!_ParseGlossinessLine(line, propName, filePath)) {
+            continue;
+        }
+        MaxUsd::Log::Warn(
+            "MAX-TEX-005: material '{0}' slot '{1}' references a texture that "
+            "does not exist: {2}. The USD will carry this path as authored; "
+            "the renderer will fall back to a flat surface.",
+            shaderNode->getName(),
+            propName,
+            filePath);
+        ++reported;
+    }
+    return reported;
+}
+
 // MAX-MTLX-GLOSSINESS-SCALAR-030: MAXScript helper that probes VRayMtl's
 // SCALAR glossiness parameters -- the numbers, not the maps. Returns
 // pipe-delimited lines `<mtlxInput>|<raw glossiness>`, one per discovered
@@ -3214,6 +3356,15 @@ void MtlxShaderWriter::Write()
     // NodeGraph output instead of leaving the NodeGraph with declared but
     // unconnected outputs. No-op when the doc is already fully populated or
     // when the material has no Bitmap-backed slots.
+    // MAX-TEX-005: say so, on export day, when a texture the scene asks for is
+    // not on disk. Authors nothing -- diagnostics only. 1,286 crowd meshes
+    // rendered flat grey on the Spectrum Center interior because the Max scene
+    // asked for `rp_<name>_rigged_<nnn>_dif.jpg` and the delivered library
+    // ships `RP-FAN-<NAME>_<nnn>_TC0<n>.jpg`; the exporter authored the
+    // requested path and said nothing. Correcting the name would be inventing
+    // a mapping and is not ours to do. Reporting it is.
+    _WarnOnUnresolvableTextures(shaderNode, animHandle);
+
     _EnrichMtlxDocFromMaxMaterial(mtlxDoc, shaderNode, animHandle, GetUsdStage());
 
     // MAX-MTLX-002: after MAX-MTLX-001 has restored every wire-able slot,
