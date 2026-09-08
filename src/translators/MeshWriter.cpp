@@ -21,6 +21,7 @@
 #include <MaxUsd/Translators/primWriter.h>
 #include <MaxUsd/Translators/writeJobContext.h>
 #include <MaxUsd/Utilities/Logging.h>
+#include <MaxUsd/Utilities/NodeVisibility.h>
 
 #include <pxr/base/gf/vec3f.h>
 #include <pxr/pxr.h>
@@ -295,7 +296,10 @@ bool MaxUsdMeshWriter::Write(
     // "hidden FROM THE RENDERER", which consults the .renderable flag -- and in this scene
     // .renderable is true on all 29,295 objects, so TRUE reported every node as visible and the
     // guard never fired. The two hidden medallions still became geometry lights as a result.
-    const bool nodeHidden = sourceNode->IsNodeHidden();
+    // MAX-VIS-027: include layer-hidden. Without it a mesh hidden only by its layer still
+    // becomes a geometry light, which is the exact failure this guard exists to prevent -- an
+    // invisible prim lighting the scene with no visible source.
+    const bool nodeHidden = MaxUsd::NodeVisibility::IsHiddenIncludingLayer(sourceNode);
     if (time.IsFirstFrame() && !nodeHidden && _TreeHasVRayLightMtl(sourceNode->GetMtl())
         && !_TreeHasTransparentMtl(sourceNode->GetMtl())
         && !_TreeHasTexturedVRayLight(sourceNode->GetMtl())) {

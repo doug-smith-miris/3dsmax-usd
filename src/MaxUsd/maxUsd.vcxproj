@@ -207,6 +207,7 @@ powershell.exe -ExecutionPolicy Unrestricted -Command "$(SolutionDir)..\build-sc
     <ClCompile Include="Utilities\Logging.cpp" />
     <ClCompile Include="Utilities\MaterialUtils.cpp" />
     <ClCompile Include="Utilities\PortableAssetPath.cpp" />
+    <ClCompile Include="Utilities\NodeVisibility.cpp" />
     <ClCompile Include="Utilities\MathUtils.cpp" />
     <ClCompile Include="Utilities\MaxProgressBar.cpp" />
     <ClCompile Include="Utilities\MeshUtils.cpp" />
@@ -324,6 +325,7 @@ powershell.exe -ExecutionPolicy Unrestricted -Command "$(SolutionDir)..\build-sc
     <ClInclude Include="Utilities\Logging.h" />
     <ClInclude Include="Utilities\MaterialUtils.h" />
     <ClInclude Include="Utilities\PortableAssetPath.h" />
+    <ClInclude Include="Utilities\NodeVisibility.h" />
     <ClInclude Include="Utilities\MathUtils.h" />
     <ClInclude Include="Utilities\MaxProgressBar.h" />
     <ClInclude Include="Utilities\MeshUtils.h" />

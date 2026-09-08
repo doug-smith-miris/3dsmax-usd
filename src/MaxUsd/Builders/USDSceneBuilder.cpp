@@ -25,6 +25,7 @@
 #include <MaxUsd/Translators/WriteJobContext.h>
 #include <MaxUsd/USDCore.h>
 #include <MaxUsd/Utilities/Logging.h>
+#include <MaxUsd/Utilities/NodeVisibility.h>
 #include <MaxUsd/Utilities/MathUtils.h>
 #include <MaxUsd/Utilities/MaxProgressBar.h>
 #include <MaxUsd/Utilities/MetaDataUtils.h>
@@ -547,7 +548,9 @@ bool USDSceneBuilder::BuildStageFromMaxNodes(
                 if (parentHiddenAncestor) {
                     hiddenAncestor = parentHiddenAncestor;
                 } else {
-                    if (node->IsNodeHidden()) {
+                    // MAX-VIS-027: layer-hidden counts as hidden here too, so the
+                    // "hidden but has visible descendants" warning below reflects reality.
+                    if (MaxUsd::NodeVisibility::IsHiddenIncludingLayer(node)) {
                         hiddenAncestor = node;
                     }
                 }
@@ -1123,7 +1126,15 @@ MaxUsd::PrimDefVectorPtr USDSceneBuilder::ProcessNode(
                 // is what the source scene says. Verified that Hydra/Karma honours visibility on a
                 // UsdLux prim rather than ignoring it: marking these lights invisible moved the
                 // court region from 2.01x the V-Ray reference to 0.31x, so the attribute is live.
-                if (context.node->IsNodeHidden() && buildOptions.GetUseUSDVisibility()) {
+                // MAX-VIS-027: a switched-off LAYER hides its objects too, and
+                // INode::IsNodeHidden() does not know that -- inode.h documents it as covering
+                // "the node hidden attribute and the 'Hide By Category' flags", with layers absent
+                // from the list. On the generic arena, where every Z_ layer is hidden on purpose,
+                // 11 prims exported with no visibility authored while their siblings on the same
+                // layers exported invisible: the siblings were individually hidden, the leaks were
+                // hidden only by their layer.
+                if (MaxUsd::NodeVisibility::IsHiddenIncludingLayer(context.node)
+                    && buildOptions.GetUseUSDVisibility()) {
                     xFormPrim.MakeInvisible(pxr::UsdTimeCode::Default());
                 }
 
