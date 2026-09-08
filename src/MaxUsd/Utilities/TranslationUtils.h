@@ -386,6 +386,28 @@ MaxUSDAPI pxr::UsdTimeCode GetCurrentUsdTimeCode(const pxr::UsdStageWeakPtr& sta
 MaxUSDAPI double GetUsdToMaxScaleFactor(const pxr::UsdStageWeakPtr& stage);
 
 /**
+ * \brief Gets the factor that converts a MILLIMETRE optical value (focal length, aperture, aperture
+ * offset) into the units UsdGeomCamera expects, which are TENTHS OF A SCENE UNIT -- not millimetres.
+ *
+ * This is the exact inverse of what CameraConverter applies on import
+ * (`value * .1f * GetUsdToMaxScaleFactor(stage) * GetSystemUnitScale(UNITS_MILLIMETERS)`), and it
+ * lives here so the reader and the writer cannot drift apart again. They had drifted: the writer
+ * authored Max's raw millimetres with the comment "focal and aperture in mm and is not subjected to
+ * units translation", while the reader converted correctly, so a round trip only survived on a
+ * scene whose system unit happens to be centimetres -- where this factor is 1.0, which is why the
+ * defect went unnoticed.
+ *
+ * Worked example, the Spectrum Center arena (system unit = feet, metersPerUnit 0.3048): a 20 mm lens
+ * must be authored as 20 * 0.032808 = 0.656. Authoring the raw 20 makes it 20 * 30.48 = 609.6 mm to
+ * every consumer that honours the convention, a ~30x telephoto. Every interior camera in that asset
+ * framed a few centimetres of upholstery and rendered black.
+ *
+ * \param stage The stage being authored.
+ * \return The multiplier to apply to a millimetre value before authoring it on a UsdGeomCamera.
+ */
+MaxUSDAPI double GetMaxMmToUsdOpticalFactor(const pxr::UsdStageWeakPtr& stage);
+
+/**
  * \brief Checks if the stage is using a 'Y' up axis. Helper method required to fix possible bad data
  * in the stage where the up axis is defined with lowercase characters (not valid comparison token).
  * \param stage The stage to for which the 'Y' up axis is verified.

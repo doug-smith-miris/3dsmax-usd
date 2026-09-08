@@ -275,6 +275,16 @@ bool MaxUsdCameraWriter::Write(
 
     auto stage = targetPrim.GetStage();
 
+    // MAX-CAM-003: UsdGeomCamera authors focalLength, aperture and aperture offset in TENTHS OF A
+    // SCENE UNIT. This writer used to author Max's raw millimetres ("focal and aperture in mm and is
+    // not subjected to units translation"), while CameraConverter converts correctly on import -- so
+    // a round trip only held on a centimetre scene, where the factor happens to be 1.0. On the
+    // Spectrum Center arena (system unit = feet) every camera came out a ~30x telephoto: a 20 mm
+    // lens read back as 609.6 mm, and every interior frame rendered black because the camera was
+    // framing a few centimetres of seat back. Applied at every optical authoring site below.
+    const float mmToUsdOptical
+        = static_cast<float>(MaxUsd::GetMaxMmToUsdOpticalFactor(stage));
+
     pxr::UsdGeomCamera usdCamera { targetPrim };
 
     if (time.IsFirstFrame()) {
@@ -374,7 +384,7 @@ bool MaxUsdCameraWriter::Write(
                     for (auto& knot : focalLengthKnots) {
                         auto knotTime = MaxUsd::GetTimeValueFromFrame(knot.GetTime());
                         knot.SetValue(
-                            maxPhysicalCamera->GetEffectiveLensFocalLength(knotTime, valid) * 10.f);
+                            maxPhysicalCamera->GetEffectiveLensFocalLength(knotTime, valid) * mmToUsdOptical);
                     }
 
                     if (!focalLengthKnots.empty()) {
@@ -383,14 +393,14 @@ bool MaxUsdCameraWriter::Write(
                     }
                 } else {
                     focalLengthAttribute.Set(
-                        maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * 10.f);
+                        maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * mmToUsdOptical);
                 }
             }
 
             if (exportTimeSamples)
 #endif
             {
-                float focal = maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * 10.f;
+                float focal = maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * mmToUsdOptical;
                 focalLengthAttribute.Set(focal, usdTimeCode);
             }
         }
@@ -417,9 +427,13 @@ bool MaxUsdCameraWriter::Write(
                         auto  knotTime = MaxUsd::GetTimeValueFromFrame(knot.GetTime());
                         float focalLength;
                         focalLengthSpline.Eval(knotTime, &focalLength);
+                        // MAX-CAM-003: focalLength here comes straight off pb_focal_length_mm, so
+                        // it is raw MILLIMETRES -- unlike the scaled value used on the non-animated
+                        // path. Convert here too, or an animated physical camera authors an
+                        // aperture in a different unit from its own focal length.
                         auto aperture
                             = tan(maxCamera->GetFOV(MaxUsd::GetTimeValueFromFrame(knotTime)) / 2.f)
-                            * focalLength * 2.f;
+                            * (focalLength * mmToUsdOptical) * 2.f;
                         knot.SetValue(aperture);
 
                         auto verticalKnot = knot;
@@ -434,7 +448,7 @@ bool MaxUsdCameraWriter::Write(
                     } else {
                         usdCamera.CreateHorizontalApertureAttr().Set(
                             tan(maxCamera->GetFOV(timeVal) / 2.0f)
-                            * maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * 10.f
+                            * maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * mmToUsdOptical
                             * 2.0f);
                     }
 
@@ -444,7 +458,7 @@ bool MaxUsdCameraWriter::Write(
                     } else {
                         usdCamera.CreateVerticalApertureAttr().Set(
                             tan(maxCamera->GetFOV(timeVal) / 2.0f)
-                            * maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * 10.f
+                            * maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * mmToUsdOptical
                             * 2.0f / aspect);
                     }
                 }
@@ -453,7 +467,7 @@ bool MaxUsdCameraWriter::Write(
             if (exportTimeSamples)
 #endif
             {
-                float focal = maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * 10.f;
+                float focal = maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * mmToUsdOptical;
                 float w = tan(maxCamera->GetFOV(timeVal) / 2.0f) * focal * 2.0f;
                 usdCamera.CreateHorizontalApertureAttr().Set(w, usdTimeCode);
                 float v = w / aspect;
@@ -634,7 +648,7 @@ bool MaxUsdCameraWriter::Write(
                     // The offset value we get is a percentage from the film width
                     // The negative sign is the offset direction USD applies on the camera
                     float focal
-                        = maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * 10.f;
+                        = maxPhysicalCamera->GetEffectiveLensFocalLength(timeVal, valid) * mmToUsdOptical;
                     float w = tan(maxCamera->GetFOV(timeVal) / 2.0f) * focal * 2.0f;
                     offset[0] = -(offset[0] * w);
                     offset[1] = -(offset[1] * w);
@@ -737,9 +751,10 @@ bool MaxUsdCameraWriter::Write(
             // Focal Length
             {
                 float w = GetCOREInterface()->GetRendApertureWidth();
-                auto  calculateFocal = [w](float tanFov) {
+                // MAX-CAM-003: w is millimetres; convert on the way out.
+                auto  calculateFocal = [w, mmToUsdOptical](float tanFov) {
                     if (tanFov != 0) {
-                        return float((0.5f * w) / tanFov);
+                        return float((0.5f * w) / tanFov) * mmToUsdOptical;
                     }
                     return FLT_MAX; // Focal length is infinite
                 };
@@ -771,14 +786,15 @@ bool MaxUsdCameraWriter::Write(
             {
                 // classic FOV equation
                 // see maxsdk\samples\objects\camera.h:	float FOVtoMM(float fov);
-                // focal and aperture in mm and is not subjected to units translation
+                // MAX-CAM-003: w and focal are MILLIMETRES here. They ARE subject to a units
+                // translation on the way out -- the old comment claiming otherwise was the defect.
                 float w = GetCOREInterface()->GetRendApertureWidth();
                 float focal;
                 float tanFov = tan(maxCamera->GetFOV(timeVal) / 2.0f);
                 if (tanFov == 0.0f) {
                     focal = FLT_MAX;
                 } else {
-                    focal = float((0.5f * w) / tanFov);
+                    focal = float((0.5f * w) / tanFov) * mmToUsdOptical;
                 }
                 usdCamera.CreateFocalLengthAttr().Set(focal, usdTimeCode);
             }
@@ -790,8 +806,8 @@ bool MaxUsdCameraWriter::Write(
             // Not frame dependent and not animated, not need to set multiple times
             if (time.IsFirstFrame()) {
                 auto aspect = GetCOREInterface()->GetRendImageAspect();
-                // aperture in mm and is not subjected to units translation
-                float w = GetCOREInterface()->GetRendApertureWidth();
+                // MAX-CAM-003: millimetres, converted to tenths of a scene unit on the way out.
+                float w = GetCOREInterface()->GetRendApertureWidth() * mmToUsdOptical;
                 usdCamera.CreateHorizontalApertureAttr().Set(w);
 
                 float verticalAperture;

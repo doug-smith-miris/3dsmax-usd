@@ -679,6 +679,21 @@ double GetUsdToMaxScaleFactor(const pxr::UsdStageWeakPtr& stage)
     return rescaleFactor;
 }
 
+double GetMaxMmToUsdOpticalFactor(const pxr::UsdStageWeakPtr& stage)
+{
+    // Mirror of the import expression in CameraConverter, inverted. Written as the literal inverse
+    // rather than a simplified constant so that the two stay provably reciprocal.
+    const double usdToMax = GetUsdToMaxScaleFactor(stage);
+    const double mmPerMaxUnit = GetSystemUnitScale(UNITS_MILLIMETERS);
+    const double usdToMm = 0.1 * usdToMax * mmPerMaxUnit;
+    if (usdToMm == 0.0) {
+        // A degenerate stage (metersPerUnit 0, or a unit scale of 0) would otherwise divide by zero.
+        // Fall back to the identity so the export still produces a camera rather than an inf.
+        return 1.0;
+    }
+    return 1.0 / usdToMm;
+}
+
 void UniqueNameGenerator::Reset() { existingNames.clear(); }
 
 void UniqueNameGenerator::AddExistingName(const std::string& name) { existingNames.insert(name); }
