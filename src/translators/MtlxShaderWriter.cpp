@@ -1293,6 +1293,53 @@ bool _IsShaderInputDangling(
         && out->getNodeGraphString().empty();
 }
 
+// MAX-MTLX-GLOSSINESS-GATE-029: true when `inputName` is actually FED by
+// something -- a node, a NodeGraph output -- as opposed to carrying a plain
+// constant `value` (or nothing at all).
+//
+// This exists because `_IsShaderInputDangling` above conflates two states the
+// V-Ray glossiness passes must treat oppositely. It answers `false` both for
+//
+//   (a) "MAX-MTLX-001 wired a polarity-correct roughness MAP here" -- defer, and
+//   (b) "MtlxIOUtil.ExportMtlxString left a scalar constant here" -- override.
+//
+// State (b) is the entire reason those passes exist: a constant sitting in
+// `specular_roughness` after the native VRayMtl -> standard_surface conversion
+// is raw V-Ray GLOSSINESS on the inverted polarity (1 = smooth), not roughness.
+// Gating on `_IsShaderInputDangling` therefore made MAX-MTLX-GLOSSINESS-INVERT-018
+// a no-op for exactly the materials it was written for -- any VRayMtl whose
+// glossiness the native path had already stamped as a number.
+bool _IsShaderInputConnected(
+    const MaterialX::DocumentPtr& doc,
+    const MaterialX::NodePtr&     shaderNode,
+    const std::string&            inputName)
+{
+    auto input = shaderNode->getInput(inputName);
+    if (!input) {
+        return false;
+    }
+    if (!input->getNodeName().empty()) {
+        return true;
+    }
+    // A `nodegraph` / `output` reference only counts as a connection when the
+    // NodeGraph actually resolves AND declares that output AND something
+    // drives it. A reference into a NodeGraph that was never scaffolded is the
+    // MAX-MTLX-001 dangling-connection defect, not a connection to respect.
+    auto ng = _GetInputNodeGraph(doc, shaderNode, inputName);
+    if (!ng) {
+        return false;
+    }
+    auto outName = input->getOutputString();
+    if (outName.empty()) {
+        outName = inputName + "_output";
+    }
+    auto out = ng->getOutput(outName);
+    if (!out) {
+        return false;
+    }
+    return !out->getNodeName().empty() || !out->getNodeGraphString().empty();
+}
+
 // MAX-MTLX-001: inject the missing <tiledimage> nodes into the mtlxDoc's
 // NodeGraphs / shader wiring based on the Max material's map-slot inventory.
 // Returns the number of tiledimage nodes injected — 0 if the material is
@@ -2459,7 +2506,17 @@ size_t _WireVRayGlossinessAsInvertedRoughness(
         // was already discovered on this material, MTLX-001 already wired
         // the correct tiledimage into the shader input. Do NOT overwrite
         // it with an inverted glossiness path. Surgical-scope invariant.
-        if (!_IsShaderInputDangling(mtlxDoc, shaderNode, mtlxInput)) {
+        //
+        // MAX-MTLX-GLOSSINESS-GATE-029: this used to ask
+        // `!_IsShaderInputDangling(...)`, which also skipped every input
+        // holding a plain constant. MtlxIOUtil.ExportMtlxString stamps a
+        // constant into `specular_roughness` for essentially every VRayMtl,
+        // so the guard fired on the common case and this pass never ran. Ask
+        // the narrower question -- is anything actually WIRED here -- so a
+        // native constant is treated as the stale opinion it is. The
+        // `removeAttribute("value")` at the foot of this loop was already
+        // written to clear it.
+        if (_IsShaderInputConnected(mtlxDoc, shaderNode, mtlxInput)) {
             continue;
         }
 
